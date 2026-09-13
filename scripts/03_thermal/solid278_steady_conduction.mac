@@ -1,0 +1,61 @@
+! ============================================================================
+! Demo 03: SOLID278 steady-state heat conduction through a rectangular body
+! Unit system: m, W, degC
+! WARNING: /CLEAR,NOSTART clears the current MAPDL database.
+! ============================================================================
+/CLEAR,NOSTART
+/FILNAME,demo_solid278,1
+/TITLE,SOLID278 Steady-State Heat Conduction
+
+/PREP7
+
+! ----------------------------- Parameters -----------------------------------
+body_length          = 0.10
+body_width           = 0.04
+body_height          = 0.02
+mesh_size            = 0.01
+thermal_conductivity = 45
+hot_temperature      = 100
+cold_temperature     = 20
+
+elem_type_id = 1
+material_id  = 1
+
+! ----------------------- Element and material -------------------------------
+ET,elem_type_id,SOLID278
+MP,KXX,material_id,thermal_conductivity
+MP,KYY,material_id,thermal_conductivity
+MP,KZZ,material_id,thermal_conductivity
+
+! -------------------------- Geometry and mesh -------------------------------
+BLOCK,0,body_length,0,body_width,0,body_height
+VATT,material_id,,elem_type_id
+ESIZE,mesh_size
+VMESH,ALL
+ALLSEL,ALL
+
+! ----------------------- Temperature boundaries -----------------------------
+NSEL,S,LOC,X,0
+D,ALL,TEMP,hot_temperature
+ALLSEL,ALL
+
+NSEL,S,LOC,X,body_length
+D,ALL,TEMP,cold_temperature
+ALLSEL,ALL
+FINISH
+
+! -------------------------------- Solve --------------------------------------
+/SOLU
+ANTYPE,STATIC
+OUTRES,ALL,ALL
+SOLVE
+FINISH
+
+! ---------------------------- Postprocessing --------------------------------
+/POST1
+SET,LAST
+/EDGE,1,1
+PLNSOL,TEMP
+PRNSOL,TEMP
+FINISH
+

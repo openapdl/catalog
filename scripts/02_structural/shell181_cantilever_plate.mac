@@ -1,0 +1,66 @@
+! ============================================================================
+! Demo 02: Parametric SHELL181 cantilever plate
+! Unit system: N, mm, MPa
+! WARNING: /CLEAR,NOSTART clears the current MAPDL database.
+! ============================================================================
+/CLEAR,NOSTART
+/FILNAME,demo_shell181,1
+/TITLE,Parametric SHELL181 Cantilever Plate
+
+/PREP7
+
+! ----------------------------- Parameters -----------------------------------
+plate_length    = 300
+plate_width     = 150
+plate_thickness = 3
+mesh_size       = 15
+young_modulus   = 70000
+poisson_ratio   = 0.33
+total_edge_load = 300
+
+elem_type_id = 1
+material_id  = 1
+section_id   = 1
+
+! --------------------- Element, material, section ---------------------------
+ET,elem_type_id,SHELL181
+MP,EX,material_id,young_modulus
+MP,PRXY,material_id,poisson_ratio
+SECTYPE,section_id,SHELL
+SECDATA,plate_thickness,material_id,0,3
+
+! -------------------------- Geometry and mesh -------------------------------
+BLC4,0,0,plate_length,plate_width
+AATT,material_id,,elem_type_id,,section_id
+ESIZE,mesh_size
+AMESH,ALL
+ALLSEL,ALL
+
+! ---------------------- Constraints and loading -----------------------------
+NSEL,S,LOC,X,0
+D,ALL,ALL,0
+ALLSEL,ALL
+
+NSEL,S,LOC,X,plate_length
+*GET,edge_node_count,NODE,0,COUNT
+edge_node_force = -total_edge_load/edge_node_count
+F,ALL,FZ,edge_node_force
+ALLSEL,ALL
+FINISH
+
+! -------------------------------- Solve --------------------------------------
+/SOLU
+ANTYPE,STATIC
+OUTRES,ALL,ALL
+SOLVE
+FINISH
+
+! ---------------------------- Postprocessing --------------------------------
+/POST1
+SET,LAST
+/ESHAPE,1
+PLDISP,2
+PRNSOL,U,COMP
+PRRSOL
+FINISH
+

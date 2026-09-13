@@ -1,0 +1,74 @@
+! ============================================================================
+! Demo 01: Parametric BEAM188 cantilever beam
+! Unit system: N, mm, MPa
+! WARNING: /CLEAR,NOSTART clears the current MAPDL database.
+! ============================================================================
+/CLEAR,NOSTART
+/FILNAME,demo_beam188,1
+/TITLE,Parametric BEAM188 Cantilever Beam
+
+/PREP7
+
+! ----------------------------- Parameters -----------------------------------
+beam_len       = 1000
+beam_width     = 20
+beam_height    = 40
+mesh_size      = 50
+young_modulus  = 200000
+poisson_ratio  = 0.30
+total_tip_load = 1000
+
+elem_type_id = 1
+material_id  = 1
+section_id   = 1
+kp_fixed_id  = 1
+kp_tip_id    = 2
+kp_orient_id = 3
+
+! --------------------- Element, material, section ---------------------------
+ET,elem_type_id,BEAM188
+MP,EX,material_id,young_modulus
+MP,PRXY,material_id,poisson_ratio
+SECTYPE,section_id,BEAM,RECT
+SECDATA,beam_width,beam_height
+
+! ----------------------------- Geometry -------------------------------------
+K,kp_fixed_id,0,0,0
+K,kp_tip_id,beam_len,0,0
+K,kp_orient_id,0,1,0
+L,kp_fixed_id,kp_tip_id
+
+! ------------------------------- Mesh ---------------------------------------
+LATT,material_id,,elem_type_id,,kp_orient_id,,section_id
+LESIZE,ALL,mesh_size
+LMESH,ALL
+ALLSEL,ALL
+
+! ---------------------- Constraints and loading -----------------------------
+NSEL,S,LOC,X,0
+D,ALL,ALL,0
+ALLSEL,ALL
+
+NSEL,S,LOC,X,beam_len
+*GET,tip_node_count,NODE,0,COUNT
+tip_node_force = -total_tip_load/tip_node_count
+F,ALL,FY,tip_node_force
+ALLSEL,ALL
+FINISH
+
+! -------------------------------- Solve --------------------------------------
+/SOLU
+ANTYPE,STATIC
+OUTRES,ALL,ALL
+SOLVE
+FINISH
+
+! ---------------------------- Postprocessing --------------------------------
+/POST1
+SET,LAST
+/ESHAPE,1
+PLDISP,2
+PRNSOL,U,COMP
+PRRSOL
+FINISH
+
