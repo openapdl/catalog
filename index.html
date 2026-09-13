@@ -1,0 +1,393 @@
+---
+layout: default
+title: APDL 腳本目錄
+---
+
+<style>
+  .catalog-app {
+    --border: #d9e2ec;
+    --muted: #5f6c7b;
+    color: #273444;
+  }
+  .catalog-breadcrumb {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .45rem;
+    margin-bottom: 1.5rem;
+    color: var(--muted);
+    font-size: .95rem;
+  }
+  .catalog-breadcrumb a {
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .catalog-view h1 { margin-bottom: .4rem; }
+  .catalog-help, .catalog-empty, .catalog-status { color: var(--muted); }
+  .catalog-list {
+    overflow: hidden;
+    margin: 1rem 0;
+    border: 1px solid var(--border);
+    border-radius: .65rem;
+    background: #fff;
+  }
+  .catalog-entry {
+    display: flex;
+    gap: .9rem;
+    align-items: center;
+    min-height: 4rem;
+    padding: .75rem 1rem;
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .catalog-entry:last-child { border-bottom: 0; }
+  .catalog-entry:hover, .catalog-entry:focus-visible {
+    background: #eef7f6;
+    text-decoration: none;
+  }
+  .catalog-entry:focus-visible {
+    outline: 3px solid rgba(21, 153, 87, .3);
+    outline-offset: -3px;
+  }
+  .catalog-icon {
+    flex: 0 0 2rem;
+    color: #159957;
+    font-size: 1.35rem;
+    text-align: center;
+  }
+  .catalog-entry-main { min-width: 0; }
+  .catalog-entry-name {
+    display: block;
+    overflow-wrap: anywhere;
+    color: #155799;
+    font-weight: 650;
+  }
+  .catalog-entry-meta {
+    display: block;
+    margin-top: .15rem;
+    color: var(--muted);
+    font-size: .85rem;
+  }
+  .catalog-code {
+    overflow: auto;
+    margin-top: 1rem;
+    padding: 1rem;
+    border: 1px solid var(--border);
+    border-radius: .65rem;
+    background: #f6f8fa;
+    color: #1f2933;
+    font: .9rem/1.55 Consolas, "Courier New", monospace;
+    tab-size: 4;
+    white-space: pre;
+  }
+  .catalog-error {
+    padding: .85rem 1rem;
+    border-left: 4px solid #c53030;
+    background: #fff5f5;
+    color: #9b2c2c;
+  }
+  [hidden] { display: none !important; }
+  @media (max-width: 600px) {
+    .catalog-entry { padding: .7rem .75rem; }
+    .catalog-code {
+      margin-right: -.5rem;
+      margin-left: -.5rem;
+      font-size: .82rem;
+    }
+  }
+</style>
+
+<div class="catalog-app" id="catalog-app">
+  <nav class="catalog-breadcrumb" aria-label="目前位置">
+    <a href="#" id="breadcrumb-home">scripts</a>
+    <span id="breadcrumb-folder-part" hidden>
+      <span aria-hidden="true">/</span>
+      <a href="#" id="breadcrumb-folder"></a>
+    </span>
+    <span id="breadcrumb-file-part" hidden>
+      <span aria-hidden="true">/</span>
+      <span id="breadcrumb-file"></span>
+    </span>
+  </nav>
+
+  <section class="catalog-view" id="home-view">
+    <h1>APDL 腳本目錄</h1>
+    <p class="catalog-help">點選資料夾以瀏覽其中的 APDL 腳本。</p>
+    <div class="catalog-list" id="folder-list"></div>
+    <p class="catalog-empty" id="folder-empty" hidden>
+      尚未找到腳本。請將檔案放入 <code>scripts/分類資料夾/</code>。
+    </p>
+  </section>
+
+  <section class="catalog-view" id="folder-view" hidden>
+    <h1 id="folder-title"></h1>
+    <p class="catalog-help">點選腳本即可在頁面中閱讀內容。</p>
+    <div class="catalog-list" id="script-list"></div>
+  </section>
+
+  <section class="catalog-view" id="script-view" hidden>
+    <h1 id="script-title"></h1>
+    <p class="catalog-status" id="script-status" aria-live="polite"></p>
+    <pre class="catalog-code" id="script-panel" tabindex="0" hidden><code id="script-code"></code></pre>
+  </section>
+
+  <section class="catalog-view" id="error-view" hidden>
+    <h1>找不到項目</h1>
+    <p class="catalog-error" id="route-error"></p>
+  </section>
+
+  <noscript><p class="catalog-error">這個自動目錄需要啟用 JavaScript。</p></noscript>
+</div>
+
+<script id="catalog-data" type="application/json">
+[
+{% assign catalog_files = site.static_files | sort: "path" %}
+{% assign first_script = true %}
+{% for file in catalog_files %}
+  {% assign parts = file.path | split: "/" %}
+  {% assign extension = file.extname | downcase %}
+  {% if parts[1] == "scripts" and parts.size >= 4 %}
+    {% if extension == ".mac" or extension == ".inp" or extension == ".txt" %}
+      {% unless first_script %},{% endunless %}
+      {
+        "path": {{ file.path | jsonify }},
+        "url": {{ file.path | remove_first: "/" | jsonify }},
+        "name": {{ file.name | jsonify }},
+        "folder": {{ parts[2] | jsonify }},
+        "extension": {{ extension | jsonify }}
+      }
+      {% assign first_script = false %}
+    {% endif %}
+  {% endif %}
+{% endfor %}
+]
+</script>
+
+<script>
+  (() => {
+    "use strict";
+
+    const byId = (id) => document.getElementById(id);
+    const views = [byId("home-view"), byId("folder-view"),
+      byId("script-view"), byId("error-view")];
+    const folderList = byId("folder-list");
+    const folderEmpty = byId("folder-empty");
+    const folderTitle = byId("folder-title");
+    const scriptList = byId("script-list");
+    const scriptTitle = byId("script-title");
+    const scriptStatus = byId("script-status");
+    const scriptPanel = byId("script-panel");
+    const scriptCode = byId("script-code");
+    const routeError = byId("route-error");
+    const folderCrumbPart = byId("breadcrumb-folder-part");
+    const folderCrumb = byId("breadcrumb-folder");
+    const fileCrumbPart = byId("breadcrumb-file-part");
+    const fileCrumb = byId("breadcrumb-file");
+    const collator = new Intl.Collator("zh-Hant", {
+      numeric: true,
+      sensitivity: "base"
+    });
+
+    let scripts;
+    let activeRequest = 0;
+
+    function showOnly(view) {
+      views.forEach((item) => {
+        item.hidden = item !== view;
+      });
+    }
+
+    function showError(message) {
+      activeRequest += 1;
+      document.title = "找不到項目 | APDL 腳本目錄";
+      setBreadcrumb("", "");
+      routeError.textContent = message;
+      showOnly(byId("error-view"));
+    }
+
+    try {
+      scripts = JSON.parse(byId("catalog-data").textContent);
+    } catch (error) {
+      scripts = [];
+      showError("腳本目錄資料無法解析。");
+      return;
+    }
+
+    scripts.sort((left, right) => collator.compare(left.path, right.path));
+    const scriptByPath = new Map(
+      scripts.map((script) => [script.path, script])
+    );
+    const folders = [...new Set(scripts.map((script) => script.folder))]
+      .sort((left, right) => collator.compare(left, right));
+
+    function routeHash(type, value) {
+      return "#" + type + "=" + encodeURIComponent(value);
+    }
+
+    function relativeName(script) {
+      const prefix = "/scripts/" + script.folder + "/";
+      return script.path.startsWith(prefix)
+        ? script.path.slice(prefix.length)
+        : script.name;
+    }
+
+    function createEntry(href, icon, name, meta) {
+      const link = document.createElement("a");
+      const iconElement = document.createElement("span");
+      const main = document.createElement("span");
+      const nameElement = document.createElement("span");
+      const metaElement = document.createElement("span");
+
+      link.className = "catalog-entry";
+      link.href = href;
+      iconElement.className = "catalog-icon";
+      iconElement.setAttribute("aria-hidden", "true");
+      iconElement.textContent = icon;
+      main.className = "catalog-entry-main";
+      nameElement.className = "catalog-entry-name";
+      nameElement.textContent = name;
+      metaElement.className = "catalog-entry-meta";
+      metaElement.textContent = meta;
+      main.append(nameElement, metaElement);
+      link.append(iconElement, main);
+      return link;
+    }
+
+    function setBreadcrumb(folder, file) {
+      folderCrumbPart.hidden = !folder;
+      fileCrumbPart.hidden = !file;
+      if (folder) {
+        folderCrumb.textContent = folder;
+        folderCrumb.href = routeHash("folder", folder);
+      }
+      if (file) {
+        fileCrumb.textContent = file;
+      }
+    }
+
+    function renderHome() {
+      activeRequest += 1;
+      document.title = "APDL 腳本目錄";
+      setBreadcrumb("", "");
+      folderList.replaceChildren();
+      folderEmpty.hidden = folders.length !== 0;
+
+      folders.forEach((folder) => {
+        const count = scripts.filter(
+          (script) => script.folder === folder
+        ).length;
+        folderList.append(createEntry(
+          routeHash("folder", folder),
+          "📁",
+          folder,
+          String(count) + " 個腳本"
+        ));
+      });
+      showOnly(byId("home-view"));
+    }
+
+    function renderFolder(folder) {
+      activeRequest += 1;
+      if (!folders.includes(folder)) {
+        showError("找不到資料夾：" + folder);
+        return;
+      }
+
+      const folderScripts = scripts.filter(
+        (script) => script.folder === folder
+      );
+      document.title = folder + " | APDL 腳本目錄";
+      setBreadcrumb(folder, "");
+      folderTitle.textContent = folder;
+      scriptList.replaceChildren();
+
+      folderScripts.forEach((script) => {
+        scriptList.append(createEntry(
+          routeHash("file", script.path),
+          "▤",
+          relativeName(script),
+          script.extension.toUpperCase().slice(1)
+        ));
+      });
+      showOnly(byId("folder-view"));
+    }
+
+    async function renderScript(path) {
+      const script = scriptByPath.get(path);
+      if (!script) {
+        showError("找不到腳本：" + path);
+        return;
+      }
+
+      const requestId = ++activeRequest;
+      const displayName = relativeName(script);
+      document.title = displayName + " | APDL 腳本目錄";
+      setBreadcrumb(script.folder, displayName);
+      scriptTitle.textContent = displayName;
+      scriptStatus.className = "catalog-status";
+      scriptStatus.textContent = "正在載入腳本內容…";
+      scriptStatus.hidden = false;
+      scriptPanel.hidden = true;
+      scriptCode.textContent = "";
+      showOnly(byId("script-view"));
+
+      try {
+        const response = await fetch(
+          new URL(script.url, document.baseURI),
+          { cache: "no-cache" }
+        );
+        if (!response.ok) {
+          throw new Error("HTTP " + response.status);
+        }
+        const content = await response.text();
+        if (requestId !== activeRequest) {
+          return;
+        }
+        scriptCode.textContent = content;
+        scriptStatus.hidden = true;
+        scriptPanel.hidden = false;
+      } catch (error) {
+        if (requestId !== activeRequest) {
+          return;
+        }
+        scriptStatus.className = "catalog-error";
+        scriptStatus.textContent =
+          "腳本內容載入失敗，請稍後重新整理頁面。";
+      }
+    }
+
+    function renderRoute() {
+      const hash = window.location.hash.slice(1);
+      if (!hash) {
+        renderHome();
+        return;
+      }
+
+      const separator = hash.indexOf("=");
+      if (separator < 1) {
+        showError("網址格式不正確。");
+        return;
+      }
+
+      const type = hash.slice(0, separator);
+      let value;
+      try {
+        value = decodeURIComponent(hash.slice(separator + 1));
+      } catch (error) {
+        showError("網址內容無法解析。");
+        return;
+      }
+
+      if (type === "folder") {
+        renderFolder(value);
+      } else if (type === "file") {
+        renderScript(value);
+      } else {
+        showError("網址指定了未知的頁面。");
+      }
+    }
+
+    window.addEventListener("hashchange", renderRoute);
+    renderRoute();
+  })();
+</script>
