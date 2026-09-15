@@ -1,0 +1,161 @@
+
+/PREP7
+
+! =============== Unit bump 參數設定 ===============
+! ── Die 位置與尺寸 ──
+Die_position_x = 6.565134
+Die_position_y = 4.022692
+Die_size_x     = 4.511864
+Die_size_y     = 12.847308
+
+! ========= 單顆 bump 參數
+bump_count_x    = 5
+bump_count_y    = 5
+total_bump_area = 13.55039
+
+! ========= bump 陣列複製設定
+kp_start = 2        ! TODO: 使用者自行設定：keypoint 起始編號（腳本其他地方已固定用掉 id=1，避免這裡產生的 keypoint 撞號）
+die_pitch_x = 10    ! TODO: 使用者自行設定：+X 方向陣列間距
+die_pitch_y = 20    ! TODO: 使用者自行設定：+Y 方向陣列間距
+die_count_x = 14    ! +X 方向總份數（含原始那一份）
+die_count_y = 5     ! +Y 方向總份數（含原始那一份）
+
+! ========= 背景 area 座標範圍（涵蓋 +X/+Y 方向複製後的完整陣列，範圍隨 die_count_x/y、die_pitch_x/y 自動延伸）
+bg_x1 = Die_position_x
+bg_y1 = Die_position_y
+bg_x2 = Die_position_x + Die_size_x + (die_count_x-1)*die_pitch_x
+bg_y2 = Die_position_y + Die_size_y + (die_count_y-1)*die_pitch_y
+
+! ========= 其他設定
+loc_tol = 1e-6   ! TODO: 使用者自行設定：ASEL,LOC 座標比對容差，避免浮點數誤差漏選
+
+! ========= 腳本流程開始，建立unit bump area出來
+
+bump_count_per_die = bump_count_x*bump_count_y
+
+*del,bump_xy
+*dim,bump_xy,array,bump_count_per_die,4
+
+NUMSTR,KP,kp_start
+
+*get,area_max_before,area,0,num,max   ! 記錄建立 bump 前的最大面號，供後面用 AGEN 陣列複製時精準選取這組 bump 面（不寫死面號）
+
+bump_area = total_bump_area / (bump_count_x*bump_count_y)   ! [FIX] * 前不可有空白，否則該行被當成註解截斷（見APDL手冊3.7節）
+bump_w    = sqrt(bump_area)
+bump_h    = sqrt(bump_area)
+pitch_x = (Die_size_x  - bump_count_x*bump_w) / (bump_count_x + 1)
+pitch_y = (Die_size_y - bump_count_y*bump_h) / (bump_count_y + 1)
+start_cx = Die_position_x + pitch_x + bump_w / 2
+start_cy = Die_position_y + pitch_y + bump_h / 2
+
+*DO,j,1,bump_count_y
+    *DO,i,1,bump_count_x
+        xc = start_cx + (i-1)*(bump_w + pitch_x)
+        yc = start_cy + (j-1)*(bump_h + pitch_y)
+        BLC5, xc, yc, bump_w, bump_h, 0
+
+        bump_idx = (j-1)*bump_count_x + i
+        bump_xy(bump_idx,1) = xc - bump_w/2   ! x1
+        bump_xy(bump_idx,2) = yc - bump_h/2   ! y1
+        bump_xy(bump_idx,3) = xc + bump_w/2   ! x2
+        bump_xy(bump_idx,4) = yc + bump_h/2   ! y2
+    *ENDDO
+*ENDDO
+
+*get,area_max_after,area,0,num,max
+ASEL,S,AREA,,area_max_before+1,area_max_after   ! 只選出剛剛新建的 bump 面
+CM,bump_base,AREA                                ! 存成 component，供 AGEN 陣列複製使用
+! APLOT
+
+! ========= 把unit bump area 進行陣列(+X 方向複製)
+*get,area_max_x0,area,0,num,max
+AGEN,die_count_x,bump_base, , ,die_pitch_x, , ,0,0,0
+*get,area_max_x1,area,0,num,max
+ASEL,S,AREA,,area_max_x0+1,area_max_x1
+CMSEL,A,bump_base,AREA
+CM,bump_x_array,AREA                              ! X 方向複製完成後的完整陣列
+
+! ========= +Y 方向複製(以 X 方向結果為基礎)
+*get,area_max_y0,area,0,num,max
+AGEN,die_count_y,bump_x_array, , , ,die_pitch_y, ,0,0,0
+*get,area_max_y1,area,0,num,max
+ASEL,S,AREA,,area_max_y0+1,area_max_y1
+CMSEL,A,bump_x_array,AREA
+CM,bump_full_array,AREA                           ! 最終完整 bump 陣列 component（die_count_x × die_count_y 組）
+! APLOT
+
+! ========= 用 bg_x1/y1/x2/y2 座標點建立背景 area，再用 ASEL,LOC 選出這個大面
+ALLSEL,ALL
+BLC4,bg_x1,bg_y1,bg_x2-bg_x1,bg_y2-bg_y1   ! 背景 area（左下角 + 寬高）
+
+ALLSEL,ALL
+ASEL,S,LOC,X,bg_x1-loc_tol,bg_x2+loc_tol
+ASEL,R,LOC,Y,bg_y1-loc_tol,bg_y2+loc_tol
+CMSEL,U,bump_full_array,AREA   ! 排除 bump 面本身，只留下剛建立的背景大面
+CM,bg_area,AREA
+ALLSEL,ALL
+
+! ── 用 bump_full_array 每個面的邊界（左下角/右上角）切割背景 area ──
+boptn,keep,0     ! 布林運算後刪除輸入面（預設值；ASBA 這行自己有帶 KEEP 引數，會覆蓋這裡的全域設定）
+boptn,nwarn,0    ! 布林運算「沒效果」時跳警告（這是預設值，等於沒改變行為；若要關掉警告訊息應設成 NWARN,1）
+btol,1e-3        ! 布林運算點重合容差，放寬到 1e-3（預設 1e-5）以吸收浮點誤差，提高 ASBA 成功率
+
+! ========= 布林第一種作法
+! [原始做法：Boolean Overlap，保留供比較]
+! CMSEL,S,bg_area,AREA
+! CMSEL,A,bump_full_array,AREA
+! AOVLAP,ALL
+
+! ========= 布林第二種作法
+! [改用 Boolean Subtract：背景扣掉 70 個 bump 面，並保留 bump_full_array 不被刪除]
+ASBA,bg_area,bump_full_array,,,KEEP
+
+
+! ========= 重新選取所有 bump
+! ── 用 ASEL,LOC 依座標重新選出全部 bump 面並建立 component ──
+! 注意：若某顆 bump 在此之前已被其他 Boolean 運算切成多個子面，
+!       這裡不假設每格剛好只有 1 個面，而是把該座標範圍內選到的「所有」面都收進 component。
+bump_count_total = bump_count_per_die*die_count_x*die_count_y
+
+*del,bump_loc_cnt
+*dim,bump_loc_cnt,array,bump_count_total
+first_cell = 1
+
+*DO,by,1,die_count_y
+    *DO,bx,1,die_count_x
+        *DO,j,1,bump_count_y
+            *DO,i,1,bump_count_x
+                xc = start_cx + (i-1)*(bump_w + pitch_x) + (bx-1)*die_pitch_x
+                yc = start_cy + (j-1)*(bump_h + pitch_y) + (by-1)*die_pitch_y
+                x1 = xc - bump_w/2
+                x2 = xc + bump_w/2
+                y1 = yc - bump_h/2
+                y2 = yc + bump_h/2
+
+                bump_idx = ((by-1)*die_count_x + (bx-1))*bump_count_per_die + (j-1)*bump_count_x + i
+
+                ALLSEL,ALL
+                ASEL,S,LOC,X,x1-loc_tol,x2+loc_tol
+                ASEL,R,LOC,Y,y1-loc_tol,y2+loc_tol
+                *get,bump_loc_cnt(bump_idx),area,0,count   ! 這格實際選到幾個面：1=完整bump，>1=之前被切過（仍會全部收進來），0=這格沒有面（可能被完全挖掉，需留意）
+
+                *if,bump_loc_cnt(bump_idx),gt,0,then
+                    *if,first_cell,eq,1,then
+                        CM,bump_full_array,AREA        ! 第一格：把目前選到的（可能不只一個）面直接存成 component
+                        first_cell = 0
+                    *else
+                        CM,bump_tmp_cell,AREA          ! 這一格選到的所有面，不論幾個，先存成暫存 component
+                        CMSEL,A,bump_full_array,AREA   ! 加回目前累積結果
+                        CMSEL,A,bump_tmp_cell,AREA     ! 再加上這一格新選到的
+                        CM,bump_full_array,AREA        ! 重新存回累積 component（等於聯集）
+                    *endif
+                *endif
+            *ENDDO
+        *ENDDO
+    *ENDDO
+*ENDDO
+
+CMSEL,S,bump_full_array,AREA      ! 最終累積結果：座標重新確認並重建的 component（覆蓋前面用面號差集建立的版本）
+ALLSEL,ALL
+
+! [方法二（先建大 area、用切割線切割背景）已搬到獨立檔案 test3.txt]
