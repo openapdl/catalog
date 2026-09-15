@@ -1,0 +1,1532 @@
+! ==========================================================
+!  Package bounding-box report
+!  輸出：bbox.txt（寫在當前工作目錄）
+! ==========================================================
+
+! ── 只清除這支腳本自己會用到的參數，確保重跑時不殘留上一次的數值，
+!    但不動到 session 裡其他跟這支腳本無關的參數（不用 *del,all）──
+*del,mmax        $  *del,vol_mat     $  *del,vol_total
+*del,m           $  *del,ne
+*del,nb          $  *del,bxmin       $  *del,bxmax
+*del,bymin       $  *del,bymax       $  *del,bzmin       $  *del,bzmax
+*del,na          $  *del,axmin       $  *del,axmax
+*del,aymin       $  *del,aymax       $  *del,azmin       $  *del,azmax
+*del,gxmin       $  *del,gxmax       $  *del,gymin       $  *del,gymax
+*del,gzmin       $  *del,gzmax
+*del,tot_elem    $  *del,tot_node
+*del,m_mold      $  *del,m_die
+*del,ne1         $  *del,ne2
+*del,z_mold      $  *del,z_die       $  *del,z_die_bot
+*del,mclr        $  *del,gap_chip_sm
+*del,z_above_top $  *del,ne_above_ref $  *del,z_above_bottom
+*del,nc          $  *del,cxmin        $  *del,cxmax
+*del,cymin       $  *del,cymax        $  *del,czmin        $  *del,czmax
+*del,ne_chk_     $  *del,ne_full_     $  *del,zmax_full_   $  *del,zmin_full_
+*del,vol_pct_tot_ $ *del,z_mid_
+*del,elist_pre_  $  *del,evol_pre_    $  *del,i_pre_
+! ── 以下是「MATERIAL TOTAL VOLUME 之後的逐層表格改依 zmax 全域降冪排序」用到的
+!    暫存變數：nlay_ 存每個 MAT 的 layer 數、gb_* 是蒐集全表所有列後排序輸出用的
+!    全域陣列，一律以底線結尾，同一組名稱在 5 個表格間重複使用、各自開頭明確刪除 ──
+*del,nlay_       $  *del,gb_total_    $  *del,gb_idx_
+*del,gb_m_       $  *del,gb_k_
+*del,gb_xmin_    $  *del,gb_xmax_     $  *del,gb_ymin_    $  *del,gb_ymax_
+*del,gb_zmin_    $  *del,gb_zmax_     $  *del,gb_vol_     $  *del,gb_pct_    $  *del,gb_area_
+*del,gb_negzmax_ $  *del,gb_perm_
+! ── 以下是「逐材料分層 bbox」演算法（PER-MATERIAL BOUNDING BOX / BELOW-ABOVE z=0 /
+!    ABOVE MAT n 共用同一套邏輯）用到的暫存變數，一律以底線結尾。
+!    明確逐一列出刪除，不用 *DEL,,PRM_ 這種寫法，比較保險 ──
+*del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+*del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+*del,ib_         $  *del,ne_layer_   $  *del,i_band_
+*del,elist_band_ $  *del,evol_band_
+*del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+*del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+*del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+! ── 使用者可調參數：若要額外輸出「以某材料頂面 Z 為門檻」的 ABOVE 區塊，
+!    在此填入該材料編號；預設 0 = 不執行 ──
+m_above = 0
+
+/PREP7
+CSYS,0
+ALLSEL,ALL
+SELTOL,1e-7
+*GET,mmax,MAT,0,NUM,MAX
+
+! ── 逐材料體積（供下方 PER-MATERIAL BOUNDING BOX 表格的 volume/percent 欄位使用）──
+! 原本用 ETABLE,,VOLU + SSUM（POST1 專用指令）取得元素體積，實測發現 SSUM/*GET,,SSUM
+! 在從未求解過（無 .rst / 無 SET 過結果）時會直接報錯（Unknown label ... 被忽略）。
+! 改用 *VGET,,ELEM,,GEOM 直接指定 ENTNUM 空白時，*VGET 會依「元素編號 1,2,3...」依序抓，
+! 跟目前選取的元素完全無關（官方文件寫明：不論該元素是否存在/被選取都會照編號往下抓），
+! 導致抓到別的材料、甚至不存在的元素編號（"Some entities...were undefined" 警告即為此因）。
+! 正確做法：先用 *VGET,,ELEM,,ELIST 取得「目前實際選取」的元素編號緊湊清單，
+! 再逐一用 *GET,,ELEM,N,VOLU（單一元素查詢，PREP7 資料庫層級，不需要求解結果）取體積、加總。
+*dim,vol_mat,array,mmax
+vol_total = 0
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        vol_mat(m) = 0
+        *CYCLE
+    *ENDIF
+    *del,elist_pre_   $  *del,evol_pre_
+    *dim,elist_pre_,array,ne
+    *vget,elist_pre_,elem,,elist
+    *dim,evol_pre_,array,ne
+    *do,i_pre_,1,ne
+        *get,evol_pre_(i_pre_),elem,elist_pre_(i_pre_),volu
+    *enddo
+    *vscfun,vol_mat(m),sum,evol_pre_
+    vol_total = vol_total + vol_mat(m)
+*ENDDO
+
+*CFOPEN,bbox,txt
+
+! ==========================================================
+!  1. 逐材料明細
+! ==========================================================
+*VWRITE
+('=== PER-MATERIAL BOUNDING BOX ===')
+*VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        *CYCLE
+    *ENDIF
+
+    ! ── 同一 MAT 可能存在於彼此不相連的多個層（例如上下對稱各一層）──
+    ! 用「元素是否共用節點」判斷連通性，而非用 Z 座標猜門檻。
+    ! 這個區塊的暫存變數一律以底線結尾，每個 MAT 迴圈開頭把它們逐一明確刪除，
+    ! 避免 *DIM 每次重設陣列大小時跳出「already exists, redefined」的提示
+    ! （不用 *DEL,,PRM_ 這種寫法，明確列出每個變數比較保險）。
+    *del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+    *del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+    *del,ib_         $  *del,ne_layer_   $  *del,i_band_
+    *del,elist_band_ $  *del,evol_band_
+    *del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+    *del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+    *del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+    ! 第一輪只數這個 MAT 有幾個獨立連通層（決定陣列大小）
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+
+    *dim,lay_xmin_,array,nband_m_  $  *dim,lay_xmax_,array,nband_m_
+    *dim,lay_ymin_,array,nband_m_  $  *dim,lay_ymax_,array,nband_m_
+    *dim,lay_zmin_,array,nband_m_  $  *dim,lay_zmax_,array,nband_m_
+    *dim,lay_vol_,array,nband_m_
+    *dim,lay_perm_,array,nband_m_
+
+    ! 第二輪：重跑同一套決定性 flood-fill（種子挑選規則相同，順序與第一輪一致），
+    ! 這次把每層的 bbox/體積存進陣列，最後依 zmin 排序輸出
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    CM,cm_remain,ELEM
+    ib_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        ib_ = ib_ + 1
+        CM,cm_layer,ELEM
+
+        NSLE,S
+        *GET,lay_xmin_(ib_),NODE,0,MNLOC,X  $  *GET,lay_xmax_(ib_),NODE,0,MXLOC,X
+        *GET,lay_ymin_(ib_),NODE,0,MNLOC,Y  $  *GET,lay_ymax_(ib_),NODE,0,MXLOC,Y
+        *GET,lay_zmin_(ib_),NODE,0,MNLOC,Z  $  *GET,lay_zmax_(ib_),NODE,0,MXLOC,Z
+
+        CMSEL,S,cm_layer
+        *GET,ne_layer_,ELEM,0,COUNT
+        *del,elist_band_  $  *del,evol_band_
+        *dim,elist_band_,array,ne_layer_
+        *vget,elist_band_,elem,,elist
+        *dim,evol_band_,array,ne_layer_
+        *do,i_band_,1,ne_layer_
+            *get,evol_band_(i_band_),elem,elist_band_(i_band_),volu
+        *enddo
+        *vscfun,lay_vol_(ib_),sum,evol_band_
+
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+
+    ! 依 zmin 排序（LAYER 1 = zmin 最小）：*MOPER,,,SORT 把 lay_zmin_ 就地排序，
+    ! lay_perm_(k_) 記錄排序後第 k_ 筆對應到排序前的原始索引
+    *moper,lay_perm_,lay_zmin_,sort,,1
+
+    *do,k_,1,nband_m_
+        orig_i_ = lay_perm_(k_)
+        vol_pct_k_ = lay_vol_(orig_i_)/vol_total*100
+        ! 每層是均勻厚度的水平薄片，體積 = 底面積 × 厚度，所以底面積 = 體積 / 厚度，
+        ! 不管這層 XY 形狀多不規則（有沒有孔洞）都成立，不用另外做投影/取樣運算。
+        ! 有些材料（如接觸/膠合面元素）厚度為 0，此時 AREA 無意義，直接填 0 避免除以零中斷腳本
+        *IF,(lay_zmax_(orig_i_)-lay_zmin_(k_)),EQ,0,THEN
+            area_k_ = 0
+        *ELSE
+            area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
+        *ENDIF
+        *VLEN,1        ! 只印這一列：*VWRITE 對陣列索引預設會從起始索引印到陣列結尾，不加這行會重複列印
+        *VWRITE,m,k_,lay_xmin_(orig_i_),lay_ymin_(orig_i_),lay_zmin_(k_),lay_xmax_(orig_i_),lay_ymax_(orig_i_),lay_zmax_(orig_i_),lay_xmax_(orig_i_)-lay_xmin_(orig_i_),lay_ymax_(orig_i_)-lay_ymin_(orig_i_),lay_zmax_(orig_i_)-lay_zmin_(k_),lay_vol_(orig_i_),vol_pct_k_,area_k_
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+    *enddo
+*ENDDO
+
+! ==========================================================
+!  1b. 每個 MAT 所有 LAYER 加總的總體積（不用自己手動加總）
+!      vol_mat(m) 是檔案最前面體積預算迴圈算出的該材料「全部元素」體積，
+!      本來就不分層，直接印出來即可，不必重算。
+! ==========================================================
+*VWRITE
+(' ')
+*VWRITE
+('=== MATERIAL TOTAL VOLUME ===')
+*VWRITE
+('  MAT              VOLUME   PERCENT')
+
+*DO,m,1,mmax
+    *IF,vol_mat(m),EQ,0,THEN
+        *CYCLE
+    *ENDIF
+    vol_pct_tot_ = vol_mat(m)/vol_total*100
+    *VLEN,1
+    *VWRITE,m,vol_mat(m),vol_pct_tot_
+(F5.0,F20.2,F10.4)
+*ENDDO
+
+! ==========================================================
+!  2. z = 0 以下
+! ==========================================================
+*VWRITE
+(' ')
+*VWRITE
+('=== BELOW z=0 ===')
+*VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+
+! ── 先算這個表格全部 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+!    （用精確總數而非估計上限，避免陣列尾端殘留 0 值混進 zmax 排序）──
+*del,nlay_  $  *del,gb_total_
+*dim,nlay_,array,mmax
+gb_total_ = 0
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,-1e9,0
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        nlay_(m) = 0
+        *CYCLE
+    *ENDIF
+    *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+    *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+    nlay_(m) = nband_m_
+    gb_total_ = gb_total_ + nband_m_
+*ENDDO
+
+*del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+*del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+*IF,gb_total_,GT,0,THEN
+    *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+    *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+    *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+    *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+    *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+*ENDIF
+gb_idx_ = 0
+
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,-1e9,0
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        *CYCLE
+    *ENDIF
+
+    ! ── 同一 MAT 在這個 Z 範圍內可能仍分成彼此不相連的多個層 ──
+    ! 用「元素是否共用節點」判斷連通性，而非用 Z 座標猜門檻。
+    ! 這個區塊的暫存變數一律以底線結尾，每個 MAT 迴圈開頭把它們逐一明確刪除，
+    ! 避免 *DIM 每次重設陣列大小時跳出「already exists, redefined」的提示
+    ! （不用 *DEL,,PRM_ 這種寫法，明確列出每個變數比較保險）。
+    *del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+    *del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+    *del,ib_         $  *del,ne_layer_   $  *del,i_band_
+    *del,elist_band_ $  *del,evol_band_
+    *del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+    *del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+    *del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+    ! 第一輪只數這個 MAT（在此 Z 範圍內）有幾個獨立連通層（決定陣列大小）
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+
+    *dim,lay_xmin_,array,nband_m_  $  *dim,lay_xmax_,array,nband_m_
+    *dim,lay_ymin_,array,nband_m_  $  *dim,lay_ymax_,array,nband_m_
+    *dim,lay_zmin_,array,nband_m_  $  *dim,lay_zmax_,array,nband_m_
+    *dim,lay_vol_,array,nband_m_
+    *dim,lay_perm_,array,nband_m_
+
+    ! 第二輪：重跑同一套決定性 flood-fill（種子挑選規則相同，順序與第一輪一致），
+    ! 這次把每層的 bbox/體積存進陣列，最後依 zmin 排序輸出
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,-1e9,0
+    CM,cm_remain,ELEM
+    ib_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        ib_ = ib_ + 1
+        CM,cm_layer,ELEM
+
+        NSLE,S
+        *GET,lay_xmin_(ib_),NODE,0,MNLOC,X  $  *GET,lay_xmax_(ib_),NODE,0,MXLOC,X
+        *GET,lay_ymin_(ib_),NODE,0,MNLOC,Y  $  *GET,lay_ymax_(ib_),NODE,0,MXLOC,Y
+        *GET,lay_zmin_(ib_),NODE,0,MNLOC,Z  $  *GET,lay_zmax_(ib_),NODE,0,MXLOC,Z
+
+        CMSEL,S,cm_layer
+        *GET,ne_layer_,ELEM,0,COUNT
+        *del,elist_band_  $  *del,evol_band_
+        *dim,elist_band_,array,ne_layer_
+        *vget,elist_band_,elem,,elist
+        *dim,evol_band_,array,ne_layer_
+        *do,i_band_,1,ne_layer_
+            *get,evol_band_(i_band_),elem,elist_band_(i_band_),volu
+        *enddo
+        *vscfun,lay_vol_(ib_),sum,evol_band_
+
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+
+    *moper,lay_perm_,lay_zmin_,sort,,1
+
+    *do,k_,1,nband_m_
+        orig_i_ = lay_perm_(k_)
+        vol_pct_k_ = lay_vol_(orig_i_)/vol_total*100
+        ! 有些材料（如接觸/膠合面元素）厚度為 0，此時 AREA 無意義，直接填 0 避免除以零中斷腳本
+        *IF,(lay_zmax_(orig_i_)-lay_zmin_(k_)),EQ,0,THEN
+            area_k_ = 0
+        *ELSE
+            area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
+        *ENDIF
+        gb_idx_ = gb_idx_ + 1
+        gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+        gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+        gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+        gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+        gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+        gb_area_(gb_idx_) = area_k_
+    *enddo
+*ENDDO
+
+! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+*IF,gb_total_,GT,0,THEN
+    *del,gb_negzmax_ $ *del,gb_perm_
+    *dim,gb_negzmax_,array,gb_total_
+    *do,k_,1,gb_total_
+        gb_negzmax_(k_) = -gb_zmax_(k_)
+    *enddo
+    *dim,gb_perm_,array,gb_total_
+    *moper,gb_perm_,gb_negzmax_,sort,,1
+
+    *do,k_,1,gb_total_
+        orig_i_ = gb_perm_(k_)
+        *VLEN,1
+        *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+    *enddo
+*ENDIF
+
+ALLSEL,ALL
+ESEL,S,CENT,Z,-1e9,0
+*GET,nb,ELEM,0,COUNT
+*IF,nb,GT,0,THEN
+    NSLE,S
+    *GET,bxmin,NODE,0,MNLOC,X  $  *GET,bxmax,NODE,0,MXLOC,X
+    *GET,bymin,NODE,0,MNLOC,Y  $  *GET,bymax,NODE,0,MXLOC,Y
+    *GET,bzmin,NODE,0,MNLOC,Z  $  *GET,bzmax,NODE,0,MXLOC,Z
+    *VWRITE
+('                   X         Y         Z')
+    *VWRITE,bxmin,bymin,bzmin
+('  min     ',3F10.4)
+    *VWRITE,bxmax,bymax,bzmax
+('  max     ',3F10.4)
+    *VWRITE,bxmax-bxmin,bymax-bymin,bzmax-bzmin
+('  L/W/T   ',3F10.4)
+*ENDIF
+
+! ==========================================================
+!  3. z = 0 以上
+! ==========================================================
+*VWRITE
+(' ')
+*VWRITE
+('=== ABOVE z=0 ===')
+*VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+
+! ── 先算這個表格全部 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+!    （用精確總數而非估計上限，避免陣列尾端殘留 0 值混進 zmax 排序）──
+*del,nlay_  $  *del,gb_total_
+*dim,nlay_,array,mmax
+gb_total_ = 0
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,0,1e9
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        nlay_(m) = 0
+        *CYCLE
+    *ENDIF
+    *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+    *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+    nlay_(m) = nband_m_
+    gb_total_ = gb_total_ + nband_m_
+*ENDDO
+
+*del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+*del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+*IF,gb_total_,GT,0,THEN
+    *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+    *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+    *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+    *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+    *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+*ENDIF
+gb_idx_ = 0
+
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,0,1e9
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        *CYCLE
+    *ENDIF
+
+    ! ── 同一 MAT 在這個 Z 範圍內可能仍分成彼此不相連的多個層 ──
+    ! 這個區塊的暫存變數一律以底線結尾，每個 MAT 迴圈開頭把它們逐一明確刪除
+    ! （不用 *DEL,,PRM_ 這種寫法，明確列出每個變數比較保險）。
+    *del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+    *del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+    *del,ib_         $  *del,ne_layer_   $  *del,i_band_
+    *del,elist_band_ $  *del,evol_band_
+    *del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+    *del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+    *del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+
+    *dim,lay_xmin_,array,nband_m_  $  *dim,lay_xmax_,array,nband_m_
+    *dim,lay_ymin_,array,nband_m_  $  *dim,lay_ymax_,array,nband_m_
+    *dim,lay_zmin_,array,nband_m_  $  *dim,lay_zmax_,array,nband_m_
+    *dim,lay_vol_,array,nband_m_
+    *dim,lay_perm_,array,nband_m_
+
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,0,1e9
+    CM,cm_remain,ELEM
+    ib_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        ib_ = ib_ + 1
+        CM,cm_layer,ELEM
+
+        NSLE,S
+        *GET,lay_xmin_(ib_),NODE,0,MNLOC,X  $  *GET,lay_xmax_(ib_),NODE,0,MXLOC,X
+        *GET,lay_ymin_(ib_),NODE,0,MNLOC,Y  $  *GET,lay_ymax_(ib_),NODE,0,MXLOC,Y
+        *GET,lay_zmin_(ib_),NODE,0,MNLOC,Z  $  *GET,lay_zmax_(ib_),NODE,0,MXLOC,Z
+
+        CMSEL,S,cm_layer
+        *GET,ne_layer_,ELEM,0,COUNT
+        *del,elist_band_  $  *del,evol_band_
+        *dim,elist_band_,array,ne_layer_
+        *vget,elist_band_,elem,,elist
+        *dim,evol_band_,array,ne_layer_
+        *do,i_band_,1,ne_layer_
+            *get,evol_band_(i_band_),elem,elist_band_(i_band_),volu
+        *enddo
+        *vscfun,lay_vol_(ib_),sum,evol_band_
+
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+
+    *moper,lay_perm_,lay_zmin_,sort,,1
+
+    *do,k_,1,nband_m_
+        orig_i_ = lay_perm_(k_)
+        vol_pct_k_ = lay_vol_(orig_i_)/vol_total*100
+        ! 有些材料（如接觸/膠合面元素）厚度為 0，此時 AREA 無意義，直接填 0 避免除以零中斷腳本
+        *IF,(lay_zmax_(orig_i_)-lay_zmin_(k_)),EQ,0,THEN
+            area_k_ = 0
+        *ELSE
+            area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
+        *ENDIF
+        gb_idx_ = gb_idx_ + 1
+        gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+        gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+        gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+        gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+        gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+        gb_area_(gb_idx_) = area_k_
+    *enddo
+*ENDDO
+
+! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+*IF,gb_total_,GT,0,THEN
+    *del,gb_negzmax_ $ *del,gb_perm_
+    *dim,gb_negzmax_,array,gb_total_
+    *do,k_,1,gb_total_
+        gb_negzmax_(k_) = -gb_zmax_(k_)
+    *enddo
+    *dim,gb_perm_,array,gb_total_
+    *moper,gb_perm_,gb_negzmax_,sort,,1
+
+    *do,k_,1,gb_total_
+        orig_i_ = gb_perm_(k_)
+        *VLEN,1
+        *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+    *enddo
+*ENDIF
+
+ALLSEL,ALL
+ESEL,S,CENT,Z,0,1e9
+*GET,na,ELEM,0,COUNT
+*IF,na,GT,0,THEN
+    NSLE,S
+    *GET,axmin,NODE,0,MNLOC,X  $  *GET,axmax,NODE,0,MXLOC,X
+    *GET,aymin,NODE,0,MNLOC,Y  $  *GET,aymax,NODE,0,MXLOC,Y
+    *GET,azmin,NODE,0,MNLOC,Z  $  *GET,azmax,NODE,0,MXLOC,Z
+    *VWRITE
+('                   X         Y         Z')
+    *VWRITE,axmin,aymin,azmin
+('  min     ',3F10.4)
+    *VWRITE,axmax,aymax,azmax
+('  max     ',3F10.4)
+    *VWRITE,axmax-axmin,aymax-aymin,azmax-azmin
+('  L/W/T   ',3F10.4)
+*ENDIF
+
+! ==========================================================
+!  4. 整體包絡盒
+! ==========================================================
+ALLSEL,ALL
+*GET,gxmin,NODE,0,MNLOC,X  $  *GET,gxmax,NODE,0,MXLOC,X
+*GET,gymin,NODE,0,MNLOC,Y  $  *GET,gymax,NODE,0,MXLOC,Y
+*GET,gzmin,NODE,0,MNLOC,Z  $  *GET,gzmax,NODE,0,MXLOC,Z
+*GET,tot_elem,ELEM,0,COUNT
+*GET,tot_node,NODE,0,COUNT
+z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
+
+*VWRITE
+(' ')
+*VWRITE
+('=== OVERALL ===')
+*VWRITE,tot_elem,tot_node
+('  total elements ',F12.0,'   total nodes ',F12.0)
+*VWRITE
+('                   X         Y         Z')
+*VWRITE,gxmin,gymin,gzmin
+('  min     ',3F10.4)
+*VWRITE,gxmax,gymax,gzmax
+('  max     ',3F10.4)
+*VWRITE,gxmax-gxmin,gymax-gymin,gzmax-gzmin
+('  L/W/T   ',3F10.4)
+*VWRITE,z_mid_
+('  Z mid-thickness   ',F12.4)
+
+! ==========================================================
+!  5. 以指定材料頂面 Z 為門檻（使用者於檔案開頭設定 m_above；預設 0 = 不執行）
+! ==========================================================
+*IF,m_above,NE,0,THEN
+    ALLSEL,ALL
+    ESEL,S,MAT,,m_above
+    *GET,ne_above_ref,ELEM,0,COUNT
+    *IF,ne_above_ref,GT,0,THEN
+        NSLE,S
+        *GET,z_above_top,NODE,0,MXLOC,Z
+        *GET,z_above_bottom,NODE,0,MNLOC,Z
+
+        *VWRITE
+(' ')
+        *VWRITE,m_above
+('=== ABOVE MAT ',F5.0,' ===')
+        *VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+
+        ! ── 先算這個表格全部 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+        !    （用精確總數而非估計上限，避免陣列尾端殘留 0 值混進 zmax 排序）──
+        *del,nlay_  $  *del,gb_total_
+        *dim,nlay_,array,mmax
+        gb_total_ = 0
+        *DO,m,1,mmax
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne,ELEM,0,COUNT
+            *IF,ne,EQ,0,THEN
+                nlay_(m) = 0
+                *CYCLE
+            *ENDIF
+            *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+            *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+            nlay_(m) = nband_m_
+            gb_total_ = gb_total_ + nband_m_
+        *ENDDO
+
+        *del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+        *del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+        *IF,gb_total_,GT,0,THEN
+            *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+            *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+            *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+            *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+            *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+        *ENDIF
+        gb_idx_ = 0
+
+        *DO,m,1,mmax
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne,ELEM,0,COUNT
+            *IF,ne,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+
+            ! ── 同一 MAT 在這個 Z 範圍內可能仍分成彼此不相連的多個層 ──
+            ! 這個區塊的暫存變數一律以底線結尾，每個 MAT 迴圈開頭把它們逐一明確刪除
+            ! （不用 *DEL,,PRM_ 這種寫法，明確列出每個變數比較保險）。
+            *del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+            *del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+            *del,ib_         $  *del,ne_layer_   $  *del,i_band_
+            *del,elist_band_ $  *del,evol_band_
+            *del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+            *del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+            *del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+
+            *dim,lay_xmin_,array,nband_m_  $  *dim,lay_xmax_,array,nband_m_
+            *dim,lay_ymin_,array,nband_m_  $  *dim,lay_ymax_,array,nband_m_
+            *dim,lay_zmin_,array,nband_m_  $  *dim,lay_zmax_,array,nband_m_
+            *dim,lay_vol_,array,nband_m_
+            *dim,lay_perm_,array,nband_m_
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            CM,cm_remain,ELEM
+            ib_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                ib_ = ib_ + 1
+                CM,cm_layer,ELEM
+
+                NSLE,S
+                *GET,lay_xmin_(ib_),NODE,0,MNLOC,X  $  *GET,lay_xmax_(ib_),NODE,0,MXLOC,X
+                *GET,lay_ymin_(ib_),NODE,0,MNLOC,Y  $  *GET,lay_ymax_(ib_),NODE,0,MXLOC,Y
+                *GET,lay_zmin_(ib_),NODE,0,MNLOC,Z  $  *GET,lay_zmax_(ib_),NODE,0,MXLOC,Z
+
+                CMSEL,S,cm_layer
+                *GET,ne_layer_,ELEM,0,COUNT
+                *del,elist_band_  $  *del,evol_band_
+                *dim,elist_band_,array,ne_layer_
+                *vget,elist_band_,elem,,elist
+                *dim,evol_band_,array,ne_layer_
+                *do,i_band_,1,ne_layer_
+                    *get,evol_band_(i_band_),elem,elist_band_(i_band_),volu
+                *enddo
+                *vscfun,lay_vol_(ib_),sum,evol_band_
+
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+
+            *moper,lay_perm_,lay_zmin_,sort,,1
+
+            *do,k_,1,nband_m_
+                orig_i_ = lay_perm_(k_)
+                vol_pct_k_ = lay_vol_(orig_i_)/vol_total*100
+                ! 有些材料（如接觸/膠合面元素）厚度為 0，此時 AREA 無意義，直接填 0 避免除以零中斷腳本
+                *IF,(lay_zmax_(orig_i_)-lay_zmin_(k_)),EQ,0,THEN
+                    area_k_ = 0
+                *ELSE
+                    area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
+                *ENDIF
+                gb_idx_ = gb_idx_ + 1
+                gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+                gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+                gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+                gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+                gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+                gb_area_(gb_idx_) = area_k_
+            *enddo
+        *ENDDO
+
+        ! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+        *IF,gb_total_,GT,0,THEN
+            *del,gb_negzmax_ $ *del,gb_perm_
+            *dim,gb_negzmax_,array,gb_total_
+            *do,k_,1,gb_total_
+                gb_negzmax_(k_) = -gb_zmax_(k_)
+            *enddo
+            *dim,gb_perm_,array,gb_total_
+            *moper,gb_perm_,gb_negzmax_,sort,,1
+
+            *do,k_,1,gb_total_
+                orig_i_ = gb_perm_(k_)
+                *VLEN,1
+                *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+            *enddo
+        *ENDIF
+
+        ALLSEL,ALL
+        ESEL,S,CENT,Z,z_above_top,1e9
+        *GET,nc,ELEM,0,COUNT
+        *IF,nc,GT,0,THEN
+            NSLE,S
+            *GET,cxmin,NODE,0,MNLOC,X  $  *GET,cxmax,NODE,0,MXLOC,X
+            *GET,cymin,NODE,0,MNLOC,Y  $  *GET,cymax,NODE,0,MXLOC,Y
+            *GET,czmin,NODE,0,MNLOC,Z  $  *GET,czmax,NODE,0,MXLOC,Z
+            *VWRITE
+('                   X         Y         Z')
+            *VWRITE,cxmin,cymin,czmin
+('  min     ',3F10.4)
+            *VWRITE,cxmax,cymax,czmax
+('  max     ',3F10.4)
+            *VWRITE,cxmax-cxmin,cymax-cymin,czmax-czmin
+('  L/W/T   ',3F10.4)
+        *ENDIF
+
+        ! ──────────────────────────────────────────────────────────
+        ! m_above 本身的頂面高度不一定到處一致（例如局部有薄蓋/凸出結構）。
+        ! 上面的 ABOVE 判斷只認「元素中心點 Z > z_above_top（m_above 全域最高點）」，
+        ! 如果某材料剛好貼齊在 m_above 頂面「比較矮的那一段」，它的中心點就不會超過
+        ! z_above_top，於是整個被排除、且完全沒有任何提示（實測案例：m_above=7 時，
+        ! MAT1/MAT17 的頂面跟 MAT7 的最高點一樣高，但因為中心點沒有更高而被排除，
+        ! 只看前視圖看不出來，要切等角圖才看得到）。
+        ! 這裡另外抓出「沒有出現在上面 ABOVE 表格，但自己本身頂面已經搆到/超過
+        ! z_above_top」的材料，代表 m_above 頂面在這些材料所在的 X-Y 範圍其實沒有
+        ! z_above_top 那麼高（頂面不等高），特別列出來提醒使用者。
+        ! ──────────────────────────────────────────────────────────
+
+        ! ── 先算這個表格全部符合條件的 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+        !    （篩選條件需與下面偵測邏輯一致：排除 m_above 本身、已出現在 ABOVE 表格、
+        !    以及頂面本來就沒有搆到/超過 z_above_top 的材料）──
+        *del,nlay_  $  *del,gb_total_
+        *dim,nlay_,array,mmax
+        gb_total_ = 0
+        *DO,m,1,mmax
+            nlay_(m) = 0
+            *IF,m,EQ,m_above,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne_chk_,ELEM,0,COUNT
+            *IF,ne_chk_,GT,0,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne_full_,ELEM,0,COUNT
+            *IF,ne_full_,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+            NSLE,S
+            *GET,zmax_full_,NODE,0,MXLOC,Z
+            *IF,zmax_full_,LT,z_above_top,THEN
+                *CYCLE
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne,ELEM,0,COUNT
+            *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+            *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+            nlay_(m) = nband_m_
+            gb_total_ = gb_total_ + nband_m_
+        *ENDDO
+
+        *del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+        *del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+        *IF,gb_total_,GT,0,THEN
+            *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+            *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+            *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+            *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+            *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+
+            *VWRITE
+(' ')
+            *VWRITE,m_above
+('=== HEIGHT NOT UNIFORM ON MAT ',F5.0,' TOP ===')
+            *VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+        *ENDIF
+        gb_idx_ = 0
+
+        *DO,m,1,mmax
+            *IF,m,EQ,m_above,THEN
+                *CYCLE
+            *ENDIF
+
+            ! 先看這個材料是不是已經出現在上面的 ABOVE 表格裡，是的話不用再提醒
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne_chk_,ELEM,0,COUNT
+            *IF,ne_chk_,GT,0,THEN
+                *CYCLE
+            *ENDIF
+
+            ! 再看這個材料自己（不限 Z）本身頂面有沒有搆到/超過 z_above_top
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne_full_,ELEM,0,COUNT
+            *IF,ne_full_,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+            NSLE,S
+            *GET,zmax_full_,NODE,0,MXLOC,Z
+            *IF,zmax_full_,LT,z_above_top,THEN
+                *CYCLE   ! 這個材料真的比較矮，跟 m_above 沒有齊平，正常排除
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne,ELEM,0,COUNT
+
+            ! ── 同一 MAT 可能仍分成彼此不相連的多個層/區域 ──
+            ! 這個區塊的暫存變數一律以底線結尾，每個 MAT 迴圈開頭把它們逐一明確刪除
+            ! （不用 *DEL,,PRM_ 這種寫法，明確列出每個變數比較保險）。
+            *del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+            *del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+            *del,ib_         $  *del,ne_layer_   $  *del,i_band_
+            *del,elist_band_ $  *del,evol_band_
+            *del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+            *del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+            *del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+
+            *dim,lay_xmin_,array,nband_m_  $  *dim,lay_xmax_,array,nband_m_
+            *dim,lay_ymin_,array,nband_m_  $  *dim,lay_ymax_,array,nband_m_
+            *dim,lay_zmin_,array,nband_m_  $  *dim,lay_zmax_,array,nband_m_
+            *dim,lay_vol_,array,nband_m_
+            *dim,lay_perm_,array,nband_m_
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            CM,cm_remain,ELEM
+            ib_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                ib_ = ib_ + 1
+                CM,cm_layer,ELEM
+
+                NSLE,S
+                *GET,lay_xmin_(ib_),NODE,0,MNLOC,X  $  *GET,lay_xmax_(ib_),NODE,0,MXLOC,X
+                *GET,lay_ymin_(ib_),NODE,0,MNLOC,Y  $  *GET,lay_ymax_(ib_),NODE,0,MXLOC,Y
+                *GET,lay_zmin_(ib_),NODE,0,MNLOC,Z  $  *GET,lay_zmax_(ib_),NODE,0,MXLOC,Z
+
+                CMSEL,S,cm_layer
+                *GET,ne_layer_,ELEM,0,COUNT
+                *del,elist_band_  $  *del,evol_band_
+                *dim,elist_band_,array,ne_layer_
+                *vget,elist_band_,elem,,elist
+                *dim,evol_band_,array,ne_layer_
+                *do,i_band_,1,ne_layer_
+                    *get,evol_band_(i_band_),elem,elist_band_(i_band_),volu
+                *enddo
+                *vscfun,lay_vol_(ib_),sum,evol_band_
+
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+
+            *moper,lay_perm_,lay_zmin_,sort,,1
+
+            *do,k_,1,nband_m_
+                orig_i_ = lay_perm_(k_)
+                vol_pct_k_ = lay_vol_(orig_i_)/vol_total*100
+                *IF,(lay_zmax_(orig_i_)-lay_zmin_(k_)),EQ,0,THEN
+                    area_k_ = 0
+                *ELSE
+                    area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
+                *ENDIF
+                gb_idx_ = gb_idx_ + 1
+                gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+                gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+                gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+                gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+                gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+                gb_area_(gb_idx_) = area_k_
+            *enddo
+        *ENDDO
+
+        ! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+        *IF,gb_total_,GT,0,THEN
+            *del,gb_negzmax_ $ *del,gb_perm_
+            *dim,gb_negzmax_,array,gb_total_
+            *do,k_,1,gb_total_
+                gb_negzmax_(k_) = -gb_zmax_(k_)
+            *enddo
+            *dim,gb_perm_,array,gb_total_
+            *moper,gb_perm_,gb_negzmax_,sort,,1
+
+            *do,k_,1,gb_total_
+                orig_i_ = gb_perm_(k_)
+                *VLEN,1
+                *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+            *enddo
+        *ENDIF
+
+        ! ──────────────────────────────────────────────────────────
+        ! 除了「頂面齊平」的情況，某些材料可能整個夾在 m_above 的 Z 範圍
+        ! （z_above_bottom ~ z_above_top）之內——例如台階中間某一層，沒有碰到
+        ! z_above_top，但也不是單純比 m_above 矮而已。這裡用「材料自己最低點
+        ! > m_above 最低點」抓出這種情況，跟前面兩段（ABOVE 表格、
+        ! HEIGHT NOT UNIFORM）互斥，避免重複列出。
+        ! 注意：這裡只比較 Z 範圍，沒有檢查 X-Y 位置是否真的落在 m_above 的
+        ! 範圍內——如果封裝裡剛好有其他跟 m_above 無關、Z 範圍卻重疊的材料，
+        ! 也會被列在這裡，使用者需自行判斷是否為真的台階結構。
+        ! ──────────────────────────────────────────────────────────
+
+        ! ── 先算這個表格全部符合條件的 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+        !    （篩選條件需與下面偵測邏輯一致）──
+        *del,nlay_  $  *del,gb_total_
+        *dim,nlay_,array,mmax
+        gb_total_ = 0
+        *DO,m,1,mmax
+            nlay_(m) = 0
+            *IF,m,EQ,m_above,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne_chk_,ELEM,0,COUNT
+            *IF,ne_chk_,GT,0,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne_full_,ELEM,0,COUNT
+            *IF,ne_full_,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+            NSLE,S
+            *GET,zmax_full_,NODE,0,MXLOC,Z
+            *GET,zmin_full_,NODE,0,MNLOC,Z
+            *IF,zmax_full_,GE,z_above_top,THEN
+                *CYCLE
+            *ENDIF
+            *IF,zmin_full_,LE,z_above_bottom,THEN
+                *CYCLE
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne,ELEM,0,COUNT
+            *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+            *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+            nlay_(m) = nband_m_
+            gb_total_ = gb_total_ + nband_m_
+        *ENDDO
+
+        *del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+        *del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+        *IF,gb_total_,GT,0,THEN
+            *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+            *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+            *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+            *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+            *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+
+            *VWRITE
+(' ')
+            *VWRITE,m_above
+('=== WITHIN MAT ',F5.0,' Z-RANGE (POSSIBLE STEP) ===')
+            *VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+        *ENDIF
+        gb_idx_ = 0
+
+        *DO,m,1,mmax
+            *IF,m,EQ,m_above,THEN
+                *CYCLE
+            *ENDIF
+
+            ! 已經在 ABOVE 表格 → 跳過
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne_chk_,ELEM,0,COUNT
+            *IF,ne_chk_,GT,0,THEN
+                *CYCLE
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne_full_,ELEM,0,COUNT
+            *IF,ne_full_,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+            NSLE,S
+            *GET,zmax_full_,NODE,0,MXLOC,Z
+            *GET,zmin_full_,NODE,0,MNLOC,Z
+
+            ! 已經被 HEIGHT NOT UNIFORM 抓到（頂面齊平）→ 跳過，避免重複列出
+            *IF,zmax_full_,GE,z_above_top,THEN
+                *CYCLE
+            *ENDIF
+
+            ! 材料自己最低點沒有比 m_above 最低點高 → 不算夾在範圍內，正常排除
+            *IF,zmin_full_,LE,z_above_bottom,THEN
+                *CYCLE
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne,ELEM,0,COUNT
+
+            ! ── 同一 MAT 可能仍分成彼此不相連的多個層/區域 ──
+            ! 這個區塊的暫存變數一律以底線結尾，每個 MAT 迴圈開頭把它們逐一明確刪除
+            ! （不用 *DEL,,PRM_ 這種寫法，明確列出每個變數比較保險）。
+            *del,nband_m_    $  *del,safety_     $  *del,ne_remain_
+            *del,seed_elem_  $  *del,igrow_      $  *del,ne_before_  $  *del,ne_after_
+            *del,ib_         $  *del,ne_layer_   $  *del,i_band_
+            *del,elist_band_ $  *del,evol_band_
+            *del,lay_xmin_   $  *del,lay_xmax_   $  *del,lay_ymin_   $  *del,lay_ymax_
+            *del,lay_zmin_   $  *del,lay_zmax_   $  *del,lay_vol_    $  *del,lay_perm_
+            *del,k_          $  *del,orig_i_     $  *del,vol_pct_k_  $  *del,area_k_
+
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+
+            *dim,lay_xmin_,array,nband_m_  $  *dim,lay_xmax_,array,nband_m_
+            *dim,lay_ymin_,array,nband_m_  $  *dim,lay_ymax_,array,nband_m_
+            *dim,lay_zmin_,array,nband_m_  $  *dim,lay_zmax_,array,nband_m_
+            *dim,lay_vol_,array,nband_m_
+            *dim,lay_perm_,array,nband_m_
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            CM,cm_remain,ELEM
+            ib_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                ib_ = ib_ + 1
+                CM,cm_layer,ELEM
+
+                NSLE,S
+                *GET,lay_xmin_(ib_),NODE,0,MNLOC,X  $  *GET,lay_xmax_(ib_),NODE,0,MXLOC,X
+                *GET,lay_ymin_(ib_),NODE,0,MNLOC,Y  $  *GET,lay_ymax_(ib_),NODE,0,MXLOC,Y
+                *GET,lay_zmin_(ib_),NODE,0,MNLOC,Z  $  *GET,lay_zmax_(ib_),NODE,0,MXLOC,Z
+
+                CMSEL,S,cm_layer
+                *GET,ne_layer_,ELEM,0,COUNT
+                *del,elist_band_  $  *del,evol_band_
+                *dim,elist_band_,array,ne_layer_
+                *vget,elist_band_,elem,,elist
+                *dim,evol_band_,array,ne_layer_
+                *do,i_band_,1,ne_layer_
+                    *get,evol_band_(i_band_),elem,elist_band_(i_band_),volu
+                *enddo
+                *vscfun,lay_vol_(ib_),sum,evol_band_
+
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+
+            *moper,lay_perm_,lay_zmin_,sort,,1
+
+            *do,k_,1,nband_m_
+                orig_i_ = lay_perm_(k_)
+                vol_pct_k_ = lay_vol_(orig_i_)/vol_total*100
+                *IF,(lay_zmax_(orig_i_)-lay_zmin_(k_)),EQ,0,THEN
+                    area_k_ = 0
+                *ELSE
+                    area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
+                *ENDIF
+                gb_idx_ = gb_idx_ + 1
+                gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+                gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+                gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+                gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+                gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+                gb_area_(gb_idx_) = area_k_
+            *enddo
+        *ENDDO
+
+        ! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+        *IF,gb_total_,GT,0,THEN
+            *del,gb_negzmax_ $ *del,gb_perm_
+            *dim,gb_negzmax_,array,gb_total_
+            *do,k_,1,gb_total_
+                gb_negzmax_(k_) = -gb_zmax_(k_)
+            *enddo
+            *dim,gb_perm_,array,gb_total_
+            *moper,gb_perm_,gb_negzmax_,sort,,1
+
+            *do,k_,1,gb_total_
+                orig_i_ = gb_perm_(k_)
+                *VLEN,1
+                *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+            *enddo
+        *ENDIF
+    *ELSE
+        *VWRITE
+(' ')
+        *VWRITE,m_above
+('  WARNING: m_above = ',F5.0,' has no elements, ABOVE MAT block skipped')
+    *ENDIF
+*ENDIF
+
+! ==========================================================
+!  6. Mold clearance = MAT14 頂面 - MAT7 頂面
+! ==========================================================
+m_mold = 14
+m_die  = 7
+
+ALLSEL,ALL
+ESEL,S,MAT,,m_mold
+*GET,ne1,ELEM,0,COUNT
+*IF,ne1,GT,0,THEN
+    NSLE,S
+    *GET,z_mold,NODE,0,MXLOC,Z
+*ELSE
+    z_mold = 0
+*ENDIF
+
+ALLSEL,ALL
+ESEL,S,MAT,,m_die
+*GET,ne2,ELEM,0,COUNT
+*IF,ne2,GT,0,THEN
+    NSLE,S
+    *GET,z_die,NODE,0,MXLOC,Z
+    *GET,z_die_bot,NODE,0,MNLOC,Z
+*ELSE
+    z_die = 0
+    z_die_bot = 0
+*ENDIF
+
+mclr = z_mold - z_die
+gap_chip_sm = z_die_bot - 0   ! die 底面(MNLOC,Z)與 z=0 之間的間隙
+
+*VWRITE
+(' ')
+*VWRITE
+('=== MOLD CLEARANCE ===')
+*IF,ne1,EQ,0,THEN
+    *VWRITE,m_mold
+('  WARNING: MAT ',F5.0,' has no elements')
+*ENDIF
+*IF,ne2,EQ,0,THEN
+    *VWRITE,m_die
+('  WARNING: MAT ',F5.0,' has no elements')
+*ENDIF
+*VWRITE,m_mold,z_mold
+('  MAT ',F5.0,' top z   ',F12.4)
+*VWRITE,m_die,z_die
+('  MAT ',F5.0,' top z   ',F12.4)
+*VWRITE,mclr
+('  clearance      ',F12.4)
+*VWRITE,gap_chip_sm
+('  gap btw chip and sm   ',F12.4)
+
+*CFCLOS
+ALLSEL,ALL
