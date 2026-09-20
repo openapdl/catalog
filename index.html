@@ -12,7 +12,8 @@ title: APDL 腳本目錄
   .catalog-breadcrumb {
     display: flex;
     flex-wrap: wrap;
-    gap: .4rem;
+    align-items: baseline;
+    gap: .3rem;
     margin-bottom: 1.5rem;
     color: var(--muted);
     font-size: .85rem;
@@ -22,11 +23,13 @@ title: APDL 腳本目錄
     text-decoration: none;
   }
   .catalog-breadcrumb a:hover { text-decoration: underline; }
+  .catalog-breadcrumb-sep { color: var(--muted); }
   .catalog-view h1 {
     font-size: 1.4rem;
     margin-bottom: .3rem;
     padding-bottom: .55rem;
     border-bottom: 1px solid var(--border);
+    word-break: break-all;
   }
   .catalog-help, .catalog-empty, .catalog-status { color: var(--muted); font-size: .9rem; }
   .catalog-list {
@@ -42,6 +45,9 @@ title: APDL 腳本目錄
   .catalog-entry::before {
     content: "- ";
     color: var(--muted);
+  }
+  .catalog-entry-folder::before {
+    content: "\01F4C1 ";
   }
   .catalog-entry-name {
     color: #0969da;
@@ -84,31 +90,15 @@ title: APDL 腳本目錄
 </style>
 
 <div class="catalog-app" id="catalog-app">
-  <nav class="catalog-breadcrumb" aria-label="目前位置">
-    <a href="#" id="breadcrumb-home">scripts</a>
-    <span id="breadcrumb-folder-part" hidden>
-      <span aria-hidden="true">/</span>
-      <a href="#" id="breadcrumb-folder"></a>
-    </span>
-    <span id="breadcrumb-file-part" hidden>
-      <span aria-hidden="true">/</span>
-      <span id="breadcrumb-file"></span>
-    </span>
-  </nav>
+  <nav class="catalog-breadcrumb" id="breadcrumb" aria-label="目前位置"></nav>
 
-  <section class="catalog-view" id="home-view">
-    <h1>APDL 腳本目錄</h1>
-    <p class="catalog-help">點選資料夾以瀏覽其中的 APDL 腳本。</p>
-    <ul class="catalog-list" id="folder-list"></ul>
-    <p class="catalog-empty" id="folder-empty" hidden>
-      尚未找到腳本。請將檔案放入 <code>scripts/分類資料夾/</code>。
+  <section class="catalog-view" id="browse-view">
+    <h1 id="browse-title">APDL 腳本目錄</h1>
+    <p class="catalog-help">點選資料夾或腳本以繼續瀏覽。</p>
+    <ul class="catalog-list" id="browse-list"></ul>
+    <p class="catalog-empty" id="browse-empty" hidden>
+      這個資料夾裡還沒有子資料夾或腳本。請將檔案放入 <code>scripts/分類資料夾/</code>。
     </p>
-  </section>
-
-  <section class="catalog-view" id="folder-view" hidden>
-    <h1 id="folder-title"></h1>
-    <p class="catalog-help">點選腳本即可在頁面中閱讀內容。</p>
-    <ul class="catalog-list" id="script-list"></ul>
   </section>
 
   <section class="catalog-view" id="script-view" hidden>
@@ -132,14 +122,13 @@ title: APDL 腳本目錄
 {% for file in catalog_files %}
   {% assign parts = file.path | split: "/" %}
   {% assign extension = file.extname | downcase %}
-  {% if parts[1] == "scripts" and parts.size >= 4 %}
+  {% if parts[1] == "scripts" and parts.size >= 3 %}
     {% if extension == ".mac" or extension == ".inp" or extension == ".txt" %}
       {% unless first_script %},{% endunless %}
       {
-        "path": {{ file.path | jsonify }},
+        "path": {{ file.path | remove_first: "/scripts/" | jsonify }},
         "url": {{ file.path | remove_first: "/" | jsonify }},
         "name": {{ file.name | jsonify }},
-        "folder": {{ parts[2] | jsonify }},
         "extension": {{ extension | jsonify }}
       }
       {% assign first_script = false %}
@@ -154,21 +143,16 @@ title: APDL 腳本目錄
     "use strict";
 
     const byId = (id) => document.getElementById(id);
-    const views = [byId("home-view"), byId("folder-view"),
-      byId("script-view"), byId("error-view")];
-    const folderList = byId("folder-list");
-    const folderEmpty = byId("folder-empty");
-    const folderTitle = byId("folder-title");
-    const scriptList = byId("script-list");
+    const views = [byId("browse-view"), byId("script-view"), byId("error-view")];
+    const breadcrumb = byId("breadcrumb");
+    const browseTitle = byId("browse-title");
+    const browseList = byId("browse-list");
+    const browseEmpty = byId("browse-empty");
     const scriptTitle = byId("script-title");
     const scriptStatus = byId("script-status");
     const scriptPanel = byId("script-panel");
     const scriptCode = byId("script-code");
     const routeError = byId("route-error");
-    const folderCrumbPart = byId("breadcrumb-folder-part");
-    const folderCrumb = byId("breadcrumb-folder");
-    const fileCrumbPart = byId("breadcrumb-file-part");
-    const fileCrumb = byId("breadcrumb-file");
     const collator = new Intl.Collator("zh-Hant", {
       numeric: true,
       sensitivity: "base"
@@ -186,7 +170,7 @@ title: APDL 腳本目錄
     function showError(message) {
       activeRequest += 1;
       document.title = "找不到項目 | APDL 腳本目錄";
-      setBreadcrumb("", "");
+      breadcrumb.replaceChildren();
       routeError.textContent = message;
       showOnly(byId("error-view"));
     }
@@ -203,26 +187,54 @@ title: APDL 腳本目錄
     const scriptByPath = new Map(
       scripts.map((script) => [script.path, script])
     );
-    const folders = [...new Set(scripts.map((script) => script.folder))]
-      .sort((left, right) => collator.compare(left, right));
+
+    // Build a folder tree from the flat file list so that any depth of
+    // sub-folders under scripts/ can be browsed, not just one level.
+    const root = { name: "", dirs: new Map(), files: [] };
+
+    function ensureDir(parent, name, path) {
+      if (!parent.dirs.has(name)) {
+        parent.dirs.set(name, { name, path, dirs: new Map(), files: [] });
+      }
+      return parent.dirs.get(name);
+    }
+
+    scripts.forEach((script) => {
+      const segments = script.path.split("/");
+      const fileName = segments.pop();
+      let node = root;
+      let accum = [];
+      segments.forEach((segment) => {
+        accum.push(segment);
+        node = ensureDir(node, segment, accum.join("/"));
+      });
+      node.files.push(script);
+    });
+
+    function findDir(pathStr) {
+      if (!pathStr) {
+        return root;
+      }
+      let node = root;
+      for (const segment of pathStr.split("/")) {
+        node = node.dirs.get(segment);
+        if (!node) {
+          return null;
+        }
+      }
+      return node;
+    }
 
     function routeHash(type, value) {
       return "#" + type + "=" + encodeURIComponent(value);
     }
 
-    function relativeName(script) {
-      const prefix = "/scripts/" + script.folder + "/";
-      return script.path.startsWith(prefix)
-        ? script.path.slice(prefix.length)
-        : script.name;
-    }
-
-    function createEntry(href, name, meta) {
+    function createEntry(href, name, meta, isFolder) {
       const item = document.createElement("li");
       const link = document.createElement("a");
       const metaElement = document.createElement("span");
 
-      item.className = "catalog-entry";
+      item.className = "catalog-entry" + (isFolder ? " catalog-entry-folder" : "");
       link.className = "catalog-entry-name";
       link.href = href;
       link.textContent = name;
@@ -232,61 +244,98 @@ title: APDL 腳本目錄
       return item;
     }
 
-    function setBreadcrumb(folder, file) {
-      folderCrumbPart.hidden = !folder;
-      fileCrumbPart.hidden = !file;
-      if (folder) {
-        folderCrumb.textContent = folder;
-        folderCrumb.href = routeHash("folder", folder);
-      }
-      if (file) {
-        fileCrumb.textContent = file;
-      }
-    }
+    function renderBreadcrumb(dirSegments, currentFileName) {
+      breadcrumb.replaceChildren();
 
-    function renderHome() {
-      activeRequest += 1;
-      document.title = "APDL 腳本目錄";
-      setBreadcrumb("", "");
-      folderList.replaceChildren();
-      folderEmpty.hidden = folders.length !== 0;
+      const homeLink = document.createElement("a");
+      homeLink.href = routeHash("dir", "");
+      homeLink.textContent = "scripts";
+      breadcrumb.append(homeLink);
 
-      folders.forEach((folder) => {
-        const count = scripts.filter(
-          (script) => script.folder === folder
-        ).length;
-        folderList.append(createEntry(
-          routeHash("folder", folder),
-          folder,
-          String(count) + " 個腳本"
-        ));
+      const linkableSegments = currentFileName
+        ? dirSegments
+        : dirSegments.slice(0, -1);
+      const accum = [];
+
+      linkableSegments.forEach((segment) => {
+        accum.push(segment);
+        breadcrumb.append(makeSep());
+        const link = document.createElement("a");
+        link.href = routeHash("dir", accum.join("/"));
+        link.textContent = segment;
+        breadcrumb.append(link);
       });
-      showOnly(byId("home-view"));
+
+      if (currentFileName) {
+        breadcrumb.append(makeSep());
+        const span = document.createElement("span");
+        span.textContent = currentFileName;
+        breadcrumb.append(span);
+      } else if (dirSegments.length > 0) {
+        breadcrumb.append(makeSep());
+        const span = document.createElement("span");
+        span.textContent = dirSegments[dirSegments.length - 1];
+        breadcrumb.append(span);
+      }
     }
 
-    function renderFolder(folder) {
+    function makeSep() {
+      const sep = document.createElement("span");
+      sep.className = "catalog-breadcrumb-sep";
+      sep.setAttribute("aria-hidden", "true");
+      sep.textContent = "/";
+      return sep;
+    }
+
+    function renderBrowse(pathStr) {
       activeRequest += 1;
-      if (!folders.includes(folder)) {
-        showError("找不到資料夾：" + folder);
+      const node = findDir(pathStr);
+      if (!node) {
+        showError("找不到資料夾：" + pathStr);
         return;
       }
 
-      const folderScripts = scripts.filter(
-        (script) => script.folder === folder
-      );
-      document.title = folder + " | APDL 腳本目錄";
-      setBreadcrumb(folder, "");
-      folderTitle.textContent = folder;
-      scriptList.replaceChildren();
+      const dirSegments = pathStr ? pathStr.split("/") : [];
+      const label = dirSegments.length
+        ? dirSegments[dirSegments.length - 1]
+        : "APDL 腳本目錄";
+      document.title = pathStr ? label + " | APDL 腳本目錄" : "APDL 腳本目錄";
+      renderBreadcrumb(dirSegments, null);
+      browseTitle.textContent = label;
+      browseList.replaceChildren();
 
-      folderScripts.forEach((script) => {
-        scriptList.append(createEntry(
-          routeHash("file", script.path),
-          relativeName(script),
-          script.extension.toUpperCase().slice(1)
+      const subDirs = [...node.dirs.values()]
+        .sort((left, right) => collator.compare(left.name, right.name));
+      const files = [...node.files]
+        .sort((left, right) => collator.compare(left.name, right.name));
+
+      browseEmpty.hidden = subDirs.length + files.length !== 0;
+
+      subDirs.forEach((dir) => {
+        const itemCount = countItems(dir);
+        browseList.append(createEntry(
+          routeHash("dir", dir.path),
+          dir.name,
+          String(itemCount) + " 個項目",
+          true
         ));
       });
-      showOnly(byId("folder-view"));
+
+      files.forEach((script) => {
+        browseList.append(createEntry(
+          routeHash("file", script.path),
+          script.name,
+          script.extension.toUpperCase().slice(1),
+          false
+        ));
+      });
+
+      showOnly(byId("browse-view"));
+    }
+
+    function countItems(node) {
+      let count = node.dirs.size + node.files.length;
+      return count;
     }
 
     async function renderScript(path) {
@@ -297,10 +346,11 @@ title: APDL 腳本目錄
       }
 
       const requestId = ++activeRequest;
-      const displayName = relativeName(script);
-      document.title = displayName + " | APDL 腳本目錄";
-      setBreadcrumb(script.folder, displayName);
-      scriptTitle.textContent = displayName;
+      const segments = path.split("/");
+      const fileName = segments.pop();
+      document.title = fileName + " | APDL 腳本目錄";
+      renderBreadcrumb(segments, fileName);
+      scriptTitle.textContent = fileName;
       scriptStatus.className = "catalog-status";
       scriptStatus.textContent = "正在載入腳本內容…";
       scriptStatus.hidden = false;
@@ -336,7 +386,7 @@ title: APDL 腳本目錄
     function renderRoute() {
       const hash = window.location.hash.slice(1);
       if (!hash) {
-        renderHome();
+        renderBrowse("");
         return;
       }
 
@@ -355,8 +405,8 @@ title: APDL 腳本目錄
         return;
       }
 
-      if (type === "folder") {
-        renderFolder(value);
+      if (type === "dir") {
+        renderBrowse(value);
       } else if (type === "file") {
         renderScript(value);
       } else {
