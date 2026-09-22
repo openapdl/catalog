@@ -1,0 +1,76 @@
+! ----------------------------------------------------------------------
+! call_capsule_xy.inp
+! capsule_xy.mac 的兩個呼叫與位置選取範例。
+!
+! 請把本檔案與 capsule_xy.mac 放在 MAPDL 的工作目錄中。
+! 範例 1 建立 slot；範例 2 將 CENTER_SPACING 設為 0，建立完整圓面。
+!
+! 兩個範例都不依賴固定面號，而是在建模完成後以 ASEL,LOC
+! 及原始中心座標選回結果面。slot 即使已經過巨集內的 AADD
+! 布林聯集、面號發生變化，仍可由中心位置重新選取。
+!
+! 注意：ASEL,LOC 比對的是面中心（hot spot），不是判斷某點是否
+! 落在面內。若後續做非對稱布林而改變面中心，必須改用布林後的
+! 新中心座標。
+! ----------------------------------------------------------------------
+
+/PREP7
+
+! LOC_TOL 是 ASEL,LOC 的位置容差，請依模型單位與尺寸調整。
+LOC_TOL=1E-6
+
+! LOC 使用目前作用座標系解釋 X、Y、Z；這裡使用全域直角座標系。
+CSYS,0
+
+! ----------------------------------------------------------------------
+! 範例 1：建立 slot，再以中心位置選回布林後的結果面
+! ----------------------------------------------------------------------
+CAP_XC=0   ! 膠囊整體中心，位於全域 XY 平面上。
+CAP_YC=0
+CAP_R=1    ! 端蓋半徑，以及兩端蓋圓心間的距離。
+CAP_D=4
+CAP_ANG=0  ! 膠囊軸線角度，從全域 +X 逆時針量測（度）。
+*USE,capsule_xy.mac,CAP_XC,CAP_YC,CAP_R,CAP_D,CAP_ANG ! 巨集內會建立矩形與兩個圓，再以 AADD 聯集成單一 slot 面。
+
+
+SELTOL,LOC_TOL     ! 使用明確容差，避免預設容差因座標大小而過寬。
+ASEL,S,LOC,X,CAP_XC      ! 先以 X 建立新選取集，再以 Y 與 Z 從目前選取集逐步縮小。
+ASEL,R,LOC,Y,CAP_YC      ! 對稱 slot 經過 AADD 後，面中心仍是 (CAP_XC,CAP_YC,0)。
+ASEL,R,LOC,Z,0
+
+*GET,CAP_NLOC,AREA,0,COUNT     ! CAP_NLOC 預期為 1。若大於 1，代表另有面使用相同中心座標。
+*GET,CAP_LID,AREA,0,NUM,MIN    ! CAP_LID 是用位置找到的面號，可供後續指令或人工檢查。
+CM,SLOT_BY_LOC,AREA   ! 將結果存成 Area Component。重複使用同名 Component 時會覆蓋舊定義。
+
+SELTOL        ! 恢復預設選取容差與全選狀態，再進入下一個範例。
+ALLSEL,ALL
+
+! ----------------------------------------------------------------------
+! 範例 2：CENTER_SPACING = 0，建立圓面後再以中心位置選回
+! ----------------------------------------------------------------------
+CIR_XC=5
+CIR_YC=0
+CIR_R=1   ! 圓面半徑。
+CIR_D=0   ! 圓心距離設為 0，巨集會走 CYL4 分支，不建立矩形或執行 AADD。
+CIR_ANG=0 ! 完整圓旋轉後外形不變，範例仍明確傳入 0 度。
+*USE,capsule_xy.mac,CIR_XC,CIR_YC,CIR_R,CIR_D,CIR_ANG
+
+SELTOL,LOC_TOL        ! 圓面中心是 (CIR_XC,CIR_YC,0)，同樣不需要預先知道面號。
+ASEL,S,LOC,X,CIR_XC
+ASEL,R,LOC,Y,CIR_YC
+ASEL,R,LOC,Z,0
+
+*GET,CIR_NLOC,AREA,0,COUNT   ! CIR_NLOC 預期為 1；CIR_LID 是用位置找到的圓面面號。
+*GET,CIR_LID,AREA,0,NUM,MIN
+CM,CIRC_BY_LOC,AREA
+
+! 恢復 ANSYS 預設的位置選取容差規則，避免影響後續指令。
+SELTOL
+
+! 以 Component 名稱取回兩個位置選取結果，並一起顯示。
+CMSEL,S,SLOT_BY_LOC,AREA
+CMSEL,A,CIRC_BY_LOC,AREA
+APLOT
+
+! 顯示完成後恢復全選，不把範例的 Area 選取集留給後續腳本。
+ALLSEL,ALL
