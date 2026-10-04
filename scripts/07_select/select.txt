@@ -1,0 +1,2150 @@
+from __future__ import annotations
+
+import codecs
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import tkinter as tk
+from collections import deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from tkinter import messagebox, ttk
+from typing import Callable, Iterable, Optional, TextIO, Union
+
+# 換到其他電腦時，只需修改下一行的 pythonw.exe 絕對路徑。
+PYTHONW_EXE = Path(
+    r"C:\Users\kade\Desktop\xxx\010_vendor_refs\015_python\python3.8\win64\pythonw.exe"
+)
+
+
+def _executable_path_key(path: Path) -> str:
+    """Return a case-insensitive absolute identity for a Windows executable."""
+
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _show_bootstrap_error(detail: str) -> None:
+    """Show an error even when the current interpreter has no console."""
+
+    if sys.stderr is not None:
+        sys.stderr.write(detail + "\n")
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, detail, "APDL 選取語法工具箱", 0x10)
+    except (AttributeError, OSError):
+        pass
+
+
+def _ensure_configured_python() -> None:
+    """Relaunch this file with the configured portable Python when necessary."""
+
+    configured_pythonw = PYTHONW_EXE.expanduser()
+    configured_python = configured_pythonw.with_name("python.exe")
+    current_key = _executable_path_key(Path(sys.executable))
+    configured_keys = {
+        _executable_path_key(configured_pythonw),
+        _executable_path_key(configured_python),
+    }
+    if current_key in configured_keys:
+        return
+
+    if not configured_pythonw.is_file():
+        _show_bootstrap_error(
+            "找不到指定的 Python 執行檔：\n{}\n\n"
+            "請用文字編輯器開啟 select.pyw，修改檔案最上方的 PYTHONW_EXE。".format(configured_pythonw)
+        )
+        raise SystemExit(1)
+
+    current_is_console_python = Path(sys.executable).name.lower() == "python.exe"
+    target_executable = (
+        configured_python if current_is_console_python and configured_python.is_file() else configured_pythonw
+    )
+    script_path = Path(__file__).resolve()
+    command = [str(target_executable), str(script_path)] + sys.argv[1:]
+    try:
+        if current_is_console_python:
+            return_code = subprocess.call(command, cwd=str(script_path.parent))
+            raise SystemExit(return_code)
+        subprocess.Popen(command, cwd=str(script_path.parent))
+    except OSError as exc:
+        _show_bootstrap_error("無法使用指定的 Python 啟動程式：\n{}\n\n{}".format(target_executable, exc))
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+
+# ── ANSYS LOG 轉 APDL：轉換核心（內嵌自 ansys_log_converter.py）────────────────
+
+ProgressCallback = Callable[[int, Optional[int]], None]
+CancelCheck = Callable[[], bool]
+
+
+class ConversionCancelled(RuntimeError):
+    """Raised when a caller asks an in-progress conversion to stop."""
+
+
+@dataclass
+class ConversionReport:
+    input_lines: int = 0
+    output_lines: int = 0
+    converted_selection_blocks: int = 0
+    converted_component_blocks: int = 0
+    converted_direct_blocks: int = 0
+    preserved_blocks: int = 0
+    superseded_blocks: int = 0
+    removed_noise_lines: int = 0
+    removed_comment_lines: int = 0
+    input_encoding: str = ""
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def handled_blocks(self) -> int:
+        return (
+            self.converted_selection_blocks
+            + self.converted_component_blocks
+            + self.converted_direct_blocks
+            + self.preserved_blocks
+        )
+
+
+@dataclass
+class _Event:
+    sequence: int
+    raw: str
+    block_id: int | None = None
+    drop: bool = False
+    generated: list[str] | None = None
+
+
+@dataclass
+class _PickBlock:
+    block_id: int
+    nfield: int
+    narg: int
+    entity_type: int
+    order_type: str
+    length: int | None
+    start_sequence: int
+    items: list[int] = field(default_factory=list)
+    item_events: list[_Event] = field(default_factory=list)
+    header_event: _Event | None = None
+
+    @property
+    def all_events(self) -> Iterable[_Event]:
+        if self.header_event is not None:
+            yield self.header_event
+        yield from self.item_events
+
+
+ENTITY_BY_FLST_TYPE = {
+    1: ("NODE", "NSEL", "NODE"),
+    2: ("ELEM", "ESEL", "ELEM"),
+    3: ("KP", "KSEL", "KP"),
+    4: ("LINE", "LSEL", "LINE"),
+    5: ("AREA", "ASEL", "AREA"),
+    6: ("VOLU", "VSEL", "VOLU"),
+}
+
+SELECTION_COMMANDS = {
+    "NSEL": "NODE",
+    "ESEL": "ELEM",
+    "KSEL": "KP",
+    "LSEL": "LINE",
+    "ASEL": "AREA",
+    "VSEL": "VOLU",
+}
+
+# Every command below was checked against the local ANSYS 2025 R2 command
+# reference.  In the positions where GUI logging emits P51X, these commands
+# accept a component name as an equivalent entity-list argument.
+COMPONENT_COMMANDS = {
+    "AL", "VA", "VCLEAR", "VSBW", "LESIZE", "VGLUE", "VDELE",
+    "LCCAT", "ADELE", "VEXT", "ACCAT", "LCOMB", "ACLEAR", "AADD",
+    "VOVLAP", "KGEN", "LDELE", "VGEN", "ASBW", "VDRAG", "KMODIF",
+    "VSBV", "EMODIF", "AGLUE", "VSBA", "LGEN", "KDELE", "AGEN",
+    "EDELE", "VADD", "ADRAG", "LSBW", "NDELE", "VPTN",
+}
+
+DIRECT_COMMAND_LIMITS = {
+    "A": 18,
+    "BSPLIN": 6,
+    "E": 8,
+    "KWPAVE": 9,
+}
+
+SUPPORTED_ORDER_TYPES = {"", "NOOR", "ORDE", "ORDER"}
+
+# GUI-only display/viewport records.  Active /INPUT is intentionally absent:
+# it can run macros that materially change the model and must be preserved.
+ACTIVE_NOISE_COMMANDS = {
+    "/DIST", "/REPLOT", "/REP", "/REPLO", "/FOCUS", "/FOC",
+    "KPLOT", "LPLOT", "APLOT", "GPLOT", "EPLOT", "/USER",
+    "/PNUM", "/NUMBER", "/NUM", "/ZOOM", "CHKMSH", "/AUTO",
+}
+COMMENTED_NOISE_COMMANDS = ACTIVE_NOISE_COMMANDS | {"/INPUT"}
+
+_INTEGER_AT_START = re.compile(r"^[ \t]*([+-]?\d+)")
+_IDENTIFIER = re.compile(r"\b[A-Za-z][A-Za-z0-9_]{0,31}\b")
+
+
+def _parse_leading_int(value: str) -> int:
+    match = _INTEGER_AT_START.match(value)
+    if match is None:
+        raise ValueError(f"不是整數：{value!r}")
+    return int(match.group(1))
+
+
+def _command_fields(line: str) -> list[str] | None:
+    stripped = line.lstrip()
+    if not stripped or stripped.startswith("!"):
+        return None
+    return stripped.rstrip("\r\n").split(",")
+
+
+def _command_name(line: str) -> str | None:
+    fields = _command_fields(line)
+    if not fields:
+        return None
+    name = fields[0].strip().upper()
+    return name or None
+
+
+def _is_noise_line(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped:
+        return False
+    if stripped.startswith("!*"):
+        return True
+    commented = stripped.startswith("!")
+    content = stripped[1:].lstrip() if commented else stripped
+    if not content:
+        return False
+    command = content.split(",", 1)[0].strip().upper()
+    commands = COMMENTED_NOISE_COMMANDS if commented else ACTIVE_NOISE_COMMANDS
+    return command in commands
+
+
+def _is_comment_line(line: str) -> bool:
+    return line.lstrip().startswith("!")
+
+
+def compress_numbers_to_ranges(numbers: list[int]) -> list[tuple[int, int, int]]:
+    """Sort, dedupe, and merge numbers into minimal (start, end, step) runs."""
+    if not numbers:
+        return []
+    sorted_nums = sorted(set(numbers))
+    if len(sorted_nums) == 1:
+        n = sorted_nums[0]
+        return [(n, n, 1)]
+    ranges: list[tuple[int, int, int]] = []
+    start = prev = sorted_nums[0]
+    step: int | None = None
+    for cur in sorted_nums[1:]:
+        delta = cur - prev
+        if step is None:
+            step = delta
+            prev = cur
+            continue
+        if delta != step:
+            ranges.append((start, prev, step))
+            start = prev = cur
+            step = None
+        else:
+            prev = cur
+    ranges.append((start, prev, step if step is not None else 1))
+    return ranges
+
+
+def _expand_items(items: list[int]) -> list[int]:
+    """Expand the FLST negative-endpoint range notation."""
+    expanded: list[int] = []
+    previous_positive: int | None = None
+    for item in items:
+        if item >= 0:
+            expanded.append(item)
+            previous_positive = item
+            continue
+        if previous_positive is None:
+            raise ValueError("負數 FITEM 前沒有範圍起點")
+        endpoint = abs(item)
+        step = 1 if endpoint >= previous_positive else -1
+        expanded.extend(range(previous_positive + step, endpoint + step, step))
+    return expanded
+
+
+def _selection_segments(items: list[int]) -> list[tuple[int, int | None]]:
+    """Return single IDs or inclusive ranges without expanding large ranges."""
+    segments: list[tuple[int, int | None]] = []
+    previous_positive: int | None = None
+    for item in items:
+        if item >= 0:
+            segments.append((item, None))
+            previous_positive = item
+            continue
+        if previous_positive is None:
+            raise ValueError("負數 FITEM 前沒有範圍起點")
+        endpoint = abs(item)
+        start, _ = segments[-1]
+        # Selection commands require VMIN <= VMAX.  FITEM can describe the
+        # same entity range in descending order, but order is irrelevant once
+        # the picked IDs are represented as a selection set.
+        segments[-1] = (min(start, endpoint), max(start, endpoint))
+    return segments
+
+
+def _validate_block(block: _PickBlock) -> list[int]:
+    if block.entity_type not in ENTITY_BY_FLST_TYPE:
+        raise ValueError(f"不支援 FLST TYPE={block.entity_type}")
+    if block.order_type not in SUPPORTED_ORDER_TYPES:
+        raise ValueError(f"不支援 FLST Otype={block.order_type!r}")
+    if block.length is not None and len(block.items) != block.length:
+        raise ValueError(
+            f"FLST LENG={block.length}，實際 FITEM={len(block.items)}"
+        )
+    expanded = _expand_items(block.items)
+    if len(expanded) != block.narg:
+        raise ValueError(
+            f"FLST NARG={block.narg}，展開後項目數={len(expanded)}"
+        )
+    if not expanded:
+        raise ValueError("空白的 FLST/FITEM 選取清單")
+    return expanded
+
+
+def _set_field(fields: list[str], index: int, value: str) -> None:
+    while len(fields) <= index:
+        fields.append("")
+    fields[index] = value
+
+
+def _render_fields(fields: list[str]) -> str:
+    return ",".join(fields).rstrip()
+
+
+def _direct_selection_lines(block: _PickBlock, *, compress: bool = False) -> list[str]:
+    _entity, select_command, item_label = ENTITY_BY_FLST_TYPE[block.entity_type]
+    lines: list[str] = []
+    if compress:
+        # 壓縮排序範圍：忽略 log 原本的排列順序，排序、去重後合併成
+        # 最少的等差範圍（與 select.pyw「ID 清單」分頁同一套演算法）。
+        for position, (start, end, step) in enumerate(
+            compress_numbers_to_ranges(_expand_items(block.items))
+        ):
+            mode = "S" if position == 0 else "A"
+            if start == end:
+                lines.append(f"{select_command},{mode},{item_label},,{start}")
+            elif step in (None, 1):
+                lines.append(f"{select_command},{mode},{item_label},,{start},{end}")
+            else:
+                lines.append(
+                    f"{select_command},{mode},{item_label},,{start},{end},{step}"
+                )
+        return lines
+    for position, (start, endpoint) in enumerate(_selection_segments(block.items)):
+        mode = "S" if position == 0 else "A"
+        if endpoint is None:
+            lines.append(f"{select_command},{mode},{item_label},,{start}")
+        else:
+            lines.append(
+                f"{select_command},{mode},{item_label},,{start},{endpoint}"
+            )
+    return lines
+
+
+def _build_pick_component(
+    block: _PickBlock,
+    component_name: str,
+    *,
+    compress: bool = False,
+) -> list[str]:
+    entity, _select_command, _item_label = ENTITY_BY_FLST_TYPE[block.entity_type]
+    lines = _direct_selection_lines(block, compress=compress)
+    lines.append(f"CM,{component_name},{entity}")
+    return lines
+
+
+def _save_selection_lines(
+    entity_type: int,
+    save_name: str,
+    count_parameter: str,
+) -> list[str]:
+    entity, _select_command, _item_label = ENTITY_BY_FLST_TYPE[entity_type]
+    return [
+        f"*GET,{count_parameter},{entity},0,COUNT",
+        f"*IF,{count_parameter},GT,0,THEN",
+        f"CM,{save_name},{entity}",
+        "*ENDIF",
+    ]
+
+
+def _restore_selection_lines(
+    entity_type: int,
+    save_name: str,
+    count_parameter: str,
+) -> list[str]:
+    _entity, select_command, _item_label = ENTITY_BY_FLST_TYPE[entity_type]
+    return [
+        f"*IF,{count_parameter},GT,0,THEN",
+        f"CMSEL,S,{save_name}",
+        "*ELSE",
+        f"{select_command},NONE",
+        "*ENDIF",
+    ]
+
+
+def _cleanup_selection_lines(save_name: str, count_parameter: str) -> list[str]:
+    return [
+        f"*IF,{count_parameter},GT,0,THEN",
+        f"CMDELE,{save_name}",
+        "*ENDIF",
+        f"*SET,{count_parameter}",
+    ]
+
+
+def _temporary_names(prefix: str, sequence: int, count: int) -> tuple[
+    list[str], dict[int, tuple[str, str]],
+]:
+    stem = f"{prefix}{sequence:06d}"
+    picks = [f"{stem}P{index + 1}" for index in range(count)]
+    selection_names: dict[int, tuple[str, str]] = {}
+    return picks, selection_names
+
+
+def _build_component_conversion(
+    command_fields: list[str],
+    field_blocks: list[tuple[int, _PickBlock]],
+    prefix: str,
+    sequence: int,
+    *,
+    compress: bool = False,
+) -> list[str]:
+    # 單一 P51X：直接選取後以 ALL 代入，行為對齊 AnsysCmdParser.exe，
+    # 不保留／還原轉換前的選取狀態。
+    if len(field_blocks) == 1:
+        field_index, block = field_blocks[0]
+        lines = ["! [LOG2APDL] FLST/FITEM -> direct selection"]
+        lines.extend(_direct_selection_lines(block, compress=compress))
+        converted_fields = list(command_fields)
+        _set_field(converted_fields, field_index, "ALL")
+        lines.append(_render_fields(converted_fields))
+        return lines
+
+    # 同一行有多個 P51X（例如 VSBV 的兩份清單）：ALL 無法區分兩份清單，
+    # 仍需各自建立暫存 component，但同樣不保留／還原轉換前的選取狀態。
+    pick_names, _unused = _temporary_names(prefix, sequence, len(field_blocks))
+    lines = ["! [LOG2APDL] FLST/FITEM -> temporary components"]
+    for pick_name, (_field_index, block) in zip(pick_names, field_blocks):
+        lines.extend(_build_pick_component(block, pick_name, compress=compress))
+    converted_fields = list(command_fields)
+    for pick_name, (field_index, _block) in zip(pick_names, field_blocks):
+        _set_field(converted_fields, field_index, pick_name)
+    lines.append(_render_fields(converted_fields))
+    for pick_name in pick_names:
+        lines.append(f"CMDELE,{pick_name}")
+    return lines
+
+
+def _build_selection_conversion(
+    command_fields: list[str],
+    field_index: int,
+    block: _PickBlock,
+    prefix: str,
+    sequence: int,
+    *,
+    compress: bool = False,
+) -> list[str]:
+    command = command_fields[0].strip().upper()
+    expected_entity = SELECTION_COMMANDS[command]
+    entity, _select_command, _item_label = ENTITY_BY_FLST_TYPE[block.entity_type]
+    if entity != expected_entity:
+        raise ValueError(
+            f"{command} 與 FLST TYPE={block.entity_type} 的實體類型不一致"
+        )
+    # KSWP is field 8 (zero-based index 7).  CMSEL cannot reproduce KSWP=1.
+    if len(command_fields) > 7 and command_fields[7].strip() not in {"", "0"}:
+        raise ValueError(f"{command} 的 KSWP 無法以 CMSEL 無損轉換")
+
+    stem = f"{prefix}{sequence:06d}"
+    pick_name = f"{stem}P1"
+    save_name = f"{stem}S1"
+    count_parameter = f"{stem}C1"
+    mode = command_fields[1].strip().upper() if len(command_fields) > 1 else ""
+    mode = mode or "S"
+    if mode not in {"S", "A", "R", "U"}:
+        raise ValueError(f"{command} 選取模式 {mode!r} 無法無損轉換")
+
+    lines = ["! [LOG2APDL] FLST/FITEM selection -> temporary component"]
+    lines.extend(_save_selection_lines(block.entity_type, save_name, count_parameter))
+    lines.extend(_build_pick_component(block, pick_name, compress=compress))
+    lines.extend(_restore_selection_lines(block.entity_type, save_name, count_parameter))
+    lines.append(f"CMSEL,{mode},{pick_name}")
+    lines.append(f"CMDELE,{pick_name}")
+    lines.extend(_cleanup_selection_lines(save_name, count_parameter))
+    return lines
+
+
+def _build_direct_conversion(
+    command_fields: list[str],
+    field_index: int,
+    block: _PickBlock,
+) -> list[str]:
+    command = command_fields[0].strip().upper()
+    values = _validate_block(block)
+    limit = DIRECT_COMMAND_LIMITS[command]
+    if len(values) > limit:
+        raise ValueError(
+            f"{command} 有 {len(values)} 個項目，超過一般語法上限 {limit}"
+        )
+    replacement = [str(value) for value in values]
+    converted = (
+        command_fields[:field_index]
+        + replacement
+        + command_fields[field_index + 1 :]
+    )
+    return ["! [LOG2APDL] FLST/FITEM -> direct arguments", _render_fields(converted)]
+
+
+def _warn(report: ConversionReport, message: str) -> None:
+    if len(report.warnings) < 200:
+        report.warnings.append(message)
+    elif len(report.warnings) == 200:
+        report.warnings.append("其餘警告已省略。")
+
+
+def _parse_flst(fields: list[str], block_id: int, sequence: int) -> _PickBlock:
+    if len(fields) < 4:
+        raise ValueError("FLST 欄位不足")
+    narg = _parse_leading_int(fields[2])
+    order_type = fields[4].strip().upper() if len(fields) > 4 else ""
+    length = (
+        _parse_leading_int(fields[5])
+        if len(fields) > 5 and fields[5].strip()
+        else None
+    )
+    return _PickBlock(
+        block_id=block_id,
+        nfield=_parse_leading_int(fields[1]),
+        narg=narg,
+        entity_type=_parse_leading_int(fields[3]),
+        order_type=order_type,
+        length=length,
+        start_sequence=sequence,
+    )
+
+
+def _choose_temp_prefix_from_names(names: set[str]) -> str:
+    upper_names = {name.upper() for name in names}
+    for index in range(10000):
+        prefix = "ZZLGW" if index == 0 else f"ZZLGW{index}"
+        upper_prefix = prefix.upper()
+        if not any(name.startswith(upper_prefix) for name in upper_names):
+            return prefix
+    raise RuntimeError("找不到不衝突的暫存名稱前綴")
+
+
+def _scan_identifiers(source: TextIO) -> set[str]:
+    if not source.seekable():
+        return set()
+    position = source.tell()
+    names: set[str] = set()
+    try:
+        for line in source:
+            # Only names that could collide with our namespace are relevant.
+            for match in _IDENTIFIER.finditer(line):
+                name = match.group(0)
+                if name.upper().startswith("ZZLGW"):
+                    names.add(name)
+    finally:
+        source.seek(position)
+    return names
+
+
+def convert_lgw_stream(
+    source: TextIO,
+    sink: TextIO,
+    *,
+    cleanup: bool = True,
+    strip_comments: bool = False,
+    compress_ranges: bool = False,
+    cancel_check: CancelCheck | None = None,
+    progress_callback: ProgressCallback | None = None,
+    temp_prefix: str | None = None,
+) -> ConversionReport:
+    """Convert an opened text stream and return a structural report."""
+    report = ConversionReport()
+    prefix = temp_prefix or _choose_temp_prefix_from_names(_scan_identifiers(source))
+    pending: dict[int, _PickBlock] = {}
+    events: deque[_Event] = deque()
+    block_id = 0
+    event_sequence = 0
+    conversion_sequence = 0
+
+    def write_line(line: str) -> None:
+        sink.write(line.rstrip("\r\n") + "\n")
+        report.output_lines += 1
+
+    def emit_event(event: _Event) -> None:
+        if event.drop:
+            return
+        if event.generated is not None:
+            for generated_line in event.generated:
+                if strip_comments and _is_comment_line(generated_line):
+                    report.removed_comment_lines += 1
+                    continue
+                write_line(generated_line)
+            return
+        if cleanup and _is_noise_line(event.raw):
+            report.removed_noise_lines += 1
+            return
+        if strip_comments and _is_comment_line(event.raw):
+            report.removed_comment_lines += 1
+            return
+        write_line(event.raw)
+
+    def flush_safe(force: bool = False) -> None:
+        cutoff = float("inf") if force or not pending else min(
+            block.start_sequence for block in pending.values()
+        )
+        while events and events[0].sequence < cutoff:
+            emit_event(events.popleft())
+        if force:
+            while events:
+                emit_event(events.popleft())
+
+    for line_number, raw_line in enumerate(source, start=1):
+        report.input_lines = line_number
+        if cancel_check is not None and line_number % 1024 == 0 and cancel_check():
+            raise ConversionCancelled("使用者已取消轉換。")
+        if progress_callback is not None and line_number % 5000 == 0:
+            progress_callback(line_number, None)
+
+        event_sequence += 1
+        event = _Event(event_sequence, raw_line)
+        events.append(event)
+        fields = _command_fields(raw_line)
+        command = fields[0].strip().upper() if fields else ""
+
+        if command == "FLST":
+            try:
+                block_id += 1
+                block = _parse_flst(fields, block_id, event_sequence)
+                event.block_id = block.block_id
+                block.header_event = event
+                old_block = pending.get(block.nfield)
+                if old_block is not None:
+                    for old_event in old_block.all_events:
+                        old_event.drop = True
+                    report.superseded_blocks += 1
+                pending[block.nfield] = block
+            except (ValueError, IndexError) as exc:
+                _warn(report, f"第 {line_number} 行 FLST 保留：{exc}")
+            flush_safe()
+            continue
+
+        if command == "FITEM":
+            try:
+                if len(fields) < 3:
+                    raise ValueError("FITEM 欄位不足")
+                nfield = _parse_leading_int(fields[1])
+                block = pending.get(nfield)
+                if block is None:
+                    raise ValueError(f"找不到 NFIELD={nfield} 的 FLST")
+                item = _parse_leading_int(fields[2])
+                event.block_id = block.block_id
+                block.items.append(item)
+                block.item_events.append(event)
+            except (ValueError, IndexError) as exc:
+                _warn(report, f"第 {line_number} 行 FITEM 保留：{exc}")
+            flush_safe()
+            continue
+
+        if fields:
+            p51x_indices = [
+                index for index, value in enumerate(fields)
+                if value.strip().upper() == "P51X"
+            ]
+        else:
+            p51x_indices = []
+
+        if p51x_indices:
+            field_blocks: list[tuple[int, _PickBlock]] = []
+            missing_fields: list[int] = []
+            for field_index in p51x_indices:
+                nfield = field_index + 1
+                block = pending.get(nfield)
+                if block is None:
+                    missing_fields.append(nfield)
+                else:
+                    field_blocks.append((field_index, block))
+
+            if not field_blocks:
+                report.preserved_blocks += 1
+                _warn(
+                    report,
+                    f"第 {line_number} 行含 P51X，但找不到對應的 "
+                    "FLST/FITEM，已原樣保留。",
+                )
+            else:
+                conversion_sequence += 1
+                failure: str | None = None
+                generated: list[str] | None = None
+                try:
+                    if missing_fields:
+                        raise ValueError(
+                            "缺少 NFIELD=" + ",".join(map(str, missing_fields))
+                        )
+                    for _field_index, block in field_blocks:
+                        _validate_block(block)
+                    if command in SELECTION_COMMANDS:
+                        if len(field_blocks) != 1:
+                            raise ValueError(f"{command} 含多個 P51X 欄位")
+                        generated = _build_selection_conversion(
+                            fields,
+                            field_blocks[0][0],
+                            field_blocks[0][1],
+                            prefix,
+                            conversion_sequence,
+                            compress=compress_ranges,
+                        )
+                        report.converted_selection_blocks += 1
+                    elif command in COMPONENT_COMMANDS:
+                        generated = _build_component_conversion(
+                            fields,
+                            field_blocks,
+                            prefix,
+                            conversion_sequence,
+                            compress=compress_ranges,
+                        )
+                        report.converted_component_blocks += 1
+                    elif command in DIRECT_COMMAND_LIMITS:
+                        if len(field_blocks) != 1:
+                            raise ValueError(f"{command} 含多個 P51X 欄位")
+                        generated = _build_direct_conversion(
+                            fields, field_blocks[0][0], field_blocks[0][1]
+                        )
+                        report.converted_direct_blocks += 1
+                    else:
+                        raise ValueError(f"未知或不支援的命令 {command or '<空白>'}")
+                except (ValueError, IndexError) as exc:
+                    failure = str(exc)
+
+                if failure is None and generated is not None:
+                    for _field_index, block in field_blocks:
+                        for block_event in block.all_events:
+                            block_event.drop = True
+                    event.generated = generated
+                else:
+                    report.preserved_blocks += 1
+                    _warn(report, f"第 {line_number} 行保留原始選取區塊：{failure}")
+
+                for _field_index, block in field_blocks:
+                    if pending.get(block.nfield) is block:
+                        del pending[block.nfield]
+
+        flush_safe()
+
+    if cancel_check is not None and cancel_check():
+        raise ConversionCancelled("使用者已取消轉換。")
+    if pending:
+        for block in pending.values():
+            report.preserved_blocks += 1
+            _warn(
+                report,
+                f"檔案結尾仍有未使用的 FLST NFIELD={block.nfield}，已原樣保留。",
+            )
+        pending.clear()
+    flush_safe(force=True)
+    if progress_callback is not None:
+        progress_callback(report.input_lines, report.input_lines)
+    return report
+
+
+def _encoding_decodes(path: Path, encoding: str) -> bool:
+    decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+    try:
+        with path.open("rb") as binary:
+            while chunk := binary.read(1024 * 1024):
+                decoder.decode(chunk)
+            decoder.decode(b"", final=True)
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def detect_text_encoding(path: str | os.PathLike[str]) -> str:
+    source_path = Path(path)
+    with source_path.open("rb") as binary:
+        prefix = binary.read(3)
+    if prefix.startswith(codecs.BOM_UTF8):
+        return "utf-8-sig"
+    for encoding in ("utf-8", "cp950", "gb18030"):
+        if _encoding_decodes(source_path, encoding):
+            return encoding
+    raise UnicodeError("無法以 UTF-8、CP950 或 GB18030 解碼輸入檔。")
+
+
+def convert_lgw_file(
+    input_path: str | os.PathLike[str],
+    output_path: str | os.PathLike[str],
+    *,
+    cleanup: bool = True,
+    strip_comments: bool = False,
+    compress_ranges: bool = False,
+    cancel_event: object | None = None,
+    progress_callback: ProgressCallback | None = None,
+    overwrite: bool = False,
+) -> ConversionReport:
+    """Convert one file atomically to UTF-8 (without BOM) and LF endings."""
+    source_path = Path(input_path).expanduser().resolve()
+    destination_path = Path(output_path).expanduser().resolve()
+    if source_path == destination_path:
+        raise ValueError("輸入與輸出檔案不可相同。")
+    if not source_path.is_file():
+        raise FileNotFoundError(f"找不到輸入檔：{source_path}")
+    if destination_path.exists() and not overwrite:
+        raise FileExistsError(f"輸出檔已存在：{destination_path}")
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+    encoding = detect_text_encoding(source_path)
+    cancel_check: CancelCheck | None = None
+    if cancel_event is not None:
+        is_set = getattr(cancel_event, "is_set", None)
+        if not callable(is_set):
+            raise TypeError("cancel_event 必須提供 is_set() 方法。")
+        cancel_check = is_set
+
+    temporary_name: str | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination_path.name}.",
+            suffix=".tmp",
+            dir=destination_path.parent,
+        )
+        os.close(descriptor)
+        with source_path.open("r", encoding=encoding, errors="strict", newline=None) as source:
+            names = _scan_identifiers(source)
+            prefix = _choose_temp_prefix_from_names(names)
+            with open(
+                temporary_name,
+                "w",
+                encoding="utf-8",
+                errors="strict",
+                newline="\n",
+            ) as sink:
+                report = convert_lgw_stream(
+                    source,
+                    sink,
+                    cleanup=cleanup,
+                    strip_comments=strip_comments,
+                    compress_ranges=compress_ranges,
+                    cancel_check=cancel_check,
+                    progress_callback=progress_callback,
+                    temp_prefix=prefix,
+                )
+        report.input_encoding = encoding
+        if cancel_check is not None and cancel_check():
+            raise ConversionCancelled("使用者已取消轉換。")
+        os.replace(temporary_name, destination_path)
+        temporary_name = None
+        return report
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
+
+
+# ── 設定檔路徑 ─────────────────────────────────────────────────────────────────
+
+SETTINGS_FILE = Path(__file__).parent / "select_settings.json"
+
+# ── 常數 ───────────────────────────────────────────────────────────────────────
+
+ENTITY_INFO = {
+    "AREA": {"sel": "ASEL", "id_item": "AREA", "cm_item": "AREA"},
+    "LINE": {"sel": "LSEL", "id_item": "LINE", "cm_item": "LINE"},
+    "VOLU": {"sel": "VSEL", "id_item": "VOLU", "cm_item": "VOLU"},
+    "NODE": {"sel": "NSEL", "id_item": "NODE", "cm_item": "NODE"},
+    "ELEM": {"sel": "ESEL", "id_item": "ELEM", "cm_item": "ELEM"},
+    "KP":   {"sel": "KSEL", "id_item": "KP",   "cm_item": "KP"},
+}
+
+TOPOLOGY_CMSEL_MODE = "COMPONENT 名稱 -> 選取元件/組合 (CMSEL,S/A)"
+
+TOPOLOGY_MODES = {
+    "AREA IDs -> ELEM (ESLA,S)":            {"source": "AREA", "steps": ["ESLA, S"],             "target": "ELEM"},
+    "AREA IDs -> NODE (NSLA,S,1)":          {"source": "AREA", "steps": ["NSLA, S, 1"],           "target": "NODE"},
+    "AREA IDs -> LINE (LSLA,S)":            {"source": "AREA", "steps": ["LSLA, S"],              "target": "LINE"},
+    "AREA IDs -> VOLU (VSLA,S)":            {"source": "AREA", "steps": ["VSLA, S"],              "target": "VOLU"},
+    "LINE IDs -> ELEM (ESLL,S)":            {"source": "LINE", "steps": ["ESLL, S"],              "target": "ELEM"},
+    "LINE IDs -> NODE (NSLL,S,1)":          {"source": "LINE", "steps": ["NSLL, S, 1"],           "target": "NODE"},
+    "LINE IDs -> KP (KSLL,S)":              {"source": "LINE", "steps": ["KSLL, S"],              "target": "KP"},
+    "LINE IDs -> AREA (ASLL,S,0)":          {"source": "LINE", "steps": ["ASLL, S, 0"],           "target": "AREA"},
+    "VOLU IDs -> ELEM (ESLV,S)":            {"source": "VOLU", "steps": ["ESLV, S"],              "target": "ELEM"},
+    "VOLU IDs -> NODE (NSLV,S,1)":          {"source": "VOLU", "steps": ["NSLV, S, 1"],           "target": "NODE"},
+    "VOLU IDs -> AREA (ASLV,S)":            {"source": "VOLU", "steps": ["ASLV, S"],              "target": "AREA"},
+    "NODE IDs -> ELEM (ESLN,S,0 任一節點)": {"source": "NODE", "steps": ["ESLN, S, 0"],           "target": "ELEM"},
+    "NODE IDs -> ELEM (ESLN,S,1 全部節點)": {"source": "NODE", "steps": ["ESLN, S, 1"],           "target": "ELEM"},
+    "NODE IDs -> KP (KSLN,S)":              {"source": "NODE", "steps": ["KSLN, S"],              "target": "KP"},
+    "ELEM IDs -> NODE (NSLE,S,ALL)":        {"source": "ELEM", "steps": ["NSLE, S, ALL"],         "target": "NODE"},
+    "ELEM IDs -> NODE (NSLE,S,CORNER)":     {"source": "ELEM", "steps": ["NSLE, S, CORNER"],      "target": "NODE"},
+    "ELEM IDs -> NODE (NSLE,S,MID)":        {"source": "ELEM", "steps": ["NSLE, S, MID"],         "target": "NODE"},
+    "KP IDs -> LINE (LSLK,S,0)":            {"source": "KP",   "steps": ["LSLK, S, 0"],           "target": "LINE"},
+    "KP IDs -> NODE (NSLK,S)":              {"source": "KP",   "steps": ["NSLK, S"],              "target": "NODE"},
+    "KP IDs -> AREA (LSLK + ASLL)":         {"source": "KP",   "steps": ["LSLK, S, 0", "ASLL, S, 0"], "target": "AREA"},
+    TOPOLOGY_CMSEL_MODE:                     {"kind": "component"},
+}
+
+# 後續疊加模式選項（顯示標籤, 值）
+NEXT_TYPE_OPTIONS = [
+    ("再加入 (A)", "A"),
+    ("取交集 (R)", "R"),
+    ("排除這些 IDs (U)", "U"),
+]
+
+# Box／區域選取方式
+BOX_SELECTION_OPTIONS = [
+    ("重新選擇 (S)", "S"),
+    ("再加入 (A)", "A"),
+    ("取交集 (R)", "R"),
+    ("排除這些 IDs (U)", "U"),
+]
+BOX_REFINE_OPTIONS = [option for option in BOX_SELECTION_OPTIONS if option[1] != "S"]
+
+HEADER_HELP_GAP = 12
+ID_COMPONENT_ENTRY_WIDTH = 10
+DEFAULT_SELTOL = "1e-6"
+SELTOL_COMMAND = f"SELTOL, {DEFAULT_SELTOL}"
+OUTPUT_ACTION_BUTTON_WIDTHS = {
+    "複製結果": 8,
+    "清空輸出": 8,
+    "插入分隔線": 10,
+}
+
+LEGACY_TAB_ORDER = (
+    "ID 清單",
+    "ID 範圍",
+    "Box / 區域",
+    "拓樸鏈",
+    "元件操作",
+)
+
+REMOVED_RANGE_SETTING_KEYS = (
+    "range_entity",
+    "range_sel_type",
+    "range_start",
+    "range_end",
+    "range_inc",
+    "range_cm_name",
+)
+
+BoxBound = Union[float, str]
+
+DEFAULT_SETTINGS: dict = {
+    "geometry":       "980x760",
+    "active_tab":     "ID 清單",
+    # ID 清單
+    "id_entity":      "AREA",
+    "id_style":       "逐一加選",
+    "id_next_type":   "A",
+    "id_cm_name":     "",
+    "id_add_seltol":  False,
+    # Box
+    "box_entity":       "ELEM",
+    "box_first_type":   "S",
+    "box_refine_type":  "R",
+    "box_x1": "0", "box_x2": "10",
+    "box_y1": "",  "box_y2": "",
+    "box_z1": "",  "box_z2": "",
+    "box_cm_name":  "",
+    "box_add_seltol": False,
+    # 拓樸鏈
+    "topo_mode":      list(TOPOLOGY_MODES.keys())[0],
+    "topo_id_style":  "逐一加選",
+    "topo_cm_name":   "",
+    # 元件操作（位於 Box / 區域分頁）
+    "comp_next_type":   "A",
+    "comp_post":        "無",
+    "comp_save_name":   "",
+    "comp_save_entity": "ELEM",
+    "comp_with_none":   False,
+    # LOG 轉 APDL
+    "log_cleanup":         True,
+    "log_strip_comments":  False,
+    "log_compress_ranges": False,
+    # 全域
+    "append_mode":    False,
+    "add_allsel_end": False,
+}
+
+
+def load_settings() -> dict:
+    try:
+        if SETTINGS_FILE.exists():
+            with SETTINGS_FILE.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {**DEFAULT_SETTINGS, **data}
+    except Exception:
+        pass
+    return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(data: dict) -> None:
+    try:
+        with SETTINGS_FILE.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ── ANSYS 輸出智慧解析輔助 ────────────────────────────────────────────────────────
+
+# 屬性賦值雜訊的正規式：MAT= 1, DSYS= 0, LOAD STEP= 1, TIME= 1.000 ...
+# 使用 [A-Za-z][A-Za-z0-9_ ]* 允許含空格的多詞鍵值（如 LOAD STEP、LOAD CASE）
+_ANSYS_ATTR_RE = re.compile(r'\b[A-Za-z][A-Za-z0-9_ ]*=\s*[\d.eE+\-]+')
+
+# 這些 LIST 指令的輸出，每列資料含多個整數欄位（MAT/TYP/KP1/KP2/NDIV…）
+# 只需取每列的「第一個整數」（= 實體 ID）
+_FIRST_COL_HEADERS = (
+    "LIST ALL SELECTED ELEMENTS",   # ELIST：ELEM + MAT/TYP/REL/ESY/SEC + NODES
+    "LIST ALL SELECTED AREAS",      # ALIST：AREA + MAT=/TYPE=/REAL= + L= 行號
+    "LIST ALL SELECTED LINES",      # LLIST：LINE + KP1/KP2/NDIV + XSYM
+    "LIST ALL SELECTED KEYPOINTS",  # KLIST：KP + KNODE/KANGLE/KCSK (X/Y/Z 為浮點)
+    "LIST ALL SELECTED VOLUMES",    # VLIST：VOLU + MAT=/TYPE=/REAL= + A= 面號
+)
+
+# ── 純邏輯函式 ─────────────────────────────────────────────────────────────────
+
+def normalize_tokens(text: str) -> list[str]:
+    raw = text.strip()
+    if not raw:
+        return []
+    raw = re.sub(r"[,\uFF0C;\uFF1B]+", " ", raw)
+    return [tok for tok in re.split(r"\s+", raw) if tok]
+
+
+def expand_range_token(token: str) -> list[int]:
+    if re.fullmatch(r"\d+", token):
+        return [int(token)]
+    m = re.fullmatch(r"(\d+)\s*[-:~]\s*(\d+)(?:\s*:\s*(\d+))?", token)
+    if not m:
+        raise ValueError(f"格式錯誤: {token}，支援 12、1-10、1:10:2")
+    start, end = int(m.group(1)), int(m.group(2))
+    step = int(m.group(3)) if m.group(3) else 1
+    if step == 0:
+        raise ValueError("步長不能是 0。")
+    if start > end and step > 0:
+        step = -step
+    if start < end and step < 0:
+        step = -step
+    out, val = [], start
+    if step > 0:
+        while val <= end:
+            out.append(val); val += step
+    else:
+        while val >= end:
+            out.append(val); val += step
+    return out
+
+
+def parse_numbers(text: str) -> list[int]:
+    """
+    解析 ID 輸入，支援以下所有格式：
+
+    手動輸入
+        整數（12）、減號/冒號/波浪號範圍（1-10、1:10:2、1~10）
+
+    ANSYS 任意 LIST 指令輸出（直接貼上即可）
+        CMLIST  → 子元件列表，子元件行縮排大，所有純整數皆為 ID
+        NLIST   → NODE 整數 + X/Y/Z 浮點，只有 NODE 是純整數 → 自動正確
+        ELIST   → ELEM/MAT/TYP/… 皆整數，採首欄模式只取 ELEM
+        ALIST   → AREA + MAT=N TYPE=N … L= 行號，採首欄模式只取 AREA
+        LLIST   → LINE + KP1/KP2/NDIV…，採首欄模式只取 LINE
+        KLIST   → KP + X/Y/Z(浮點) + KNODE…，採首欄模式只取 KP
+        VLIST   → VOLU + MAT=N … A= 面號，採首欄模式只取 VOLU
+        PRNSOL  → NODE 整數 + 結果科學記號（非純整數），自動只取 NODE
+        PRRSOL  → 同 PRNSOL
+        PRETAB  → ELEM 整數 + 浮點結果，自動只取 ELEM
+
+    其他雜訊（中文、英文標頭、WORD= value 賦值）一律靜默略過。
+    """
+    if not text.strip():
+        return []
+
+    upper = text.upper()
+
+    # ── 首欄模式：ELIST / ALIST / LLIST / KLIST / VLIST ──────────────────────
+    # 這幾個 list 的資料列含多個整數欄位，只取縮排 ≤ 15 的列之第一個整數（= 實體 ID）
+    # 縮排 > 15 的行視為 ELIST 多節點 continuation 行，直接跳過
+    if any(kw in upper for kw in _FIRST_COL_HEADERS):
+        numbers = []
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+            if len(line) - len(stripped) > 15:
+                continue                         # continuation 行，跳過
+            m = re.match(r'(\d+)', stripped)
+            if m:
+                numbers.append(int(m.group(1)))
+        return numbers
+
+    # ── 預設模式：先清除 WORD= value 屬性雜訊，再取所有純整數與 Range ─────────
+    # 適用：CMLIST / NLIST / PRNSOL / PRRSOL / PRETAB / 手動輸入
+    # 清除後：DSYS= 0, LOAD STEP= 1, MAT= 1 … 等雜訊不再干擾
+    cleaned = _ANSYS_ATTR_RE.sub('', text)
+    numbers = []
+    for token in normalize_tokens(cleaned):
+        if re.fullmatch(r"\d+", token):
+            numbers.append(int(token))
+        elif re.fullmatch(r"\d+\s*[-:~]\s*\d+(?:\s*:\s*\d+)?", token):
+            try:
+                numbers.extend(expand_range_token(token))
+            except ValueError:
+                pass
+        # else: 靜默略過（ANSYS 標頭、中文、元件名稱、科學記號結果值…）
+    return numbers
+
+
+def parse_component_names(text: str) -> list[str]:
+    names = []
+    for token in normalize_tokens(text):
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", token):
+            raise ValueError(f"元件名稱格式不合法: {token}")
+        names.append(token)
+    return names
+
+
+def build_component_select_commands(names: list[str], first_type: str = "S",
+                                    next_type: str = "A") -> str:
+    if not names:
+        return ""
+    lines = [f"CMSEL, {first_type}, {names[0]}"]
+    lines.extend(f"CMSEL, {next_type}, {name}" for name in names[1:])
+    return "\n".join(lines)
+
+
+def parse_box_bound_optional(text: str, field_name: str) -> BoxBound | None:
+    s = text.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", s):
+            return s
+        raise ValueError(
+            f"{field_name} 必須是數值或有效的 APDL 純量變數名稱"
+            "（英文字母開頭，僅限英數與底線，最多 32 字元）。"
+        )
+
+
+def format_id_select_line(sel_cmd: str, sel_type: str, item: str,
+                           id1: int, id2: int | None = None, inc: int | None = None) -> str:
+    if id2 is None:
+        return f"{sel_cmd}, {sel_type}, {item}, , {id1}"
+    if inc is None or inc == 1:
+        return f"{sel_cmd}, {sel_type}, {item}, , {id1}, {id2}"
+    return f"{sel_cmd}, {sel_type}, {item}, , {id1}, {id2}, {inc}"
+
+
+def build_id_list_commands(entity: str, numbers: list[int],
+                            style: str, first_type: str, next_type: str) -> str:
+    if entity not in ENTITY_INFO:
+        raise ValueError(f"不支援的實體類型: {entity}")
+    if not numbers:
+        return ""
+    sel_cmd = ENTITY_INFO[entity]["sel"]
+    item = ENTITY_INFO[entity]["id_item"]
+    if style == "逐一加選":
+        lines = [format_id_select_line(sel_cmd, first_type, item, numbers[0])]
+        for num in numbers[1:]:
+            lines.append(format_id_select_line(sel_cmd, next_type, item, num))
+        return "\n".join(lines)
+    # 壓縮排序範圍
+    ranges = compress_numbers_to_ranges(numbers)
+    lines = []
+    for i, (start, end, inc) in enumerate(ranges):
+        sel_type = first_type if i == 0 else next_type
+        if start == end:
+            lines.append(format_id_select_line(sel_cmd, sel_type, item, start))
+        else:
+            lines.append(format_id_select_line(sel_cmd, sel_type, item, start, end, inc))
+    return "\n".join(lines)
+
+
+def build_box_commands(entity: str, first_type: str, refine_type: str,
+                        x_pair: tuple[BoxBound, BoxBound] | None,
+                        y_pair: tuple[BoxBound, BoxBound] | None,
+                        z_pair: tuple[BoxBound, BoxBound] | None) -> str:
+    if entity not in ENTITY_INFO:
+        raise ValueError(f"Box 模式不支援此實體類型: {entity}")
+    sel_cmd = ENTITY_INFO[entity]["sel"]
+    item = "CENT" if entity == "ELEM" else "LOC"
+    axes = []
+    if x_pair is not None: axes.append(("X", x_pair))
+    if y_pair is not None: axes.append(("Y", y_pair))
+    if z_pair is not None: axes.append(("Z", z_pair))
+    if not axes:
+        raise ValueError("X/Y/Z 至少要填一組範圍。")
+    lines = []
+    for i, (axis, (vmin, vmax)) in enumerate(axes):
+        stype = first_type if i == 0 else refine_type
+        lines.append(f"{sel_cmd}, {stype}, {item}, {axis}, {vmin}, {vmax}")
+    return "\n".join(lines)
+
+
+def append_cm_line(lines: list[str], cm_name: str, entity: str) -> None:
+    name = cm_name.strip()
+    if not name:
+        return
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", name):
+        raise ValueError("元件名稱不合法，需英文字母開頭，且只含英數底線。")
+    lines.append(f"CM, {name}, {entity}")
+
+
+# ── GUI ────────────────────────────────────────────────────────────────────────
+
+class APDLSelectorGUI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self._closing = False
+        self._pane_minimum_job: str | None = None
+        self._id_pane_minimums: tuple[int, int] | None = None
+        self._main_top_minimum: int | None = None
+        self.root.title("APDL 選取語法工具箱")
+        self.settings = load_settings()
+        self.root.geometry(self.settings.get("geometry", "980x760"))
+        self.root.minsize(560, 480)
+        self.build_ui()
+        self._apply_settings()
+        self._schedule_pane_minimum_update()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ── 設定存取 ────────────────────────────────────────────────────────────────
+
+    def _on_close(self) -> None:
+        self._closing = True
+        self._collect_settings()
+        save_settings(self.settings)
+        self.root.destroy()
+
+    def _collect_settings(self) -> None:
+        s = self.settings
+        for key in REMOVED_RANGE_SETTING_KEYS:
+            s.pop(key, None)
+        s["geometry"]       = self.root.geometry()
+        s["active_tab"]     = self.notebook.tab(self.notebook.select(), "text")
+        s["id_entity"]      = self.id_entity.get()
+        s["id_style"]       = self.id_style.get()
+        s["id_next_type"]   = self.id_next_type.get()
+        s["id_cm_name"]     = self.id_cm_name.get()
+        s["id_add_seltol"]  = self.id_add_seltol.get()
+        s["box_entity"]     = self.box_entity.get()
+        s["box_first_type"] = self.box_first_type.get()
+        s["box_refine_type"]= self.box_refine_type.get()
+        s["box_x1"]         = self.box_x1.get()
+        s["box_x2"]         = self.box_x2.get()
+        s["box_y1"]         = self.box_y1.get()
+        s["box_y2"]         = self.box_y2.get()
+        s["box_z1"]         = self.box_z1.get()
+        s["box_z2"]         = self.box_z2.get()
+        s["box_cm_name"]    = self.box_cm_name.get()
+        s["box_add_seltol"] = self.box_add_seltol.get()
+        s["topo_mode"]      = self.topo_mode.get()
+        s["topo_id_style"]  = self.topo_id_style.get()
+        s["topo_cm_name"]   = self.topo_cm_name.get()
+        s["comp_next_type"] = self.comp_next_type.get()
+        s["comp_post"]      = self.comp_post.get()
+        s["comp_save_name"] = self.comp_save_name.get()
+        s["comp_save_entity"]= self.comp_save_entity.get()
+        s["comp_with_none"] = self.comp_with_none.get()
+        s["log_cleanup"] = self.log_cleanup.get()
+        s["log_strip_comments"] = self.log_strip_comments.get()
+        s["log_compress_ranges"] = self.log_compress_ranges.get()
+        s["append_mode"]    = self.append_mode.get()
+        s["add_allsel_end"] = self.add_allsel_end.get()
+
+    def _apply_settings(self) -> None:
+        s = self.settings
+        self.id_entity.set(s.get("id_entity", "AREA"))
+        self.id_style.set(s.get("id_style", "逐一加選"))
+        self.id_next_type.set(s.get("id_next_type", "A"))
+        self.id_cm_name.set(s.get("id_cm_name", ""))
+        self.id_add_seltol.set(s.get("id_add_seltol", False))
+        self.box_entity.set(s.get("box_entity", "ELEM"))
+        self.box_first_type.set(s.get("box_first_type", "S"))
+        self.box_refine_type.set(s.get("box_refine_type", "R"))
+        self.box_x1.set(s.get("box_x1", "0"))
+        self.box_x2.set(s.get("box_x2", "10"))
+        self.box_y1.set(s.get("box_y1", ""))
+        self.box_y2.set(s.get("box_y2", ""))
+        self.box_z1.set(s.get("box_z1", ""))
+        self.box_z2.set(s.get("box_z2", ""))
+        self.box_cm_name.set(s.get("box_cm_name", ""))
+        self.box_add_seltol.set(s.get("box_add_seltol", False))
+        topo = s.get("topo_mode", list(TOPOLOGY_MODES.keys())[0])
+        self.topo_mode.set(topo if topo in TOPOLOGY_MODES else list(TOPOLOGY_MODES.keys())[0])
+        self.topo_id_style.set(s.get("topo_id_style", "逐一加選"))
+        self.topo_cm_name.set(s.get("topo_cm_name", ""))
+        self._update_topology_mode_ui()
+        self.comp_next_type.set(s.get("comp_next_type", "A"))
+        self.comp_post.set(s.get("comp_post", "無"))
+        self.comp_save_name.set(s.get("comp_save_name", ""))
+        self.comp_save_entity.set(s.get("comp_save_entity", "ELEM"))
+        self.comp_with_none.set(s.get("comp_with_none", False))
+        self.log_cleanup.set(s.get("log_cleanup", True))
+        self.log_strip_comments.set(s.get("log_strip_comments", False))
+        self.log_compress_ranges.set(s.get("log_compress_ranges", False))
+        self.append_mode.set(s.get("append_mode", False))
+        self.add_allsel_end.set(s.get("add_allsel_end", False))
+        saved_tab = s.get("active_tab", "ID 清單")
+        if isinstance(saved_tab, int):
+            if 0 <= saved_tab < len(LEGACY_TAB_ORDER):
+                saved_tab = LEGACY_TAB_ORDER[saved_tab]
+            else:
+                saved_tab = "ID 清單"
+        if saved_tab == "ID 範圍":
+            saved_tab = "ID 清單"
+        elif saved_tab == "元件操作":
+            saved_tab = "Box / 區域"
+        for tab_id in self.notebook.tabs():
+            if self.notebook.tab(tab_id, "text") == saved_tab:
+                self.notebook.select(tab_id)
+                break
+
+    # ── UI 建構 ─────────────────────────────────────────────────────────────────
+
+    def build_ui(self) -> None:
+        main = ttk.Frame(self.root, padding=10)
+        main.pack(fill="both", expand=True)
+
+        header = ttk.Frame(main)
+        header.pack(fill="x", pady=(0, 6))
+        header.columnconfigure(1, weight=1)
+        self.title_label = ttk.Label(
+            header,
+            text="APDL 選取語法工具箱",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        )
+        self.title_label.grid(row=0, column=0, sticky="nw")
+        self.header_help = ttk.Label(
+            header,
+            text="支援 ID 清單 / Box / 拓樸鏈 / 元件操作；"
+                 "可直接貼入 ANSYS LIST 輸出（CMLIST/NLIST/ELIST/ALIST/LLIST/KLIST/VLIST/PRNSOL 等）自動解析。",
+            foreground="gray",
+            justify="left",
+        )
+        self.header_help.grid(row=0, column=1, sticky="ew", padx=(HEADER_HELP_GAP, 0))
+        header.bind("<Configure>", self._resize_header_help, add="+")
+
+        # ── 垂直分割：上方（頁籤 + 全域選項）/ 下方（輸出區）可拖曳調整 ──
+        self.main_pane = tk.PanedWindow(main, orient="vertical", borderwidth=0)
+        self.main_pane.pack(fill="both", expand=True)
+
+        # 上方框架
+        self.top_frame = ttk.Frame(self.main_pane)
+        self.main_pane.add(self.top_frame, minsize=1, stretch="always")
+
+        self.notebook = ttk.Notebook(self.top_frame)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.build_tab_id_list()
+        self.build_tab_box()
+        self.build_tab_topology()
+        self.build_tab_log_converter()
+
+        # 下方框架（輸出區）
+        self.bot_frame = ttk.Frame(self.main_pane)
+        self.main_pane.add(self.bot_frame, minsize=1, stretch="always")
+
+        ttk.Label(self.bot_frame, text="輸出結果：").pack(anchor="w", pady=(4, 2))
+        self.output_text = tk.Text(self.bot_frame, height=8, wrap="none")
+        self.output_text.pack(fill="both", expand=True)
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
+        self._on_tab_changed()
+
+    def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
+        """LOG 轉 APDL 分頁有自己的左右轉換結果區，用不到下方共用的「輸出結果」面板。"""
+        is_log_tab = self.notebook.tab(self.notebook.select(), "text") == "LOG 轉 APDL"
+        bot_visible = str(self.bot_frame) in {str(pane) for pane in self.main_pane.panes()}
+        if is_log_tab and bot_visible:
+            self.main_pane.forget(self.bot_frame)
+        elif not is_log_tab and not bot_visible:
+            self.main_pane.add(self.bot_frame, minsize=1, stretch="always")
+
+    def _resize_header_help(self, event: tk.Event) -> None:
+        available_width = max(
+            event.width - self.title_label.winfo_reqwidth() - HEADER_HELP_GAP,
+            1,
+        )
+        self.header_help.configure(wraplength=available_width)
+
+    def _resize_id_input1_help(self, event: tk.Event) -> None:
+        """依主要輸入區寬度換行，並同步更新可拖曳窗格的安全高度。"""
+        self.id_input1_help.configure(wraplength=max(event.width, 1))
+        self._schedule_pane_minimum_update()
+
+    def _resize_box_value_help(self, event: tk.Event) -> None:
+        self.box_value_help.configure(wraplength=max(event.width, 1))
+        self._schedule_pane_minimum_update()
+
+    def _resize_topology_help(self, event: tk.Event) -> None:
+        self.topo_help_label.configure(wraplength=max(event.width, 1))
+        self._schedule_pane_minimum_update()
+
+    def _update_topology_mode_ui(self, _event: tk.Event | None = None) -> None:
+        is_cmsel = self.topo_mode.get() == TOPOLOGY_CMSEL_MODE
+        if is_cmsel:
+            self.topo_source_label.configure(text="元件／組合名稱")
+            self.topo_style_label.configure(text="ID 輸出（不適用）")
+            self.topo_style_combo.configure(state="disabled")
+            self.topo_help_label.configure(
+                text="支援多筆元件或組合名稱（空白／逗號／分號分隔）；"
+                     "第一筆使用 CMSEL,S，後續使用 CMSEL,A。"
+            )
+            self.topo_save_label.configure(text="儲存最終結果元件（不適用）：")
+            self.topo_save_entry.configure(state="disabled")
+            self.topo_generate_button.configure(text="產生 CMSEL")
+        else:
+            self.topo_source_label.configure(text="來源 IDs")
+            self.topo_style_label.configure(text="ID 輸出")
+            self.topo_style_combo.configure(state="readonly")
+            self.topo_help_label.configure(
+                text="可直接貼入任何 ANSYS LIST 輸出"
+                     "（CMLIST/NLIST/ALIST/LLIST/KLIST 等），"
+                     "自動識別並萃取來源實體 ID"
+            )
+            self.topo_save_label.configure(text="儲存最終結果元件：")
+            self.topo_save_entry.configure(state="normal")
+            self.topo_generate_button.configure(text="產生拓樸鏈")
+        self._schedule_pane_minimum_update()
+
+    def _schedule_pane_minimum_update(self) -> None:
+        if self._pane_minimum_job is None:
+            self._pane_minimum_job = self.root.after_idle(self._update_pane_minimums)
+
+    @staticmethod
+    def _minimum_text_height(text_widget: tk.Text) -> int:
+        visible_rows = max(int(text_widget.cget("height")), 1)
+        return max(text_widget.winfo_reqheight() // visible_rows, 1)
+
+    def _update_pane_minimums(self) -> None:
+        """限制分隔線，避免 Text 區縮放時裁掉灰色提示文字。"""
+        self._pane_minimum_job = None
+        try:
+            self.root.update_idletasks()
+
+            primary_minimum = (
+                self.id_input1_help.winfo_reqheight()
+                + self.id_seltol_check.winfo_reqheight()
+                + self._minimum_text_height(self.id_input1)
+                + 4
+            )
+            secondary_minimum = (
+                self.id_secondary_controls.winfo_reqheight()
+                + self.id_input2_help.winfo_reqheight()
+                + self._minimum_text_height(self.id_input2)
+                + 6
+            )
+            id_minimums = (primary_minimum, secondary_minimum)
+            if id_minimums != self._id_pane_minimums:
+                self.id_input_pane.paneconfigure(
+                    self.id_primary_area, minsize=primary_minimum
+                )
+                self.id_input_pane.paneconfigure(
+                    self.id_secondary_area, minsize=secondary_minimum
+                )
+                self._id_pane_minimums = id_minimums
+                self.root.update_idletasks()
+
+            top_minimum = self.top_frame.winfo_reqheight()
+            if top_minimum != self._main_top_minimum:
+                self.main_pane.paneconfigure(self.top_frame, minsize=top_minimum)
+                self._main_top_minimum = top_minimum
+        except tk.TclError:
+            pass
+
+    def _entity_radio_row(self, parent: tk.Widget, var: tk.StringVar,
+                          entities: list[str] | None = None) -> ttk.Frame:
+        """建立橫排 RadioButton 實體選擇列。"""
+        if entities is None:
+            entities = list(ENTITY_INFO.keys())
+        frame = ttk.Frame(parent)
+        for ent in entities:
+            ttk.Radiobutton(frame, text=ent, variable=var, value=ent).pack(side="left", padx=(0, 6))
+        return frame
+
+    def _type_radio_row(self, parent: tk.Widget, var: tk.StringVar,
+                         options: list[tuple[str, str]]) -> ttk.Frame:
+        """建立橫排 RadioButton 選取類型列。options = [(顯示文字, 值), ...]"""
+        frame = ttk.Frame(parent)
+        for label, val in options:
+            ttk.Radiobutton(frame, text=label, variable=var, value=val).pack(side="left", padx=(0, 8))
+        return frame
+
+    # ── Tab 1：ID 清單 ──────────────────────────────────────────────────────────
+
+    def build_tab_id_list(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="ID 清單")
+
+        # 實體類型 + 輸出模式
+        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 8))
+        ttk.Label(r0, text="主要選取", foreground="red").pack(side="left", padx=(0, 12))
+        ttk.Label(r0, text="實體類型：").pack(side="left")
+        self.id_entity = tk.StringVar(value="AREA")
+        self._entity_radio_row(r0, self.id_entity).pack(side="left")
+
+        ttk.Label(r0, text="輸出模式：").pack(side="left", padx=(12, 0))
+        self.id_style = tk.StringVar(value="逐一加選")
+        for lbl, val in [("逐一加選", "逐一加選"), ("壓縮排序範圍", "壓縮排序範圍")]:
+            ttk.Radiobutton(r0, text=lbl, variable=self.id_style, value=val).pack(side="left", padx=(0, 3))
+
+        self.append_mode = tk.BooleanVar(value=False)
+        self.add_allsel_end = tk.BooleanVar(value=False)
+        option_style = ttk.Style(self.root)
+        option_style.configure("BlueOption.TCheckbutton", foreground="blue")
+        option_style.map(
+            "BlueOption.TCheckbutton",
+            foreground=[("!disabled", "blue")],
+        )
+        ttk.Checkbutton(
+            r0,
+            text="追加模式",
+            variable=self.append_mode,
+            style="BlueOption.TCheckbutton",
+        ).pack(side="left")
+        ttk.Checkbutton(
+            r0,
+            text="結尾加上 ALLSEL, ALL",
+            variable=self.add_allsel_end,
+            style="BlueOption.TCheckbutton",
+        ).pack(side="left")
+
+        # ── 輸入框 1 & 2：垂直可拖曳分割 ──
+        self.id_input_pane = tk.PanedWindow(tab, orient="vertical", borderwidth=0)
+        self.id_input_pane.pack(fill="both", expand=True, pady=(0, 6))
+
+        self.id_primary_area = ttk.Frame(self.id_input_pane)
+        self.id_primary_area.columnconfigure(0, weight=1)
+        self.id_primary_area.rowconfigure(0, weight=1)
+        self.id_input_pane.add(self.id_primary_area, minsize=1, stretch="always")
+        self.id_input1 = tk.Text(self.id_primary_area, height=4, wrap="word")
+        self.id_input1.grid(row=0, column=0, sticky="nsew")
+        self.id_input1.insert("1.0", "1 5 8 12")
+        self.id_input1_help = ttk.Label(
+            self.id_primary_area,
+            text="支援：整數、1-10、1:10:2；首筆 S 起始，後續自動聯集 A；或直接貼入任何 ANSYS LIST 指令輸出（CMLIST/NLIST/ELIST/ALIST/LLIST/KLIST/VLIST/PRNSOL 等），自動識別並萃取實體 ID",
+            foreground="gray",
+            justify="left",
+        )
+        self.id_input1_help.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.id_add_seltol = tk.BooleanVar(value=False)
+        self.id_seltol_check = ttk.Checkbutton(
+            self.id_primary_area,
+            text=f"加入 {SELTOL_COMMAND}",
+            variable=self.id_add_seltol,
+        )
+        self.id_seltol_check.grid(row=2, column=0, sticky="w", pady=(2, 0))
+        self.id_primary_area.bind("<Configure>", self._resize_id_input1_help, add="+")
+
+        self.id_secondary_area = ttk.Frame(self.id_input_pane)
+        self.id_secondary_area.columnconfigure(0, weight=1)
+        self.id_secondary_area.rowconfigure(1, weight=1)
+        self.id_input_pane.add(self.id_secondary_area, minsize=1, stretch="always")
+
+        self.id_secondary_controls = ttk.Frame(self.id_secondary_area)
+        self.id_secondary_controls.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        tr = self.id_secondary_controls
+        ttk.Label(tr, text="疊加／精選 IDs", foreground="red").pack(side="left", padx=(0, 12))
+        ttk.Label(tr, text="疊加模式：").pack(side="left")
+        self.id_next_type = tk.StringVar(value="A")
+        for label, value in NEXT_TYPE_OPTIONS:
+            ttk.Radiobutton(
+                tr, text=label, variable=self.id_next_type, value=value
+            ).pack(side="left", padx=(0, 8))
+
+        save_controls = ttk.Frame(tr)
+        save_controls.pack(side="left", padx=(6, 8))
+        ttk.Label(save_controls, text="儲存成元件：").pack(side="left")
+        self.id_cm_name = tk.StringVar(value="")
+        ttk.Entry(
+            save_controls,
+            textvariable=self.id_cm_name,
+            width=ID_COMPONENT_ENTRY_WIDTH,
+        ).pack(
+            side="left", padx=(4, 6)
+        )
+        action_style = ttk.Style(self.root)
+        action_style.configure("RedAction.TButton", foreground="red")
+        action_style.map("RedAction.TButton", foreground=[("!disabled", "red")])
+        ttk.Button(
+            save_controls,
+            text="產生 ID 選取",
+            command=self.generate_id_list,
+            style="RedAction.TButton",
+        ).pack(side="left", padx=(0, 4))
+        output_actions = (
+            ("複製結果", self.copy_output),
+            ("清空輸出", self.clear_output),
+            ("插入分隔線", self.insert_divider),
+        )
+        for index, (label, command) in enumerate(output_actions):
+            trailing_space = 2 if index < len(output_actions) - 1 else 0
+            ttk.Button(
+                save_controls,
+                text=label,
+                command=command,
+                width=OUTPUT_ACTION_BUTTON_WIDTHS[label],
+                style="RedAction.TButton",
+            ).pack(side="left", padx=(0, trailing_space))
+
+        self.id_input2 = tk.Text(self.id_secondary_area, height=4, wrap="word")
+        self.id_input2.grid(row=1, column=0, sticky="nsew")
+        self.id_input2_help = ttk.Label(
+            self.id_secondary_area, text="留空則略過此欄", foreground="gray"
+        )
+        self.id_input2_help.grid(row=2, column=0, sticky="w", pady=(2, 0))
+
+    # ── Tab 2：Box / 區域 ───────────────────────────────────────────────────────
+
+    def build_tab_box(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="Box / 區域")
+
+        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 4))
+        ttk.Label(r0, text="主要選取", foreground="red").pack(side="left", padx=(0, 12))
+        ttk.Label(r0, text="實體類型：").pack(side="left")
+        self.box_entity = tk.StringVar(value="ELEM")
+        self._entity_radio_row(r0, self.box_entity).pack(side="left")
+
+        r1 = ttk.Frame(tab); r1.pack(fill="x", pady=(0, 4))
+        ttk.Label(r1, text="首軸選取方式：").pack(side="left")
+        self.box_first_type = tk.StringVar(value="S")
+        self._type_radio_row(r1, self.box_first_type, BOX_SELECTION_OPTIONS).pack(side="left")
+
+        r2 = ttk.Frame(tab); r2.pack(fill="x", pady=(0, 8))
+        ttk.Label(r2, text="後續軸方式：  ").pack(side="left")
+        self.box_refine_type = tk.StringVar(value="R")
+        self._type_radio_row(
+            r2, self.box_refine_type, BOX_REFINE_OPTIONS
+        ).pack(side="left")
+
+        grid = ttk.Frame(tab); grid.pack(fill="x", pady=(0, 8))
+        self.box_x1 = tk.StringVar(value="0");  self.box_x2 = tk.StringVar(value="10")
+        self.box_y1 = tk.StringVar(value="");   self.box_y2 = tk.StringVar(value="")
+        self.box_z1 = tk.StringVar(value="");   self.box_z2 = tk.StringVar(value="")
+        for row, (axis, v1, v2) in enumerate([
+                ("X", self.box_x1, self.box_x2),
+                ("Y", self.box_y1, self.box_y2),
+                ("Z", self.box_z1, self.box_z2)]):
+            ttk.Label(grid, text=f"{axis}min").grid(row=row, column=0, sticky="w", padx=(0, 4), pady=2)
+            ttk.Entry(grid, textvariable=v1, width=14).grid(row=row, column=1, padx=(0, 16), pady=2)
+            ttk.Label(grid, text=f"{axis}max").grid(row=row, column=2, sticky="w", padx=(0, 4), pady=2)
+            ttk.Entry(grid, textvariable=v2, width=14).grid(row=row, column=3, pady=2)
+
+        self.box_value_help = ttk.Label(
+            tab,
+            text="X/Y/Z 最小值與最大值可輸入數值或 APDL 純量變數名稱"
+                 "（例：X_MIN、X_MAX；變數需事先定義）。",
+            foreground="gray",
+            justify="left",
+        )
+        self.box_value_help.pack(fill="x", anchor="w", pady=(0, 6))
+        tab.bind("<Configure>", self._resize_box_value_help, add="+")
+
+        self.box_add_seltol = tk.BooleanVar(value=False)
+        self.box_seltol_check = ttk.Checkbutton(
+            tab,
+            text=f"加入 {SELTOL_COMMAND}",
+            variable=self.box_add_seltol,
+        )
+        self.box_seltol_check.pack(anchor="w", pady=(0, 6))
+
+        cr = ttk.Frame(tab); cr.pack(fill="x")
+        ttk.Label(cr, text="儲存成元件：").pack(side="left")
+        self.box_cm_name = tk.StringVar(value="")
+        ttk.Entry(cr, textvariable=self.box_cm_name, width=20).pack(side="left", padx=(4, 14))
+        ttk.Button(cr, text="產生 Box 選取", command=self.generate_box).pack(side="left")
+
+        ttk.Separator(tab, orient="horizontal").pack(
+            fill="x", pady=(12, 8)
+        )
+        self.build_component_section(tab)
+
+    # ── Tab 3：拓樸鏈 ───────────────────────────────────────────────────────────
+
+    def build_tab_topology(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="拓樸鏈")
+
+        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 6))
+        ttk.Label(r0, text="模式").pack(side="left")
+        self.topo_mode = tk.StringVar(value=list(TOPOLOGY_MODES.keys())[0])
+        self.topo_mode_combo = ttk.Combobox(
+            r0,
+            state="readonly",
+            textvariable=self.topo_mode,
+            values=list(TOPOLOGY_MODES.keys()),
+            width=44,
+            height=len(TOPOLOGY_MODES),
+        )
+        self.topo_mode_combo.pack(side="left", padx=(6, 14))
+        self.topo_mode_combo.bind(
+            "<<ComboboxSelected>>", self._update_topology_mode_ui, add="+"
+        )
+        self.topo_style_label = ttk.Label(r0, text="ID 輸出")
+        self.topo_style_label.pack(side="left")
+        self.topo_id_style = tk.StringVar(value="逐一加選")
+        self.topo_style_combo = ttk.Combobox(
+            r0,
+            state="readonly",
+            width=14,
+            textvariable=self.topo_id_style,
+            values=["逐一加選", "壓縮排序範圍"],
+        )
+        self.topo_style_combo.pack(side="left", padx=(6, 0))
+
+        self.topo_source_label = ttk.Label(tab, text="來源 IDs")
+        self.topo_source_label.pack(anchor="w")
+        self.topo_ids = tk.Text(tab, height=4, wrap="word")
+        self.topo_ids.pack(fill="both", expand=True, pady=(2, 4))
+        self.topo_ids.insert("1.0", "8 25")
+        self.topo_help_label = ttk.Label(
+            tab,
+            text="可直接貼入任何 ANSYS LIST 輸出"
+                 "（CMLIST/NLIST/ALIST/LLIST/KLIST 等），"
+                 "自動識別並萃取來源實體 ID",
+            foreground="gray",
+            justify="left",
+        )
+        self.topo_help_label.pack(fill="x", anchor="w", pady=(0, 6))
+        tab.bind("<Configure>", self._resize_topology_help, add="+")
+
+        r2 = ttk.Frame(tab); r2.pack(fill="x")
+        self.topo_save_label = ttk.Label(r2, text="儲存最終結果元件：")
+        self.topo_save_label.pack(side="left")
+        self.topo_cm_name = tk.StringVar(value="")
+        self.topo_save_entry = ttk.Entry(
+            r2, textvariable=self.topo_cm_name, width=20
+        )
+        self.topo_save_entry.pack(side="left", padx=(4, 14))
+        self.topo_generate_button = ttk.Button(
+            r2, text="產生拓樸鏈", command=self.generate_topology
+        )
+        self.topo_generate_button.pack(side="left")
+
+    # ── Tab 4：ANSYS LOG 轉 APDL ────────────────────────────────────────────────
+
+    def build_tab_log_converter(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="LOG 轉 APDL")
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(1, weight=1)
+
+        self.log_cleanup = tk.BooleanVar(value=True)
+        self.log_strip_comments = tk.BooleanVar(value=False)
+        self.log_compress_ranges = tk.BooleanVar(value=False)
+        self.log_status = tk.StringVar(value="待命")
+
+        help_label = ttk.Label(
+            tab,
+            text="左側貼上 ANSYS LOG / LGW 指令，按「開始轉換」後右側顯示轉換結果。"
+                 "中間橫桿可左右拖曳調整兩側寬度。"
+                 "「壓縮排序範圍」會忽略原始 log 的挑選順序，排序去重後合併成最少的等差範圍。"
+                 "無法無損改寫的區塊會保留原始語法；執行中的 /INPUT 一律保留。",
+            foreground="gray",
+            justify="left",
+        )
+        help_label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        tab.bind(
+            "<Configure>",
+            lambda event: help_label.configure(wraplength=max(event.width - 20, 1)),
+            add="+",
+        )
+
+        paned = ttk.PanedWindow(tab, orient="horizontal")
+        paned.grid(row=1, column=0, sticky="nsew")
+
+        source_frame, self.log_source_text, self.log_source_linenumbers = (
+            self._build_log_text_panel(paned, "尚未轉換", editable=True)
+        )
+        paned.add(source_frame, weight=1)
+
+        result_frame, self.log_result_text, self.log_result_linenumbers = (
+            self._build_log_text_panel(paned, "轉換結果", editable=False)
+        )
+        paned.add(result_frame, weight=1)
+
+        action_row = ttk.Frame(tab)
+        action_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.log_cleanup_check = ttk.Checkbutton(
+            action_row,
+            text="移除 GUI 顯示／視角雜訊",
+            variable=self.log_cleanup,
+        )
+        self.log_cleanup_check.pack(side="left")
+        self.log_strip_comments_check = ttk.Checkbutton(
+            action_row,
+            text="移除註解",
+            variable=self.log_strip_comments,
+        )
+        self.log_strip_comments_check.pack(side="left", padx=(12, 0))
+        self.log_compress_ranges_check = ttk.Checkbutton(
+            action_row,
+            text="壓縮排序範圍",
+            variable=self.log_compress_ranges,
+        )
+        self.log_compress_ranges_check.pack(side="left", padx=(12, 0))
+        self.log_start_button = ttk.Button(
+            action_row, text="開始轉換", command=self._start_log_conversion
+        )
+        self.log_start_button.pack(side="left", padx=(16, 6))
+        self.log_clear_button = ttk.Button(
+            action_row, text="清除", command=self._clear_log_conversion
+        )
+        self.log_clear_button.pack(side="left")
+        self.log_copy_button = ttk.Button(
+            action_row,
+            text="複製結果",
+            command=self._copy_log_result,
+            state="disabled",
+        )
+        self.log_copy_button.pack(side="left", padx=(6, 0))
+
+        ttk.Label(tab, textvariable=self.log_status).grid(
+            row=3, column=0, sticky="w", pady=(4, 0)
+        )
+
+    def _build_log_text_panel(
+        self, parent: tk.Widget, title: str, *, editable: bool
+    ) -> tuple[ttk.Frame, tk.Text, tk.Text]:
+        frame = ttk.Frame(parent)
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text=title).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 2)
+        )
+
+        line_numbers = tk.Text(
+            frame,
+            width=5,
+            padx=4,
+            takefocus=0,
+            border=0,
+            state="disabled",
+            wrap="none",
+            background="#f0f0f0",
+            foreground="#808080",
+        )
+        line_numbers.grid(row=1, column=0, sticky="ns")
+
+        text_widget = tk.Text(frame, wrap="none", undo=editable)
+        text_widget.grid(row=1, column=1, sticky="nsew")
+        if not editable:
+            text_widget.configure(state="disabled")
+
+        yscroll = ttk.Scrollbar(frame, orient="vertical")
+        yscroll.grid(row=1, column=2, sticky="ns")
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=text_widget.xview)
+        xscroll.grid(row=2, column=1, sticky="ew")
+
+        def _on_text_yscroll(first: str, last: str) -> None:
+            yscroll.set(first, last)
+            line_numbers.yview_moveto(float(first))
+
+        def _on_scrollbar(*args: str) -> None:
+            text_widget.yview(*args)
+            line_numbers.yview(*args)
+
+        text_widget.configure(yscrollcommand=_on_text_yscroll, xscrollcommand=xscroll.set)
+        yscroll.configure(command=_on_scrollbar)
+
+        def _forward_wheel(event: tk.Event) -> str:
+            text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            line_numbers.yview_moveto(text_widget.yview()[0])
+            return "break"
+
+        line_numbers.bind("<MouseWheel>", _forward_wheel)
+
+        def _on_modified(_event: tk.Event) -> None:
+            self._refresh_line_numbers(text_widget, line_numbers)
+            text_widget.edit_modified(False)
+
+        text_widget.bind("<<Modified>>", _on_modified, add="+")
+        self._refresh_line_numbers(text_widget, line_numbers)
+
+        return frame, text_widget, line_numbers
+
+    @staticmethod
+    def _refresh_line_numbers(text_widget: tk.Text, line_numbers: tk.Text) -> None:
+        line_count = int(text_widget.index("end-1c").split(".")[0])
+        numbers = "\n".join(str(n) for n in range(1, line_count + 1))
+        line_numbers.configure(state="normal")
+        line_numbers.delete("1.0", "end")
+        line_numbers.insert("1.0", numbers)
+        line_numbers.configure(state="disabled")
+
+    def _clear_log_conversion(self) -> None:
+        self.log_source_text.delete("1.0", "end")
+        self._set_log_result("")
+        self.log_status.set("待命")
+
+    def _set_log_result(self, text: str) -> None:
+        self.log_result_text.configure(state="normal")
+        self.log_result_text.delete("1.0", "end")
+        self.log_result_text.insert("1.0", text)
+        self.log_result_text.configure(state="disabled")
+        self.log_copy_button.configure(state="normal" if text else "disabled")
+        self._refresh_line_numbers(self.log_result_text, self.log_result_linenumbers)
+
+    def _copy_log_result(self) -> None:
+        result = self.log_result_text.get("1.0", "end-1c")
+        if not result:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(result)
+        self.root.update_idletasks()
+        line_count = len(result.splitlines())
+        self.log_status.set(f"已複製轉換結果（{line_count:,} 行）")
+
+    def _start_log_conversion(self) -> None:
+        source_text = self.log_source_text.get("1.0", "end-1c")
+        if not source_text.strip():
+            messagebox.showwarning(
+                "資料不足", "請先在左側貼上要轉換的 LOG / LGW 指令。", parent=self.root
+            )
+            return
+
+        sink = io.StringIO()
+        try:
+            report = convert_lgw_stream(
+                io.StringIO(source_text),
+                sink,
+                cleanup=self.log_cleanup.get(),
+                strip_comments=self.log_strip_comments.get(),
+                compress_ranges=self.log_compress_ranges.get(),
+            )
+        except Exception as exc:
+            self.log_status.set("轉換失敗")
+            messagebox.showerror(
+                "轉換失敗", f"{type(exc).__name__}: {exc}", parent=self.root
+            )
+            return
+
+        self._set_log_result(sink.getvalue())
+        summary = f"轉換完成：輸入 {report.input_lines:,} 行 → 輸出 {report.output_lines:,} 行"
+        details = []
+        if report.removed_noise_lines:
+            details.append(f"移除 GUI 雜訊 {report.removed_noise_lines:,} 行")
+        if report.removed_comment_lines:
+            details.append(f"移除註解 {report.removed_comment_lines:,} 行")
+        if report.preserved_blocks:
+            details.append(f"保留 {report.preserved_blocks:,} 個區塊")
+        if report.warnings:
+            details.append(f"警告 {len(report.warnings):,} 筆")
+        if details:
+            summary += "（" + "；".join(details) + "）"
+        self.log_status.set(summary)
+        if report.warnings:
+            messagebox.showwarning(
+                "部分區塊原樣保留",
+                "\n".join(report.warnings),
+                parent=self.root,
+            )
+
+    # ── Box / 區域內：元件操作 ──────────────────────────────────────────────────
+
+    def build_component_section(self, tab: ttk.Frame) -> None:
+        ttk.Label(tab, text="元件操作").pack(anchor="w", pady=(0, 4))
+
+        ttk.Label(tab, text="元件名稱清單（空白 / 逗號 / 分號 分隔）").pack(anchor="w")
+        self.comp_names = tk.Text(tab, height=4, wrap="word")
+        self.comp_names.pack(fill="both", expand=True, pady=(2, 8))
+        self.comp_names.insert("1.0", "CM_2_ELEM CM_3_ELEM CM_4_ELEM")
+
+        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 8))
+        self.comp_with_none = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r0, text="前置 CMSEL, NONE",
+                         variable=self.comp_with_none).pack(side="left", padx=(0, 16))
+        ttk.Label(r0, text="後續疊加：").pack(side="left")
+        self.comp_next_type = tk.StringVar(value="A")
+        self._type_radio_row(
+            r0, self.comp_next_type, NEXT_TYPE_OPTIONS
+        ).pack(side="left")
+        ttk.Label(r0, text="  後處理：").pack(side="left")
+        self.comp_post = tk.StringVar(value="無")
+        ttk.Combobox(r0, state="readonly", width=14, textvariable=self.comp_post,
+                     values=["無", "NSLE, S", "ESLN, S, 0"]).pack(side="left", padx=(4, 0))
+
+        r1 = ttk.Frame(tab); r1.pack(fill="x")
+        ttk.Label(r1, text="儲存合併後元件：").pack(side="left")
+        self.comp_save_name = tk.StringVar(value="")
+        ttk.Entry(r1, textvariable=self.comp_save_name, width=16).pack(side="left", padx=(4, 8))
+        self.comp_save_entity = tk.StringVar(value="ELEM")
+        self._entity_radio_row(r1, self.comp_save_entity).pack(side="left", padx=(0, 12))
+        ttk.Button(r1, text="產生 CMSEL 合併",
+                    command=self.generate_component_merge).pack(side="left", padx=(4, 0))
+        ttk.Button(r1, text="產生 CMDELE 刪除",
+                    command=self.generate_component_delete).pack(side="left", padx=(6, 0))
+
+    # ── 輸出工具 ─────────────────────────────────────────────────────────────────
+
+    def write_output(self, text: str) -> None:
+        output = text.rstrip()
+        if self.add_allsel_end.get():
+            output += "\nALLSEL, ALL"
+        output += "\n"
+        if self.append_mode.get():
+            existing = self.output_text.get("1.0", "end").strip()
+            if existing:
+                self.output_text.insert("end", "\n" + output)
+            else:
+                self.output_text.insert("1.0", output)
+        else:
+            self.output_text.delete("1.0", "end")
+            self.output_text.insert("1.0", output)
+
+    def copy_output(self) -> None:
+        result = self.output_text.get("1.0", "end").strip()
+        if not result:
+            messagebox.showwarning("提醒", "目前沒有可複製內容。")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(result)
+        self.root.update()
+        messagebox.showinfo("完成", "已複製到剪貼簿。")
+
+    def clear_output(self) -> None:
+        self.output_text.delete("1.0", "end")
+
+    def insert_divider(self) -> None:
+        self.output_text.insert("end", "\n! ==============================\n")
+
+    # ── 產生處理器 ───────────────────────────────────────────────────────────────
+
+    def generate_id_list(self) -> None:
+        try:
+            entity    = self.id_entity.get().strip()
+            style     = self.id_style.get().strip()
+            next_type = self.id_next_type.get().strip()
+            nums1     = parse_numbers(self.id_input1.get("1.0", "end"))
+            nums2     = parse_numbers(self.id_input2.get("1.0", "end"))
+
+            if not nums1 and not nums2:
+                raise ValueError("請在至少一個輸入框中輸入 ID。")
+
+            lines: list[str] = []
+            if self.id_add_seltol.get():
+                lines.append(SELTOL_COMMAND)
+            if nums1:
+                cmd = build_id_list_commands(entity, nums1, style, "S", "A")
+                if cmd:
+                    lines.extend(cmd.splitlines())
+            if nums2:
+                # 第二框：全部使用所選的疊加模式
+                cmd = build_id_list_commands(entity, nums2, style, next_type, next_type)
+                if cmd:
+                    lines.extend(cmd.splitlines())
+
+            append_cm_line(lines, self.id_cm_name.get(), ENTITY_INFO[entity]["cm_item"])
+            self.write_output("\n".join(lines))
+        except Exception as exc:
+            messagebox.showerror("錯誤", str(exc))
+
+    def _parse_axis_pair(self, vmin_str: str, vmax_str: str,
+                          axis_name: str) -> tuple[BoxBound, BoxBound] | None:
+        vmin = parse_box_bound_optional(vmin_str, f"{axis_name}min")
+        vmax = parse_box_bound_optional(vmax_str, f"{axis_name}max")
+        if vmin is None and vmax is None:
+            return None
+        if vmin is None or vmax is None:
+            raise ValueError(f"{axis_name}min / {axis_name}max 需同時填寫。")
+        return (vmin, vmax)
+
+    def generate_box(self) -> None:
+        try:
+            entity      = self.box_entity.get().strip()
+            first_type  = self.box_first_type.get().strip()
+            refine_type = self.box_refine_type.get().strip()
+            x_pair = self._parse_axis_pair(self.box_x1.get(), self.box_x2.get(), "X")
+            y_pair = self._parse_axis_pair(self.box_y1.get(), self.box_y2.get(), "Y")
+            z_pair = self._parse_axis_pair(self.box_z1.get(), self.box_z2.get(), "Z")
+            text  = build_box_commands(entity, first_type, refine_type, x_pair, y_pair, z_pair)
+            lines = text.splitlines()
+            if self.box_add_seltol.get():
+                lines.insert(0, SELTOL_COMMAND)
+            append_cm_line(lines, self.box_cm_name.get(), ENTITY_INFO[entity]["cm_item"])
+            self.write_output("\n".join(lines))
+        except Exception as exc:
+            messagebox.showerror("錯誤", str(exc))
+
+    def generate_topology(self) -> None:
+        try:
+            mode_name = self.topo_mode.get().strip()
+            mode      = TOPOLOGY_MODES[mode_name]
+            if mode.get("kind") == "component":
+                names = parse_component_names(self.topo_ids.get("1.0", "end"))
+                if not names:
+                    raise ValueError("請輸入至少一個元件或組合名稱。")
+                self.write_output(build_component_select_commands(names))
+                return
+
+            ids       = parse_numbers(self.topo_ids.get("1.0", "end"))
+            if not ids:
+                raise ValueError("請輸入來源 IDs。")
+            style  = self.topo_id_style.get().strip()
+            source = mode["source"]
+            lines  = build_id_list_commands(source, ids, style, "S", "A").splitlines()
+            lines.extend(mode["steps"])
+            append_cm_line(lines, self.topo_cm_name.get(), mode["target"])
+            self.write_output("\n".join(lines))
+        except Exception as exc:
+            messagebox.showerror("錯誤", str(exc))
+
+    def generate_component_merge(self) -> None:
+        try:
+            names       = parse_component_names(self.comp_names.get("1.0", "end"))
+            if not names:
+                raise ValueError("請輸入至少一個元件名稱。")
+            next_type   = self.comp_next_type.get().strip()
+            post        = self.comp_post.get().strip()
+            save_name   = self.comp_save_name.get().strip()
+            save_entity = self.comp_save_entity.get().strip()
+            lines: list[str] = []
+            if self.comp_with_none.get():
+                lines.append("CMSEL, NONE")
+            lines.extend(
+                build_component_select_commands(
+                    names, first_type="S", next_type=next_type
+                ).splitlines()
+            )
+            if post != "無":
+                lines.append(post)
+            append_cm_line(lines, save_name, ENTITY_INFO[save_entity]["cm_item"])
+            self.write_output("\n".join(lines))
+        except Exception as exc:
+            messagebox.showerror("錯誤", str(exc))
+
+    def generate_component_delete(self) -> None:
+        try:
+            names = parse_component_names(self.comp_names.get("1.0", "end"))
+            if not names:
+                raise ValueError("請輸入至少一個元件名稱。")
+            self.write_output("\n".join(f"CMDELE, {n}" for n in names))
+        except Exception as exc:
+            messagebox.showerror("錯誤", str(exc))
+
+
+if __name__ == "__main__":
+    _ensure_configured_python()
+    root = tk.Tk()
+    app = APDLSelectorGUI(root)
+    root.mainloop()
