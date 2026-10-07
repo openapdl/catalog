@@ -1,0 +1,21 @@
+Parameter Definition
+
+Identify key package design parameters affecting PMC warpage
+
+↓
+
+② Variation Range
+
+Define lower and upper limits for each parameter
+
+↓
+
+③ Warpage Simulation
+
+Evaluate PMC warpage response at lower and upper limits
+
+↓
+
+④ Sensitivity & Factor Ranking
+
+Compare ΔWarpage and rank key factors based on warpage sensitivity
