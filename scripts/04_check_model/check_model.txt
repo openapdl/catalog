@@ -22,9 +22,16 @@
 *del,nc          $  *del,cxmin        $  *del,cxmax
 *del,cymin       $  *del,cymax        $  *del,czmin        $  *del,czmax
 *del,ne_chk_     $  *del,ne_full_     $  *del,zmax_full_   $  *del,zmin_full_
-*del,flagged_uneven_ $ *del,flagged_instep_
 *del,vol_pct_tot_ $ *del,z_mid_
 *del,elist_pre_  $  *del,evol_pre_    $  *del,i_pre_
+! ── 以下是「MATERIAL TOTAL VOLUME 之後的逐層表格改依 zmax 全域降冪排序」用到的
+!    暫存變數：nlay_ 存每個 MAT 的 layer 數、gb_* 是蒐集全表所有列後排序輸出用的
+!    全域陣列，一律以底線結尾，同一組名稱在 5 個表格間重複使用、各自開頭明確刪除 ──
+*del,nlay_       $  *del,gb_total_    $  *del,gb_idx_
+*del,gb_m_       $  *del,gb_k_
+*del,gb_xmin_    $  *del,gb_xmax_     $  *del,gb_ymin_    $  *del,gb_ymax_
+*del,gb_zmin_    $  *del,gb_zmax_     $  *del,gb_vol_     $  *del,gb_pct_    $  *del,gb_area_
+*del,gb_negzmax_ $  *del,gb_perm_
 ! ── 以下是「逐材料分層 bbox」演算法（PER-MATERIAL BOUNDING BOX / BELOW-ABOVE z=0 /
 !    ABOVE MAT n 共用同一套邏輯）用到的暫存變數，一律以底線結尾。
 !    明確逐一列出刪除，不用 *DEL,,PRM_ 這種寫法，比較保險 ──
@@ -241,6 +248,63 @@ vol_total = 0
 *VWRITE
 ('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
 
+! ── 先算這個表格全部 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+!    （用精確總數而非估計上限，避免陣列尾端殘留 0 值混進 zmax 排序）──
+*del,nlay_  $  *del,gb_total_
+*dim,nlay_,array,mmax
+gb_total_ = 0
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,-1e9,0
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        nlay_(m) = 0
+        *CYCLE
+    *ENDIF
+    *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+    *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+    nlay_(m) = nband_m_
+    gb_total_ = gb_total_ + nband_m_
+*ENDDO
+
+*del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+*del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+*IF,gb_total_,GT,0,THEN
+    *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+    *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+    *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+    *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+    *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+*ENDIF
+gb_idx_ = 0
+
 *DO,m,1,mmax
     ALLSEL,ALL
     ESEL,S,MAT,,m
@@ -357,11 +421,33 @@ vol_total = 0
         *ELSE
             area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
         *ENDIF
-        *VLEN,1
-        *VWRITE,m,k_,lay_xmin_(orig_i_),lay_ymin_(orig_i_),lay_zmin_(k_),lay_xmax_(orig_i_),lay_ymax_(orig_i_),lay_zmax_(orig_i_),lay_xmax_(orig_i_)-lay_xmin_(orig_i_),lay_ymax_(orig_i_)-lay_ymin_(orig_i_),lay_zmax_(orig_i_)-lay_zmin_(k_),lay_vol_(orig_i_),vol_pct_k_,area_k_
-(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+        gb_idx_ = gb_idx_ + 1
+        gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+        gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+        gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+        gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+        gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+        gb_area_(gb_idx_) = area_k_
     *enddo
 *ENDDO
+
+! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+*IF,gb_total_,GT,0,THEN
+    *del,gb_negzmax_ $ *del,gb_perm_
+    *dim,gb_negzmax_,array,gb_total_
+    *do,k_,1,gb_total_
+        gb_negzmax_(k_) = -gb_zmax_(k_)
+    *enddo
+    *dim,gb_perm_,array,gb_total_
+    *moper,gb_perm_,gb_negzmax_,sort,,1
+
+    *do,k_,1,gb_total_
+        orig_i_ = gb_perm_(k_)
+        *VLEN,1
+        *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+    *enddo
+*ENDIF
 
 ALLSEL,ALL
 ESEL,S,CENT,Z,-1e9,0
@@ -390,6 +476,63 @@ ESEL,S,CENT,Z,-1e9,0
 ('=== ABOVE z=0 ===')
 *VWRITE
 ('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+
+! ── 先算這個表格全部 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+!    （用精確總數而非估計上限，避免陣列尾端殘留 0 值混進 zmax 排序）──
+*del,nlay_  $  *del,gb_total_
+*dim,nlay_,array,mmax
+gb_total_ = 0
+*DO,m,1,mmax
+    ALLSEL,ALL
+    ESEL,S,MAT,,m
+    ESEL,R,CENT,Z,0,1e9
+    *GET,ne,ELEM,0,COUNT
+    *IF,ne,EQ,0,THEN
+        nlay_(m) = 0
+        *CYCLE
+    *ENDIF
+    *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+    *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+    CM,cm_remain,ELEM
+    nband_m_ = 0
+    *DO,safety_,1,ne
+        CMSEL,S,cm_remain
+        *GET,ne_remain_,ELEM,0,COUNT
+        *IF,ne_remain_,EQ,0,THEN
+            *EXIT
+        *ENDIF
+        *GET,seed_elem_,ELEM,0,NUM,MIN
+        ESEL,S,ELEM,,seed_elem_
+        *DO,igrow_,1,ne
+            *GET,ne_before_,ELEM,0,COUNT
+            NSLE,S,ALL
+            ESLN,S,0
+            CMSEL,R,cm_remain
+            *GET,ne_after_,ELEM,0,COUNT
+            *IF,ne_after_,EQ,ne_before_,THEN
+                *EXIT
+            *ENDIF
+        *ENDDO
+        nband_m_ = nband_m_ + 1
+        CM,cm_layer,ELEM
+        CMSEL,S,cm_remain
+        CMSEL,U,cm_layer
+        CM,cm_remain,ELEM
+    *ENDDO
+    nlay_(m) = nband_m_
+    gb_total_ = gb_total_ + nband_m_
+*ENDDO
+
+*del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+*del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+*IF,gb_total_,GT,0,THEN
+    *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+    *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+    *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+    *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+    *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+*ENDIF
+gb_idx_ = 0
 
 *DO,m,1,mmax
     ALLSEL,ALL
@@ -502,11 +645,33 @@ ESEL,S,CENT,Z,-1e9,0
         *ELSE
             area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
         *ENDIF
-        *VLEN,1
-        *VWRITE,m,k_,lay_xmin_(orig_i_),lay_ymin_(orig_i_),lay_zmin_(k_),lay_xmax_(orig_i_),lay_ymax_(orig_i_),lay_zmax_(orig_i_),lay_xmax_(orig_i_)-lay_xmin_(orig_i_),lay_ymax_(orig_i_)-lay_ymin_(orig_i_),lay_zmax_(orig_i_)-lay_zmin_(k_),lay_vol_(orig_i_),vol_pct_k_,area_k_
-(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+        gb_idx_ = gb_idx_ + 1
+        gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+        gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+        gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+        gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+        gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+        gb_area_(gb_idx_) = area_k_
     *enddo
 *ENDDO
+
+! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+*IF,gb_total_,GT,0,THEN
+    *del,gb_negzmax_ $ *del,gb_perm_
+    *dim,gb_negzmax_,array,gb_total_
+    *do,k_,1,gb_total_
+        gb_negzmax_(k_) = -gb_zmax_(k_)
+    *enddo
+    *dim,gb_perm_,array,gb_total_
+    *moper,gb_perm_,gb_negzmax_,sort,,1
+
+    *do,k_,1,gb_total_
+        orig_i_ = gb_perm_(k_)
+        *VLEN,1
+        *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+    *enddo
+*ENDIF
 
 ALLSEL,ALL
 ESEL,S,CENT,Z,0,1e9
@@ -572,6 +737,63 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
 ('=== ABOVE MAT ',F5.0,' ===')
         *VWRITE
 ('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+
+        ! ── 先算這個表格全部 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+        !    （用精確總數而非估計上限，避免陣列尾端殘留 0 值混進 zmax 排序）──
+        *del,nlay_  $  *del,gb_total_
+        *dim,nlay_,array,mmax
+        gb_total_ = 0
+        *DO,m,1,mmax
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne,ELEM,0,COUNT
+            *IF,ne,EQ,0,THEN
+                nlay_(m) = 0
+                *CYCLE
+            *ENDIF
+            *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+            *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+            nlay_(m) = nband_m_
+            gb_total_ = gb_total_ + nband_m_
+        *ENDDO
+
+        *del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+        *del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+        *IF,gb_total_,GT,0,THEN
+            *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+            *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+            *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+            *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+            *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+        *ENDIF
+        gb_idx_ = 0
 
         *DO,m,1,mmax
             ALLSEL,ALL
@@ -684,11 +906,33 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
                 *ELSE
                     area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
                 *ENDIF
-                *VLEN,1
-                *VWRITE,m,k_,lay_xmin_(orig_i_),lay_ymin_(orig_i_),lay_zmin_(k_),lay_xmax_(orig_i_),lay_ymax_(orig_i_),lay_zmax_(orig_i_),lay_xmax_(orig_i_)-lay_xmin_(orig_i_),lay_ymax_(orig_i_)-lay_ymin_(orig_i_),lay_zmax_(orig_i_)-lay_zmin_(k_),lay_vol_(orig_i_),vol_pct_k_,area_k_
-(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+                gb_idx_ = gb_idx_ + 1
+                gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+                gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+                gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+                gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+                gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+                gb_area_(gb_idx_) = area_k_
             *enddo
         *ENDDO
+
+        ! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+        *IF,gb_total_,GT,0,THEN
+            *del,gb_negzmax_ $ *del,gb_perm_
+            *dim,gb_negzmax_,array,gb_total_
+            *do,k_,1,gb_total_
+                gb_negzmax_(k_) = -gb_zmax_(k_)
+            *enddo
+            *dim,gb_perm_,array,gb_total_
+            *moper,gb_perm_,gb_negzmax_,sort,,1
+
+            *do,k_,1,gb_total_
+                orig_i_ = gb_perm_(k_)
+                *VLEN,1
+                *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+            *enddo
+        *ENDIF
 
         ALLSEL,ALL
         ESEL,S,CENT,Z,z_above_top,1e9
@@ -719,7 +963,90 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
         ! z_above_top」的材料，代表 m_above 頂面在這些材料所在的 X-Y 範圍其實沒有
         ! z_above_top 那麼高（頂面不等高），特別列出來提醒使用者。
         ! ──────────────────────────────────────────────────────────
-        flagged_uneven_ = 0
+
+        ! ── 先算這個表格全部符合條件的 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+        !    （篩選條件需與下面偵測邏輯一致：排除 m_above 本身、已出現在 ABOVE 表格、
+        !    以及頂面本來就沒有搆到/超過 z_above_top 的材料）──
+        *del,nlay_  $  *del,gb_total_
+        *dim,nlay_,array,mmax
+        gb_total_ = 0
+        *DO,m,1,mmax
+            nlay_(m) = 0
+            *IF,m,EQ,m_above,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne_chk_,ELEM,0,COUNT
+            *IF,ne_chk_,GT,0,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne_full_,ELEM,0,COUNT
+            *IF,ne_full_,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+            NSLE,S
+            *GET,zmax_full_,NODE,0,MXLOC,Z
+            *IF,zmax_full_,LT,z_above_top,THEN
+                *CYCLE
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne,ELEM,0,COUNT
+            *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+            *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+            nlay_(m) = nband_m_
+            gb_total_ = gb_total_ + nband_m_
+        *ENDDO
+
+        *del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+        *del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+        *IF,gb_total_,GT,0,THEN
+            *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+            *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+            *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+            *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+            *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+
+            *VWRITE
+(' ')
+            *VWRITE,m_above
+('=== HEIGHT NOT UNIFORM ON MAT ',F5.0,' TOP ===')
+            *VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+        *ENDIF
+        gb_idx_ = 0
+
         *DO,m,1,mmax
             *IF,m,EQ,m_above,THEN
                 *CYCLE
@@ -745,17 +1072,6 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
             *GET,zmax_full_,NODE,0,MXLOC,Z
             *IF,zmax_full_,LT,z_above_top,THEN
                 *CYCLE   ! 這個材料真的比較矮，跟 m_above 沒有齊平，正常排除
-            *ENDIF
-
-            ! 到這裡代表：MAT m 中心點沒有超過 z_above_top，但頂面卻搆得到/超過 → 齊平材料
-            *IF,flagged_uneven_,EQ,0,THEN
-                *VWRITE
-(' ')
-                *VWRITE,m_above
-('=== HEIGHT NOT UNIFORM ON MAT ',F5.0,' TOP ===')
-                *VWRITE
-('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
-                flagged_uneven_ = 1
             *ENDIF
 
             ALLSEL,ALL
@@ -862,11 +1178,33 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
                 *ELSE
                     area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
                 *ENDIF
-                *VLEN,1
-                *VWRITE,m,k_,lay_xmin_(orig_i_),lay_ymin_(orig_i_),lay_zmin_(k_),lay_xmax_(orig_i_),lay_ymax_(orig_i_),lay_zmax_(orig_i_),lay_xmax_(orig_i_)-lay_xmin_(orig_i_),lay_ymax_(orig_i_)-lay_ymin_(orig_i_),lay_zmax_(orig_i_)-lay_zmin_(k_),lay_vol_(orig_i_),vol_pct_k_,area_k_
-(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+                gb_idx_ = gb_idx_ + 1
+                gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+                gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+                gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+                gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+                gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+                gb_area_(gb_idx_) = area_k_
             *enddo
         *ENDDO
+
+        ! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+        *IF,gb_total_,GT,0,THEN
+            *del,gb_negzmax_ $ *del,gb_perm_
+            *dim,gb_negzmax_,array,gb_total_
+            *do,k_,1,gb_total_
+                gb_negzmax_(k_) = -gb_zmax_(k_)
+            *enddo
+            *dim,gb_perm_,array,gb_total_
+            *moper,gb_perm_,gb_negzmax_,sort,,1
+
+            *do,k_,1,gb_total_
+                orig_i_ = gb_perm_(k_)
+                *VLEN,1
+                *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+            *enddo
+        *ENDIF
 
         ! ──────────────────────────────────────────────────────────
         ! 除了「頂面齊平」的情況，某些材料可能整個夾在 m_above 的 Z 範圍
@@ -878,7 +1216,93 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
         ! 範圍內——如果封裝裡剛好有其他跟 m_above 無關、Z 範圍卻重疊的材料，
         ! 也會被列在這裡，使用者需自行判斷是否為真的台階結構。
         ! ──────────────────────────────────────────────────────────
-        flagged_instep_ = 0
+
+        ! ── 先算這個表格全部符合條件的 MAT 合計有幾個 layer，才能精確 *dim 全域陣列
+        !    （篩選條件需與下面偵測邏輯一致）──
+        *del,nlay_  $  *del,gb_total_
+        *dim,nlay_,array,mmax
+        gb_total_ = 0
+        *DO,m,1,mmax
+            nlay_(m) = 0
+            *IF,m,EQ,m_above,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            ESEL,R,CENT,Z,z_above_top,1e9
+            *GET,ne_chk_,ELEM,0,COUNT
+            *IF,ne_chk_,GT,0,THEN
+                *CYCLE
+            *ENDIF
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne_full_,ELEM,0,COUNT
+            *IF,ne_full_,EQ,0,THEN
+                *CYCLE
+            *ENDIF
+            NSLE,S
+            *GET,zmax_full_,NODE,0,MXLOC,Z
+            *GET,zmin_full_,NODE,0,MNLOC,Z
+            *IF,zmax_full_,GE,z_above_top,THEN
+                *CYCLE
+            *ENDIF
+            *IF,zmin_full_,LE,z_above_bottom,THEN
+                *CYCLE
+            *ENDIF
+
+            ALLSEL,ALL
+            ESEL,S,MAT,,m
+            *GET,ne,ELEM,0,COUNT
+            *del,nband_m_ $ *del,safety_ $ *del,ne_remain_ $ *del,seed_elem_
+            *del,igrow_   $ *del,ne_before_ $ *del,ne_after_
+            CM,cm_remain,ELEM
+            nband_m_ = 0
+            *DO,safety_,1,ne
+                CMSEL,S,cm_remain
+                *GET,ne_remain_,ELEM,0,COUNT
+                *IF,ne_remain_,EQ,0,THEN
+                    *EXIT
+                *ENDIF
+                *GET,seed_elem_,ELEM,0,NUM,MIN
+                ESEL,S,ELEM,,seed_elem_
+                *DO,igrow_,1,ne
+                    *GET,ne_before_,ELEM,0,COUNT
+                    NSLE,S,ALL
+                    ESLN,S,0
+                    CMSEL,R,cm_remain
+                    *GET,ne_after_,ELEM,0,COUNT
+                    *IF,ne_after_,EQ,ne_before_,THEN
+                        *EXIT
+                    *ENDIF
+                *ENDDO
+                nband_m_ = nband_m_ + 1
+                CM,cm_layer,ELEM
+                CMSEL,S,cm_remain
+                CMSEL,U,cm_layer
+                CM,cm_remain,ELEM
+            *ENDDO
+            nlay_(m) = nband_m_
+            gb_total_ = gb_total_ + nband_m_
+        *ENDDO
+
+        *del,gb_m_ $ *del,gb_k_ $ *del,gb_xmin_ $ *del,gb_xmax_ $ *del,gb_ymin_ $ *del,gb_ymax_
+        *del,gb_zmin_ $ *del,gb_zmax_ $ *del,gb_vol_ $ *del,gb_pct_ $ *del,gb_area_
+        *IF,gb_total_,GT,0,THEN
+            *dim,gb_m_,array,gb_total_     $  *dim,gb_k_,array,gb_total_
+            *dim,gb_xmin_,array,gb_total_  $  *dim,gb_xmax_,array,gb_total_
+            *dim,gb_ymin_,array,gb_total_  $  *dim,gb_ymax_,array,gb_total_
+            *dim,gb_zmin_,array,gb_total_  $  *dim,gb_zmax_,array,gb_total_
+            *dim,gb_vol_,array,gb_total_   $  *dim,gb_pct_,array,gb_total_  $  *dim,gb_area_,array,gb_total_
+
+            *VWRITE
+(' ')
+            *VWRITE,m_above
+('=== WITHIN MAT ',F5.0,' Z-RANGE (POSSIBLE STEP) ===')
+            *VWRITE
+('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
+        *ENDIF
+        gb_idx_ = 0
+
         *DO,m,1,mmax
             *IF,m,EQ,m_above,THEN
                 *CYCLE
@@ -913,18 +1337,6 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
                 *CYCLE
             *ENDIF
 
-            ! 到這裡代表：材料整個都比 m_above 最低點高，但頂面又搆不到 z_above_top
-            ! → 判定為「夾在 m_above 的 Z 範圍內（可能是台階中間某一層）」
-            *IF,flagged_instep_,EQ,0,THEN
-                *VWRITE
-(' ')
-                *VWRITE,m_above
-('=== WITHIN MAT ',F5.0,' Z-RANGE (POSSIBLE STEP) ===')
-                *VWRITE
-('  MATLAYER      xmin      ymin      zmin      xmax      ymax      zmax         L         W         T              VOLUME   PERCENT                AREA')
-                flagged_instep_ = 1
-            *ENDIF
-
             ALLSEL,ALL
             ESEL,S,MAT,,m
             *GET,ne,ELEM,0,COUNT
@@ -1029,11 +1441,33 @@ z_mid_ = (gzmin+gzmax)/2   ! 整體厚度中間線的 Z 座標
                 *ELSE
                     area_k_ = lay_vol_(orig_i_)/(lay_zmax_(orig_i_)-lay_zmin_(k_))
                 *ENDIF
-                *VLEN,1
-                *VWRITE,m,k_,lay_xmin_(orig_i_),lay_ymin_(orig_i_),lay_zmin_(k_),lay_xmax_(orig_i_),lay_ymax_(orig_i_),lay_zmax_(orig_i_),lay_xmax_(orig_i_)-lay_xmin_(orig_i_),lay_ymax_(orig_i_)-lay_ymin_(orig_i_),lay_zmax_(orig_i_)-lay_zmin_(k_),lay_vol_(orig_i_),vol_pct_k_,area_k_
-(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+                gb_idx_ = gb_idx_ + 1
+                gb_m_(gb_idx_)    = m                   $  gb_k_(gb_idx_)    = k_
+                gb_xmin_(gb_idx_) = lay_xmin_(orig_i_)  $  gb_xmax_(gb_idx_) = lay_xmax_(orig_i_)
+                gb_ymin_(gb_idx_) = lay_ymin_(orig_i_)  $  gb_ymax_(gb_idx_) = lay_ymax_(orig_i_)
+                gb_zmin_(gb_idx_) = lay_zmin_(k_)       $  gb_zmax_(gb_idx_) = lay_zmax_(orig_i_)
+                gb_vol_(gb_idx_)  = lay_vol_(orig_i_)   $  gb_pct_(gb_idx_)  = vol_pct_k_
+                gb_area_(gb_idx_) = area_k_
             *enddo
         *ENDDO
+
+        ! ── 全表依 zmax 由大到小排序後才印出（*MOPER,,,SORT 只能升冪，取負再排序達成降冪）──
+        *IF,gb_total_,GT,0,THEN
+            *del,gb_negzmax_ $ *del,gb_perm_
+            *dim,gb_negzmax_,array,gb_total_
+            *do,k_,1,gb_total_
+                gb_negzmax_(k_) = -gb_zmax_(k_)
+            *enddo
+            *dim,gb_perm_,array,gb_total_
+            *moper,gb_perm_,gb_negzmax_,sort,,1
+
+            *do,k_,1,gb_total_
+                orig_i_ = gb_perm_(k_)
+                *VLEN,1
+                *VWRITE,gb_m_(orig_i_),gb_k_(orig_i_),gb_xmin_(orig_i_),gb_ymin_(orig_i_),gb_zmin_(orig_i_),gb_xmax_(orig_i_),gb_ymax_(orig_i_),gb_zmax_(orig_i_),gb_xmax_(orig_i_)-gb_xmin_(orig_i_),gb_ymax_(orig_i_)-gb_ymin_(orig_i_),gb_zmax_(orig_i_)-gb_zmin_(orig_i_),gb_vol_(orig_i_),gb_pct_(orig_i_),gb_area_(orig_i_)
+(F5.0,F5.0,9F10.4,F20.2,F10.4,F20.4)
+            *enddo
+        *ENDIF
     *ELSE
         *VWRITE
 (' ')
