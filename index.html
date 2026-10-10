@@ -123,16 +123,14 @@ title: APDL 腳本目錄
   {% assign parts = file.path | split: "/" %}
   {% assign extension = file.extname | downcase %}
   {% if parts[1] == "scripts" and parts.size >= 3 %}
-    {% if extension == ".mac" or extension == ".inp" or extension == ".txt" %}
-      {% unless first_script %},{% endunless %}
-      {
-        "path": {{ file.path | remove_first: "/scripts/" | jsonify }},
-        "url": {{ file.path | remove_first: "/" | jsonify }},
-        "name": {{ file.name | jsonify }},
-        "extension": {{ extension | jsonify }}
-      }
-      {% assign first_script = false %}
-    {% endif %}
+    {% unless first_script %},{% endunless %}
+    {
+      "path": {{ file.path | remove_first: "/scripts/" | jsonify }},
+      "url": {{ file.path | remove_first: "/" | jsonify }},
+      "name": {{ file.name | jsonify }},
+      "extension": {{ extension | jsonify }}
+    }
+    {% assign first_script = false %}
   {% endif %}
 {% endfor %}
 ]
