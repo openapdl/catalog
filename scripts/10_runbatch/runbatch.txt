@@ -1,0 +1,37 @@
+! 方法1
+
+*CREATE,runsub,mac
+/CWD,ARG1
+/CWD,ARG2
+/COPY,%ARG3%,txt,,..\%ARG3%,txt
+*IF,ARG4,NE,'NONE',THEN           !要增加複製的話，
+/COPY,%ARG4%,txt,,..\%ARG4%,txt   !靠這三行
+*ENDIF                            ! 
+/CWD,'..'
+/INPUT,%ARG3%,txt
+/COPY,%ARG3%,7z,,%ARG2%\%ARG3%,7z
+/CWD,'..'
+*END
+
+還是以這個版本為主，如果還有第三個檔案要複製出來，怎麼加
+
+runsub,'leg1','nt','package','NONE'
+runsub,'leg1','t','package','NONE'
+
+*CREATE,runsub,mac
+/CWD,ARG1
+/CWD,ARG2
+/COPY,%ARG3%,txt,,..\%ARG3%,txt
+*IF,ARG4,NE,'NONE',THEN
+/COPY,%ARG4%,txt,,..\%ARG4%,txt
+*ENDIF
+*IF,ARG5,NE,'NONE',THEN
+/COPY,%ARG5%,txt,,..\%ARG5%,txt
+*ENDIF
+/CWD,'..'
+/INPUT,%ARG3%,txt
+/COPY,%ARG3%,7z,,%ARG2%\%ARG3%,7z
+/CWD,'..'
+*END
+
+runsub,'leg1','nt','1_unit_warage','mat_total_unit_src','第三個檔案'
