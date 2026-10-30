@@ -6,9 +6,11 @@
 /COPY,%ARG3%,txt,,..\%ARG3%,txt
 *IF,ARG4,NE,'NONE',THEN           !要增加複製的話，
 /COPY,%ARG4%,txt,,..\%ARG4%,txt   !靠這三行
-*ENDIF                            ! 
+*ENDIF                            !
 /CWD,'..'
 /INPUT,%ARG3%,txt
+/COPY,4_Warpage_data,txt,,%ARG2%\4_Warpage_data,txt
+/SYS,copy *.jpg %ARG2%\
 /COPY,%ARG3%,7z,,%ARG2%\%ARG3%,7z
 /CWD,'..'
 *END
