@@ -1,0 +1,4205 @@
+"""
+doe_gui.pyw -- APDL input file 變數標記與 DOE 撒點工具
+讀取 APDL input file -> 手動輸入變數名稱 / 直接點擊範本文字裡的任意數字標記 ->
+設定上下限+間距或手動數值 -> 全因子組合（pyDOE2.fullfact）->
+每組輸出到獨立資料夾的替換好數值 input file。
+執行: pythonw doe_gui.pyw
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import tkinter as tk
+import tkinter.font as tkfont
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Callable
+
+# 注意：pyDOE2 是 010_vendor_refs/015_python 可攜式環境專屬套件，系統預設 Python
+# 不一定裝得到。刻意不在檔案頂層 import，改在 build_full_factorial_combinations()
+# 內部才 import -- 確保雙擊 .pyw 時，就算一開始被系統預設 Python 執行，也能先讓
+# _ensure_configured_python() 轉呼叫到正確的可攜式直譯器，而不是在轉呼叫之前就
+# 因為系統 Python 沒有 pyDOE2 而當掉（pythonw 沒有主控台，當掉時不會顯示任何錯誤）。
+
+# 換到其他電腦時，只需修改下一行的 pythonw.exe 絕對路徑。
+PYTHONW_EXE = Path(
+    r"C:\Users\python3.8\win64\pythonw.exe"
+)
+
+# 換到其他電腦時，只需修改下一行的 ANSYS 安裝路徑。
+ANSYS_BIN = Path(r"C:\Program Files\ANSYS Inc\v252\ansys\bin\winx64")
+MAPDL_EXE = ANSYS_BIN / "ANSYS252.exe"
+
+TOOL_DIR = Path(__file__).resolve().parent
+
+# ── 設定常數 ──────────────────────────────────────────────────────────────
+DEFAULT_OUTPUT_DIR = TOOL_DIR / "runs"
+RUN_FOLDER_PREFIX = "run_"
+
+# 資料夾名稱前綴下拉選單：「run_N」是代表「用預設 run_ 編號規則」的選項文字
+# （不是字面上要寫進資料夾名稱的前綴本身），resolve_run_folder_prefix() 看到
+# 這個字串或留白時都會換成 RUN_FOLDER_PREFIX。"Leg_" 排第一個，是優先預設值；
+# 使用者自己打過的自訂前綴會記錄在 RUN_PREFIX_HISTORY_PATH，之後也會出現在
+# 這份下拉選單裡（見 load_run_prefix_history／save_run_prefix_history）。
+RUN_FOLDER_PREFIX_DEFAULT_OPTION = "run_N"
+DEFAULT_RUN_PREFIX_OPTIONS = ("Leg_", RUN_FOLDER_PREFIX_DEFAULT_OPTION)
+RUN_PREFIX_HISTORY_PATH = TOOL_DIR / "run_prefix_history.json"
+MAX_RUN_PREFIX_HISTORY = 20
+
+ASSIGNMENT_PATTERN_TEMPLATE = r"(?im)^([ \t]*)({name})\b([ \t]*=[ \t]*)([^\s!]+)"
+
+NUMBER_LITERAL = r"[+-]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?"
+# 用來在「點擊範本文字」時，從滑鼠點到的欄位往左右展開，抓出完整數字 token
+# （含正負號、含小數點、含科學記號指數部分，不限位數），不管點在 name=value 行、
+# MP 指令欄位，還是運算式裡的某個數字，都能準確抓到完整邊界。APDL 常見的
+# 1E-3、1e+06、.5、5. 等寫法都要整串被抓成一個 token，不能被拆成片段。
+NUMBER_TOKEN_PATTERN = re.compile(NUMBER_LITERAL)
+
+# 點擊到的位置不是數字時，依序退而求其次嘗試：引號裡的文字（只抓引號「裡面」
+# 的內容、不含引號本身，例如 /input,'Mat_Total_Scrip_SRC','txt' 點在引號內
+# 任何位置都會抓到整個 Mat_Total_Scrip_SRC）、再來是沒加引號的裸英數字識別字。
+QUOTED_STRING_INNER_PATTERN = re.compile(r"(?<=')[^']*(?=')|(?<=\")[^\"]*(?=\")")
+WORD_TOKEN_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+VARIABLE_KIND_NAMED = "named"
+VARIABLE_KIND_POSITION = "position"
+
+VALUE_TYPE_NUMERIC = "numeric"
+VALUE_TYPE_STRING = "string"
+
+MODE_RANGE = "Range"
+MODE_MANUAL = "Manual"
+
+RANGE_FLOAT_TOLERANCE = 1e-9
+COMBINATION_COUNT_WARNING_THRESHOLD = 200
+COMBINATION_COUNT_HARD_LIMIT = 20000
+
+EXTRA_FILES_EMPTY_TEXT = "（尚未選擇）"
+
+# 範本內容文字區字體：Ctrl+滾輪縮放時，line_numbers 跟 template_text 共用同一個
+# tkFont.Font 物件，改 size 兩邊會同步跟著變，不用各自重設。
+TEMPLATE_FONT_FAMILY = "Consolas"
+TEMPLATE_FONT_SIZE_DEFAULT = 10
+TEMPLATE_FONT_SIZE_MIN = 6
+TEMPLATE_FONT_SIZE_MAX = 24
+TEMPLATE_FONT_ZOOM_STEP = 1
+
+TEMPLATE_MODIFIED_REFRESH_DELAY_MS = 200
+
+BG = "#f0f2f5"
+BG2 = "#ffffff"
+FG = "#1a1a2e"
+TAG_HIGHLIGHT_BG = "#ffe58a"
+INVALID_MARK_BG = "#fecaca"  # 標記被改壞/刪掉時的警示色，刻意跟正常標記的黃色明顯不同
+INACTIVE_FIELD_BG = "#e5e7eb"
+SEARCH_HIGHLIGHT_BG = "#93c5fd"  # 搜尋反白色，刻意跟 TAG_HIGHLIGHT_BG 明顯不同，避免跟變數標記色混淆
+BLANK_FIELD_BG = "#fed7aa"  # Active 變數目前模式下還沒填值的欄位提醒色，刻意跟上面幾個顏色都不同，避免混淆
+SEARCH_TAG_NAME = "search_highlight"
+
+
+# ── 自我轉呼叫（確保用指定的可攜式 Python 執行）──────────────────────────────
+def _executable_path_key(path: Path) -> str:
+    """Return a case-insensitive absolute identity for a Windows executable."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _show_bootstrap_error(detail: str) -> None:
+    """Show an error even when the current interpreter has no console."""
+    if sys.stderr is not None:
+        sys.stderr.write(detail + "\n")
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, detail, "DOE 變數標記工具", 0x10)
+    except (AttributeError, OSError):
+        pass
+
+
+def _ensure_configured_python() -> None:
+    """Relaunch this file with the configured portable Python when necessary."""
+    configured_pythonw = PYTHONW_EXE.expanduser()
+    configured_python = configured_pythonw.with_name("python.exe")
+    current_key = _executable_path_key(Path(sys.executable))
+    configured_keys = {
+        _executable_path_key(configured_pythonw),
+        _executable_path_key(configured_python),
+    }
+    if current_key in configured_keys:
+        return
+
+    if not configured_pythonw.is_file():
+        _show_bootstrap_error(
+            "找不到指定的 Python 執行檔：\n{}\n\n"
+            "請用文字編輯器開啟 doe_gui.pyw，修改檔案最上方的 PYTHONW_EXE。".format(
+                configured_pythonw
+            )
+        )
+        raise SystemExit(1)
+
+    current_is_console_python = Path(sys.executable).name.lower() == "python.exe"
+    target_executable = (
+        configured_python
+        if current_is_console_python and configured_python.is_file()
+        else configured_pythonw
+    )
+    script_path = Path(__file__).resolve()
+    command = [str(target_executable), str(script_path)] + sys.argv[1:]
+    try:
+        if current_is_console_python:
+            return_code = subprocess.call(command, cwd=str(script_path.parent))
+            raise SystemExit(return_code)
+        subprocess.Popen(command, cwd=str(script_path.parent))
+    except OSError as exc:
+        _show_bootstrap_error(
+            "無法使用指定的 Python 啟動程式：\n{}\n\n{}".format(target_executable, exc)
+        )
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+
+def _is_identifier_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def find_token_at_position(line_text: str, col: int) -> tuple[re.Match, str] | None:
+    """找出 line_text 裡「包含欄位 col」的可標記 token，依序嘗試：
+
+    1. 數字（NUMBER_TOKEN_PATTERN），但數字緊貼著識別字字元（字母/數字/底線，
+       例如 abc_2 的 2、E7 的 7）時視為變數名稱的一部分、不當成獨立數字，
+       改交給下面的規則 3 抓出完整識別字——不然 Ctrl+單擊這類變數名稱裡的數字
+       尾碼，會把它誤標成可以撒 DOE 的數值，實際上那根本不是一個獨立的數字。
+    2. 引號裡的文字（QUOTED_STRING_INNER_PATTERN，不含引號本身）
+    3. 沒加引號的裸英數字識別字（WORD_TOKEN_PATTERN）
+
+    回傳 (match, value_type)；三種都沒中回傳 None。
+    """
+    for candidate in NUMBER_TOKEN_PATTERN.finditer(line_text):
+        if candidate.start() <= col < candidate.end():
+            before = line_text[candidate.start() - 1] if candidate.start() > 0 else ""
+            after = line_text[candidate.end()] if candidate.end() < len(line_text) else ""
+            if not (_is_identifier_char(before) or _is_identifier_char(after)):
+                return candidate, VALUE_TYPE_NUMERIC
+            break
+    for candidate in QUOTED_STRING_INNER_PATTERN.finditer(line_text):
+        if candidate.start() <= col < candidate.end():
+            return candidate, VALUE_TYPE_STRING
+    for candidate in WORD_TOKEN_PATTERN.finditer(line_text):
+        if candidate.start() <= col < candidate.end():
+            return candidate, VALUE_TYPE_STRING
+    return None
+
+
+# ── 水準清單計算 ──────────────────────────────────────────────────────────
+def compute_range_levels(
+    lower_bound: float, upper_bound: float, spacing: float, varname: str
+) -> list[float]:
+    """由下限、上限、間距展開成水準數值清單（含上限，含浮點誤差容忍）。
+
+    回傳 lower_bound, lower_bound+spacing, ... 中所有 <= upper_bound 的值。
+    spacing<=0、upper_bound<lower_bound，或估計水準數超過安全上限時丟出 ValueError。
+    """
+    if spacing <= 0:
+        raise ValueError(f"變數「{varname}」的間距必須大於 0（目前是 {spacing}）")
+    if upper_bound < lower_bound:
+        raise ValueError(
+            f"變數「{varname}」的上限（{upper_bound}）不可小於下限（{lower_bound}）"
+        )
+
+    estimated_count = int((upper_bound - lower_bound) / spacing) + 2
+    if estimated_count > COMBINATION_COUNT_HARD_LIMIT:
+        raise ValueError(
+            f"變數「{varname}」依目前上下限與間距估計會產生 {estimated_count} 個水準，"
+            f"超過單一變數的安全上限 {COMBINATION_COUNT_HARD_LIMIT}，請加大間距或縮小範圍"
+        )
+
+    levels: list[float] = []
+    index = 0
+    while True:
+        value = lower_bound + index * spacing
+        if value > upper_bound + RANGE_FLOAT_TOLERANCE:
+            break
+        levels.append(value)
+        index += 1
+    return levels
+
+
+def compute_tolerance_bounds(nominal: float, tolerance_text: str) -> tuple[float, float]:
+    """把「變數設定表」容差欄位輸入的一個數字，換算成以 nominal 為中心的 (low, upper)。
+
+    結尾是 % 視為百分比容差（例如 10% -> nominal*(1-0.1) ~ nominal*(1+0.1)）；
+    否則視為絕對數值容差（例如 10 -> nominal-10 ~ nominal+10）。容差為負數時
+    low/upper 會對調，確保回傳的 low 一定 <= upper。
+
+    內部改用 Decimal 做十進位運算，不是直接用 float：nominal*(1±fraction) 這類
+    二進位浮點乘法對「乾淨」的十進位輸入（如 25000、0.1）常常算不出乾淨結果
+    （例如 25000*1.1 = 27500.000000000004），而 Decimal 對加減乘除以 10 的冪次
+    是精確的十進位運算，算出來的 low/upper 本身就不帶誤差尾數。nominal 先用
+    repr() 轉回它原本的十進位字面文字再交給 Decimal，而不是直接對浮點數做
+    二進位精確轉換（那樣會展開成一長串逼近值，而不是使用者原本打的那個數字）。
+    """
+    text = tolerance_text.strip()
+    if not text:
+        raise ValueError("容差欄位是空的，請輸入數值或百分比（例如 10 或 10%）")
+
+    is_percent = text.endswith("%")
+    number_text = text[:-1].strip() if is_percent else text
+    try:
+        tolerance_decimal = Decimal(number_text)
+    except InvalidOperation:
+        raise ValueError(
+            f"容差「{tolerance_text}」不是合法數字，請輸入數值或百分比（例如 10 或 10%）"
+        )
+    if not tolerance_decimal.is_finite():
+        raise ValueError(f"容差「{tolerance_text}」不是合法的 DOE 數值（nan/inf 無法使用）")
+
+    nominal_decimal = Decimal(repr(nominal))
+    if is_percent:
+        fraction = tolerance_decimal / Decimal(100)
+        low_decimal = nominal_decimal * (Decimal(1) - fraction)
+        upper_decimal = nominal_decimal * (Decimal(1) + fraction)
+    else:
+        low_decimal = nominal_decimal - tolerance_decimal
+        upper_decimal = nominal_decimal + tolerance_decimal
+
+    low, upper = float(low_decimal), float(upper_decimal)
+    return (low, upper) if low <= upper else (upper, low)
+
+
+def parse_manual_values(raw_text: str, varname: str) -> list[float]:
+    """解析手動輸入的數值清單（逗號或空白分隔）。
+
+    任何 token 無法轉成 float，或整個清單為空，都丟出 ValueError。
+    """
+    tokens = [token for token in re.split(r"[,\s]+", raw_text.strip()) if token]
+    if not tokens:
+        raise ValueError(f"變數「{varname}」的手動數值清單是空的，請至少輸入一個數值")
+
+    values: list[float] = []
+    for token in tokens:
+        try:
+            value = float(token)
+        except ValueError:
+            raise ValueError(
+                f"變數「{varname}」的手動數值清單裡「{token}」不是合法數字"
+                f"（原始輸入：{raw_text}）"
+            )
+        if not math.isfinite(value):
+            raise ValueError(
+                f"變數「{varname}」的手動數值清單裡「{token}」不是合法的 DOE 數值"
+                f"（nan/inf 無法寫入 APDL input file，原始輸入：{raw_text}）"
+            )
+        values.append(value)
+    return values
+
+
+def parse_manual_string_values(raw_text: str, varname: str) -> list[str]:
+    """解析手動輸入的字串候選清單。
+
+    只用逗號分隔、不連空白一起拆（跟 parse_manual_values 不同），因為材料
+    名稱、檔名這類字串候選值本身可能含空白（例如 "Material Set A"）。
+    """
+    tokens = [token.strip() for token in raw_text.split(",")]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        raise ValueError(f"變數「{varname}」的手動數值清單是空的，請至少輸入一個候選字串")
+    return tokens
+
+
+def parse_bound_text(text: str, field_label: str, varname: str) -> float:
+    """解析單一數值欄位，失敗時丟出帶欄位名稱與變數名稱的錯誤。"""
+    try:
+        value = float(text.strip())
+    except ValueError:
+        raise ValueError(f"變數「{varname}」的「{field_label}」欄位不是合法數字：「{text}」")
+    if not math.isfinite(value):
+        raise ValueError(
+            f"變數「{varname}」的「{field_label}」欄位不是合法的 DOE 數值：「{text}」"
+            "（nan/inf 無法寫入 APDL input file）"
+        )
+    return value
+
+
+def variable_has_blank_level_input(config: "VariableConfig") -> bool:
+    """判斷這個變數目前是否還沒有填入任何 Range/Manual 的水準輸入。
+
+    字串類型與 Manual 模式只看 Manual Values 是否空白；Range 模式要三個欄位
+    （Lower/Upper/Spacing）都填了才算非空白，缺任何一個都視為「還沒填」。
+    用於「預覽組合數」判斷哪些變數要先用 Nominal 墊檔（見 resolve_variable_
+    levels 的 allow_blank），以及預覽後提醒使用者哪些變數還沒真正填值。
+    """
+    if config.value_type == VALUE_TYPE_STRING or config.mode == MODE_MANUAL:
+        return not config.manual_values_text.strip()
+    return not (
+        config.lower_text.strip() and config.upper_text.strip() and config.spacing_text.strip()
+    )
+
+
+def _blank_input_fallback_levels(
+    varname: str, nominal_text: str, value_type: str
+) -> list[float] | list[str]:
+    """allow_blank=True 時，還沒填 Range/Manual 的變數先用 Nominal 當成唯一
+    水準，讓「預覽組合數」能算出筆數、把其他已填變數的交叉結果先攤給使用者看，
+    不必所有變數都填完才看得到表格。Nominal 本身不合法（空白或非數字）時仍然
+    fail loud，不要悄悄當成 0。
+    """
+    if value_type == VALUE_TYPE_STRING:
+        if not nominal_text.strip():
+            raise ValueError(f"變數「{varname}」沒有 Nominal 可用於預覽，請至少填入 Manual Values")
+        return [nominal_text]
+    try:
+        value = float(nominal_text)
+    except ValueError:
+        raise ValueError(
+            f"變數「{varname}」沒有合法的 Nominal 數值可用於預覽，"
+            "請填入 Lower/Upper/Spacing 或 Manual Values"
+        )
+    return [value]
+
+
+def collect_distinct_column_values(value_texts: list[str]) -> list[str]:
+    """保留原本出現順序、去除重複與空白字串的欄位文字清單。
+
+    供「產生所有資料夾與 input file」時，把組合對照表裡某個還沒在變數設定表
+    填 Range/Manual 的變數欄（使用者可能已經直接在那邊編輯好了）填回 Manual
+    Values 欄位使用：如果使用者在每一列都填了同一個值（例如只是想把 Nominal
+    墊檔換成自己想要的值），去重後剛好只剩一個水準，不會意外炸出額外的交叉
+    組合；如果每一列的值本來就不同，去重後會變成真的多水準 Manual 清單。
+    """
+    seen: set[str] = set()
+    distinct: list[str] = []
+    for text in value_texts:
+        text = text.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        distinct.append(text)
+    return distinct
+
+
+def resolve_variable_levels(
+    varname: str,
+    mode: str,
+    lower_text: str,
+    upper_text: str,
+    spacing_text: str,
+    manual_values_text: str,
+    value_type: str = VALUE_TYPE_NUMERIC,
+    nominal_text: str = "",
+    allow_blank: bool = False,
+) -> list[float] | list[str]:
+    """依模式（Range / Manual）解析出該變數的水準清單。
+
+    value_type == "string" 時只能用 Manual 模式（字串沒有「上下限+間距」這種
+    數值概念），用 Range 會 fail loud 並提示改用 Manual Values。
+
+    allow_blank=True（供「預覽組合數」使用）時，若 Range/Manual 欄位還沒填
+    （見 variable_has_blank_level_input），改用 Nominal 當成唯一水準
+    （_blank_input_fallback_levels），不會 fail loud；allow_blank=False
+    （預設，供「產生所有資料夾與 input file」使用）則維持原本嚴格行為，
+    缺漏一律 fail loud，把「檢查有沒有漏填」留到真正產生的那一刻才做。
+    """
+    if value_type == VALUE_TYPE_STRING:
+        if mode != MODE_MANUAL:
+            raise ValueError(
+                f"變數「{varname}」是文字/字串類型，只能用 Manual 模式"
+                "（請在 Manual Values 填入候選的文字清單，用逗號分隔）"
+            )
+        if allow_blank and not manual_values_text.strip():
+            return _blank_input_fallback_levels(varname, nominal_text, value_type)
+        return parse_manual_string_values(manual_values_text, varname)
+
+    if mode == MODE_RANGE:
+        if allow_blank and not (lower_text.strip() and upper_text.strip() and spacing_text.strip()):
+            return _blank_input_fallback_levels(varname, nominal_text, value_type)
+        lower_bound = parse_bound_text(lower_text, "Lower Bound", varname)
+        upper_bound = parse_bound_text(upper_text, "Upper Bound", varname)
+        spacing = parse_bound_text(spacing_text, "Spacing", varname)
+        return compute_range_levels(lower_bound, upper_bound, spacing, varname)
+    if mode == MODE_MANUAL:
+        if allow_blank and not manual_values_text.strip():
+            return _blank_input_fallback_levels(varname, nominal_text, value_type)
+        return parse_manual_values(manual_values_text, varname)
+    raise ValueError(f"變數「{varname}」的模式「{mode}」不是合法選項")
+
+
+# ── 全因子組合 ────────────────────────────────────────────────────────────
+@dataclass
+class VariableConfig:
+    """一列變數設定的純資料快照（不含 Tk 物件）。
+
+    kind == "named"：用 varname 以 ASSIGNMENT_PATTERN_TEMPLATE 搜尋
+        「變數=數值」賦值行來定位替換範圍（自動掃描 / 手動輸入變數名稱）。
+    kind == "position"：用點擊範本文字當下記錄的絕對字元位移
+        （start_offset, end_offset, original_text）來定位替換範圍，
+        不依賴變數名稱語法，可以標記 MP 指令欄位、運算式裡的數字等。
+
+    value_type == "numeric"（預設）：水準是數字，支援 Range / Manual。
+    value_type == "string"：水準是文字候選清單（如材料名稱），只能 Manual，
+        目前只有點擊標記（kind == "position"）會產生字串類型的列。
+
+    decimal_places：輸出數字時要保留的小數位數（見 count_decimal_places /
+        format_value），由 VariableRowState.to_config() 依使用者實際輸入的
+        數字文字算出，避免浮點運算誤差尾數被完整印出。
+
+    nominal_text：Nominal 欄位目前顯示的文字，供 resolve_variable_levels 在
+        allow_blank=True（預覽組合數）時，對還沒填 Range/Manual 的變數墊檔用。
+    """
+
+    label: str
+    varname: str
+    kind: str
+    mode: str
+    lower_text: str
+    upper_text: str
+    spacing_text: str
+    manual_values_text: str
+    start_offset: int | None = None
+    end_offset: int | None = None
+    original_text: str | None = None
+    value_type: str = VALUE_TYPE_NUMERIC
+    decimal_places: int = 0
+    nominal_text: str = ""
+
+    @property
+    def display_name(self) -> str:
+        """錯誤訊息/日誌用的人類可讀名稱：優先用 Label，沒填就用 Varname。"""
+        return self.label.strip() or self.varname.strip()
+
+
+def collect_active_variable_configs(
+    active_configs: list[VariableConfig],
+) -> list[VariableConfig]:
+    """驗證已過濾出的 Active 變數設定清單。
+
+    一般檢查：清單非空。
+    僅對 kind == "named" 的列檢查 Varname 非空白、不重複（kind == "position"
+    的列靠點擊時記錄的絕對位置互相區隔，不需要/不檢查 Varname 唯一性）。
+    """
+    if not active_configs:
+        raise ValueError("沒有勾選任何 Active 變數，無法產生")
+
+    seen_names: dict[str, str] = {}
+    duplicates: list[str] = []
+    for config in active_configs:
+        if config.kind != VARIABLE_KIND_NAMED:
+            continue
+        name = config.varname.strip()
+        if not name:
+            raise ValueError("有 Active 變數的 Varname 是空白，請填寫變數名稱")
+        key = name.lower()
+        if key in seen_names:
+            duplicates.append(name)
+        else:
+            seen_names[key] = name
+
+    if duplicates:
+        raise ValueError(
+            "Active 變數的 Varname 重複：" + "、".join(sorted(set(duplicates)))
+        )
+
+    return active_configs
+
+
+def build_full_factorial_combinations(
+    active_configs: list[VariableConfig],
+    allow_blank: bool = False,
+) -> list[list]:
+    """用全因子組合（pyDOE2.fullfact）展開所有 Active 變數的水準組合。
+
+    每個變數先各自解析出水準清單（數字或字串，依 value_type），再用
+    pyDOE2.fullfact 對「水準數量」取得索引矩陣——fullfact 只處理水準數量的
+    索引、不管水準本身是什麼型別，所以數字跟字串變數可以混在同一次組合裡。
+    最後把索引映射回每個變數自己的實際水準值。回傳
+    [[各變數在這組合裡的值, ...], ...]，每筆長度與順序對應 active_configs。
+    組合總數超過 COMBINATION_COUNT_HARD_LIMIT 時，在呼叫 fullfact 之前就
+    丟出 ValueError（避免配置超大陣列）。
+
+    allow_blank 原樣轉給 resolve_variable_levels：「預覽組合數」傳 True，
+    讓還沒填 Range/Manual 的變數先用 Nominal 墊檔；「產生所有資料夾與
+    input file」維持預設 False，缺漏一律 fail loud。
+    """
+    from pyDOE2 import fullfact
+
+    levels_by_var: list[list] = [
+        resolve_variable_levels(
+            config.display_name,
+            config.mode,
+            config.lower_text,
+            config.upper_text,
+            config.spacing_text,
+            config.manual_values_text,
+            config.value_type,
+            nominal_text=config.nominal_text,
+            allow_blank=allow_blank,
+        )
+        for config in active_configs
+    ]
+    level_counts = [len(levels) for levels in levels_by_var]
+
+    total_combinations = 1
+    for count in level_counts:
+        total_combinations *= count
+    if total_combinations > COMBINATION_COUNT_HARD_LIMIT:
+        raise ValueError(
+            f"組合總數 {total_combinations} 超過上限 {COMBINATION_COUNT_HARD_LIMIT}，"
+            "請減少變數數量或水準數量"
+        )
+
+    coded_indices = fullfact(level_counts)
+
+    combinations: list[list] = []
+    for row in coded_indices:
+        combo = [
+            levels_by_var[var_idx][int(round(row[var_idx]))]
+            for var_idx in range(len(active_configs))
+        ]
+        combinations.append(combo)
+    return combinations
+
+
+def build_combinations_from_table_rows(
+    combination_rows: list["CombinationRowState"], active_configs: list[VariableConfig]
+) -> list[list]:
+    """依組合對照表目前每一列實際顯示的數值欄文字，逐列解析成可丟進
+    render_run_text 的型別，取代 build_full_factorial_combinations：使用者
+    可能已經在對照表裡排成非全因子的自訂組合（例如兩個變數的值配成一一
+    對應），這裡必須逐列原樣採用，不能對每欄去重後重新展開笛卡兒積。
+    """
+    return [
+        [
+            parse_edited_value_text(text, config)
+            for text, config in zip(row.current_value_texts(), active_configs)
+        ]
+        for row in combination_rows
+    ]
+
+
+def validate_combination_table_folder_names(folder_names: list[str]) -> list[str]:
+    """驗證『依對照表產生資料夾與 input file』批次裡每一列目前的資料夾名稱：
+    不可空白、不可含 Windows 檔案系統不允許的字元、批次內不可互相重複。是否
+    跟磁碟上既有（不相關）資料夾撞名，留給呼叫端決定要警示還是直接覆寫，不在
+    此處擋。回傳錯誤訊息清單（全部合法回傳空清單）。
+    """
+    counts: dict[str, int] = {}
+    for name in folder_names:
+        counts[name] = counts.get(name, 0) + 1
+
+    errors: list[str] = []
+    reported_duplicates: set[str] = set()
+    for name in folder_names:
+        if not name:
+            errors.append("有資料夾名稱是空白，請填寫")
+        elif INVALID_RUN_PREFIX_CHARS_PATTERN.search(name):
+            errors.append(f"資料夾名稱「{name}」含有 Windows 檔案系統不允許的字元")
+        elif counts[name] > 1 and name not in reported_duplicates:
+            reported_duplicates.add(name)
+            errors.append(f"有多列使用同一個資料夾名稱「{name}」，請確認名稱都不重複")
+    return errors
+
+
+# ── 變數替換範圍解析（統一處理 named 與 position 兩種標記方式）──────────────
+def count_decimal_places(text: str) -> int:
+    """數出數字文字字面上小數點後有幾位數字（只看指數部分前的 mantissa）。
+
+    空字串、沒有小數點、或不是合法數字文字都回傳 0。用來讓輸出的小數位數
+    跟著使用者實際打進欄位（或點擊到的原始文字）的位數走，而不是印出浮點
+    運算後的完整精度（例如 25000*1.1 算出 27500.000000000004 這種誤差尾數）。
+    """
+    mantissa = text.strip().split("e")[0].split("E")[0]
+    if "." not in mantissa:
+        return 0
+    return len(mantissa.split(".", 1)[1])
+
+
+def format_value(value: float, decimal_places: int | None = None) -> str:
+    """數值轉成寫回 APDL 的字串，整數不帶小數點。
+
+    decimal_places 非 None 時，先四捨五入到該小數位數再轉字串，用來蓋掉浮點
+    運算誤差尾數（見 count_decimal_places）；位數由呼叫端依使用者實際輸入的
+    數字文字決定，不是全域固定值。decimal_places 為 None 時維持原本直接用
+    repr() 印出完整精度的行為（供尚未提供位數資訊的呼叫端相容）。
+    """
+    value = float(value)
+    if decimal_places is not None:
+        value = round(value, decimal_places)
+    if value.is_integer():
+        return str(int(value))
+    if decimal_places is not None:
+        return f"{value:.{decimal_places}f}"
+    return repr(value)
+
+
+def format_value_for_config(value, config: VariableConfig) -> str:
+    """依 config.value_type 決定怎麼把這組合裡的值轉成寫回範本的字串。
+
+    字串類型（如材料名稱）直接原樣寫回，不經過數值格式化；數字類型依
+    config.decimal_places 套用 format_value()，避免浮點運算誤差尾數。
+    """
+    if config.value_type == VALUE_TYPE_STRING:
+        return str(value)
+    return format_value(value, config.decimal_places)
+
+
+INVALID_RUN_PREFIX_CHARS_PATTERN = re.compile(r'[\\/:*?"<>|]')
+
+
+def resolve_run_folder_prefix(raw_text: str) -> str:
+    """決定實際要用的 run 資料夾名稱前綴：留白、或選到下拉選單裡代表預設值的
+    「run_N」時都沿用預設的「run_」；否則用使用者輸入的文字（去除頭尾空白）。
+    前綴之後會直接接數字組成資料夾名稱，裡面不能出現 Windows 檔案系統不允許
+    的字元，fail loud 不自動過濾。
+    """
+    prefix = raw_text.strip()
+    if not prefix or prefix == RUN_FOLDER_PREFIX_DEFAULT_OPTION:
+        return RUN_FOLDER_PREFIX
+    if INVALID_RUN_PREFIX_CHARS_PATTERN.search(prefix):
+        raise ValueError(
+            f"資料夾名稱前綴「{prefix}」含有 Windows 檔案系統不允許的字元"
+            '（\\ / : * ? " < > |），請移除後再試'
+        )
+    return prefix
+
+
+def resolve_run_start_index(raw_text: str) -> int:
+    """解析使用者在「起始序號」欄位輸入的文字，決定資料夾序號從幾開始編號。
+    留白時預設從 1 開始（跟原本行為一致）；不可為負數。
+    """
+    text = raw_text.strip()
+    if not text:
+        return 1
+    try:
+        value = int(text)
+    except ValueError:
+        raise ValueError(f"起始序號「{text}」不是合法整數")
+    if value < 0:
+        raise ValueError(f"起始序號「{text}」不能是負數")
+    return value
+
+
+def load_run_prefix_history() -> list[str]:
+    """讀取使用者曾手動輸入過的自訂資料夾名稱前綴歷史（JSON 陣列，UTF-8
+    without BOM）。檔案不存在、損毀或格式不符時都回傳空清單，不讓歷史紀錄
+    壞掉擋到主功能正常使用。
+    """
+    if not RUN_PREFIX_HISTORY_PATH.is_file():
+        return []
+    try:
+        data = json.loads(RUN_PREFIX_HISTORY_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, str) and item.strip()]
+
+
+def save_run_prefix_history(history: list[str]) -> None:
+    """把目前的自訂前綴歷史寫回磁碟（UTF-8 without BOM），供下次啟動時還原
+    下拉選單；寫入失敗（例如檔案被其他程式鎖住）不應該擋住主功能，由呼叫端
+    決定要不要忽略例外。
+    """
+    RUN_PREFIX_HISTORY_PATH.write_text(
+        json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def format_run_id(
+    index: int, total: int, prefix: str = RUN_FOLDER_PREFIX, start_index: int = 1
+) -> str:
+    """產生 run 資料夾代號（如 run_001，或使用者自訂前綴 Leg_01），供
+    generate_run_folders 與組合對照表共用同一套命名規則。
+
+    index 仍是呼叫端迴圈用的 1..total 位置；start_index（預設 1，跟原本行為
+    一致）讓實際編號可以從任意數字開始累加，而不是固定從 1 開始。補零寬度
+    依「這一批實際會出現的最大編號」（start_index + total - 1）計算，不是只
+    看 total——否則起始序號一拉高，可能出現位數忽然變多卻沒跟著補零對齊的
+    情況（例如起始序號 95、9 組，編號會到 103，得補到 3 位數才一致）。
+    """
+    actual_number = start_index + index - 1
+    max_number = start_index + total - 1
+    width = len(str(max_number))
+    return f"{prefix}{actual_number:0{width}d}"
+
+
+def find_existing_run_folders(
+    output_dir: Path, prefix: str = RUN_FOLDER_PREFIX
+) -> list[Path]:
+    """列舉 output_dir 底下所有看起來是本工具先前用同一個前綴產生的 run 資料夾。
+
+    補零寬度（run_1 vs run_01）取決於「產生當下」的組合總數，不同次產生可能
+    用不同寬度，所以用 \\d+ 不限寬度比對；Windows 檔案系統不分大小寫，比對時
+    也不分大小寫。用來在重新產生前清掉舊一輪留下的過期資料夾，避免組合數變少
+    時舊資料夾原封不動留著、被誤跑進後續批次運算。前綴換過（例如上一輪用
+    run_、這一輪改用 Leg_）時，舊前綴的資料夾不屬於這一輪的命名規則，不會
+    被當成過期資料夾清掉。
+    """
+    if not output_dir.is_dir():
+        return []
+    pattern = re.compile(rf"(?i)^{re.escape(prefix)}\d+$")
+    return [
+        path
+        for path in output_dir.iterdir()
+        if path.is_dir() and pattern.fullmatch(path.name)
+    ]
+
+
+def find_stale_run_folders_to_delete(
+    output_dir: Path, prefix: str, new_run_ids: set[str], start_index: int
+) -> list[Path]:
+    """決定這一輪產生時該清掉哪些「這一輪用不到」的舊 run 資料夾。
+
+    只清「從這一輪的起始序號開始、連續存在到某個編號為止」這段範圍裡不在
+    new_run_ids 的資料夾（典型情境：上一輪同樣從 start_index 開始但組合數
+    比較多，這次組合數變少，尾端留下的舊資料夾）。編號序列只要出現一個
+    「斷層」（某個編號不存在），就停止往後掃——斷層之後的資料夾視為另一批
+    （使用者刻意用不同的起始序號區分，見「起始序號」欄位／resolve_run_
+    start_index），完全不動，由使用者自己決定要不要手動整理。
+
+    只看「跟這一輪起始序號相同的那條連續序列」而不是看磁碟上全部符合前綴的
+    資料夾裡最小的編號，是為了在磁碟上同時存在多批（例如 start=1 一批、
+    start=21 另一批）時，重新整理前面那批也不會誤刪後面那批——兩批之間本來
+    就會有編號斷層，掃到斷層就停，自然不會掃到另一批去。
+    """
+    existing_run_folders = find_existing_run_folders(output_dir, prefix)
+    if not existing_run_folders:
+        return []
+
+    folders_by_number: dict[int, list[Path]] = {}
+    for folder in existing_run_folders:
+        try:
+            number = int(folder.name[len(prefix):])
+        except ValueError:
+            continue
+        folders_by_number.setdefault(number, []).append(folder)
+
+    contiguous_max = start_index - 1
+    number = start_index
+    while number in folders_by_number:
+        contiguous_max = number
+        number += 1
+
+    stale_folders: list[Path] = []
+    for number in range(start_index, contiguous_max + 1):
+        for folder in folders_by_number.get(number, []):
+            if folder.name not in new_run_ids:
+                stale_folders.append(folder)
+    return stale_folders
+
+
+def format_position_default_label(sequence_number: int, line_num: int) -> str:
+    """點擊標記變數的預設名稱：流水編號 + 行號，例如 var01_L74（不含原始數值，
+    避免標記後改動數值時，標籤文字卻還停留在最初點擊到的那個舊數值）。"""
+    return f"var{sequence_number:02d}_L{line_num}"
+
+
+def resolve_variable_span(template_text: str, config: VariableConfig) -> tuple[int, int]:
+    """找出這個變數在 template_text 裡要被替換的絕對字元範圍 [start, end)。
+
+    kind == "named"：用 ASSIGNMENT_PATTERN_TEMPLATE 搜尋「變數=數值」賦值行，
+    取值（group 4）的範圍；找不到時 fail loud，並提醒 MP 等位置參數指令無法
+    用這種語法比對、建議改用點擊範本文字直接標記。
+    kind == "position"：直接採用點擊標記當下記錄的絕對字元範圍，但會先比對
+    目前範圍內的文字是否仍等於點擊當下記下的 original_text；對不上（代表範本
+    在標記後被更動過）時 fail loud，並提示重新載入、重新標記。
+    """
+    if config.kind == VARIABLE_KIND_NAMED:
+        name = config.varname.strip()
+        pattern = ASSIGNMENT_PATTERN_TEMPLATE.format(name=re.escape(name))
+        match = re.search(pattern, template_text)
+        if match is None:
+            raise ValueError(
+                f"input file 裡找不到變數「{name}」的賦值行（變數=數值），"
+                "MP 等位置參數指令無法用 name=value 形式比對，"
+                "請確認變數名稱，或改用「點擊範本文字」直接標記該數字。"
+            )
+        return match.start(4), match.end(4)
+
+    start, end = config.start_offset, config.end_offset
+    current_text = template_text[start:end]
+    if current_text != config.original_text:
+        raise ValueError(
+            f"點擊標記「{config.display_name}」的原始文字（「{config.original_text}」）"
+            f"跟目前讀入的 input file 對不上（目前是「{current_text}」），"
+            "範本可能已被更動，請重新載入範本、重新標記後再產生。"
+        )
+    return start, end
+
+
+def check_spans_do_not_overlap(
+    spans: list[tuple[int, int]], active_configs: list[VariableConfig]
+) -> None:
+    """確認所有變數要替換的文字範圍彼此不重疊，重疊時 fail loud 並點名兩個變數。"""
+    order = sorted(range(len(spans)), key=lambda i: spans[i][0])
+    for a, b in zip(order, order[1:]):
+        start_b, _end_b = spans[b]
+        _start_a, end_a = spans[a]
+        if start_b < end_a:
+            raise ValueError(
+                f"變數「{active_configs[a].display_name}」與"
+                f"「{active_configs[b].display_name}」標記到同一段（或重疊的）文字，"
+                "請移除其中一個重複的標記"
+            )
+
+
+def resolve_all_spans(
+    template_text: str, active_configs: list[VariableConfig]
+) -> list[tuple[int, int]]:
+    """解析所有 active 變數的替換範圍，並檢查彼此不重疊。"""
+    spans = [resolve_variable_span(template_text, config) for config in active_configs]
+    check_spans_do_not_overlap(spans, active_configs)
+    return spans
+
+
+def render_run_text(
+    template_text: str,
+    spans: list[tuple[int, int]],
+    active_configs: list[VariableConfig],
+    combo: list,
+) -> str:
+    """把單一組合（combo）的數值套進 template_text，回傳替換好的完整文字。
+
+    依「由右至左」（spans 起點遞減）的順序套用替換，確保前面的替換不會影響
+    後面變數在原始字串裡的字元位置。generate_run_folders 產生每個 run 資料夾
+    時呼叫這個函式；套用組合對照表的編輯結果重新改寫單一 run 的 input file
+    時也呼叫同一份，避免兩處各自維護一份替換邏輯。
+    """
+    order = sorted(range(len(active_configs)), key=lambda i: spans[i][0], reverse=True)
+    run_text = template_text
+    for i in order:
+        start, end = spans[i]
+        value_text = format_value_for_config(combo[i], active_configs[i])
+        run_text = run_text[:start] + value_text + run_text[end:]
+    return run_text
+
+
+def find_missing_extra_files(extra_file_paths: list[Path]) -> list[Path]:
+    """回傳 extra_file_paths 裡實際不存在的檔案清單。"""
+    return [path for path in extra_file_paths if not path.is_file()]
+
+
+def find_extra_file_template_collisions(
+    extra_file_paths: list[Path], template_filename: str
+) -> list[Path]:
+    """回傳 extra_file_paths 裡檔名（不分大小寫，因為 Windows 檔案系統本身不分
+    大小寫）跟 template_filename 相同的檔案清單。
+
+    generate_run_folders 會先寫入替換好數值的 input file，再把附加檔案複製進
+    同一個資料夾；若附加檔案剛好跟範本同名，複製動作會把原始未替換的內容蓋掉
+    剛寫好的替換結果，必須在產生前就攔下來。
+    """
+    template_key = template_filename.lower()
+    return [path for path in extra_file_paths if path.name.lower() == template_key]
+
+
+def find_duplicate_extra_filenames(extra_file_paths: list[Path]) -> list[list[Path]]:
+    """回傳 extra_file_paths 裡「檔名（不分大小寫）彼此重複」的分組（每組 >= 2 筆）。
+
+    不同資料夾底下的附加檔案只要檔名相同，複製進同一個 run 資料夾時目的檔名
+    就會一樣，後選的會直接把先選的蓋掉、沒有任何提示（跟 find_missing_extra_
+    files／find_extra_file_template_collisions 同一類風險，只是比對對象換成
+    附加檔案彼此之間，而不是跟範本檔名比對）。
+    """
+    groups: dict[str, list[Path]] = {}
+    for path in extra_file_paths:
+        groups.setdefault(path.name.lower(), []).append(path)
+    return [paths for paths in groups.values() if len(paths) > 1]
+
+
+def generate_run_folders(
+    template_path: Path,
+    active_configs: list[VariableConfig],
+    combinations: list[list],
+    output_dir: Path,
+    extra_file_paths: list[Path] | None = None,
+    run_prefix: str = RUN_FOLDER_PREFIX,
+    start_index: int = 1,
+    run_ids: list[str] | None = None,
+) -> int:
+    """依每組組合，在 output_dir 下建立獨立資料夾並寫入替換好數值的 input file。
+
+    產生前會重新讀取 template_path（避免使用掃描/標記當下的舊內容），對所有
+    active_configs 各自解析一次替換範圍（resolve_all_spans：named 用 regex
+    比對、position 用點擊時記錄的絕對字元範圍並驗證原始文字未變）。每組合都
+    依「由右至左」的順序套用數值替換，確保前面的替換不會影響後面變數的
+    字元位置。extra_file_paths（若有）會原封不動複製進每個資料夾，檔名維持
+    原樣；產生前會先確認所有附加檔案都存在，不會寫到一半才發現少檔案。
+    回傳實際產生的資料夾數量。
+
+    run_ids（預設 None）：指定時逐一取代原本「依 prefix/start_index 用
+    format_run_id 計算」的資料夾命名，改用呼叫端提供的現成名稱（目前只有
+    『依對照表產生資料夾與 input file』使用，資料夾名稱直接取自組合對照表
+    每一列目前顯示的「資料夾」欄文字）。指定 run_ids 時一併跳過「清掉這一輪
+    用不到的舊 run_* 資料夾」那一段——自訂名稱不保證符合 prefix+數字的命名
+    規則，意義上也不是「同一批連續編號」，不應該觸發刪除其他不相關的舊資料夾。
+    """
+    extra_file_paths = extra_file_paths or []
+    missing_extra_files = find_missing_extra_files(extra_file_paths)
+    if missing_extra_files:
+        raise ValueError(
+            "找不到以下附加檔案，請確認路徑是否正確：\n- "
+            + "\n- ".join(str(path) for path in missing_extra_files)
+        )
+    extra_file_collisions = find_extra_file_template_collisions(
+        extra_file_paths, template_path.name
+    )
+    if extra_file_collisions:
+        raise ValueError(
+            "以下附加檔案跟 input file 檔名相同，複製時會蓋掉剛寫好的替換結果，"
+            "請改名或移除：\n- "
+            + "\n- ".join(str(path) for path in extra_file_collisions)
+        )
+    duplicate_extra_filenames = find_duplicate_extra_filenames(extra_file_paths)
+    if duplicate_extra_filenames:
+        raise ValueError(
+            "以下附加檔案彼此檔名相同，複製到同一個 run 資料夾時會互相覆蓋，"
+            "請改名或移除：\n"
+            + "\n".join(
+                "- " + "、".join(str(path) for path in group)
+                for group in duplicate_extra_filenames
+            )
+        )
+
+    template_text, _stamp = read_apdl_text(template_path)
+    spans = resolve_all_spans(template_text, active_configs)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    template_filename = template_path.name
+    total = len(combinations)
+    using_custom_run_ids = run_ids is not None
+    resolved_run_ids = (
+        run_ids
+        if using_custom_run_ids
+        else [
+            format_run_id(index, total, run_prefix, start_index)
+            for index in range(1, total + 1)
+        ]
+    )
+
+    for index, combo in enumerate(combinations, start=1):
+        run_text = render_run_text(template_text, spans, active_configs, combo)
+
+        run_id = resolved_run_ids[index - 1]
+        run_dir = output_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Path.write_text() 在 Python 3.8 不支援 newline= 參數，且預設的文字模式寫入
+        # 會把字串裡每個 \n 都換成 os.linesep，不管前面是不是已經接著 \r，造成
+        # 範本裡原有的 \r\n 被寫成 \r\r\n（整份重複斷行）。改用 open(..., newline="")
+        # 完全關閉換行轉譯，確保寫出去的位元組跟 run_text 字串內容一模一樣。
+        with open(run_dir / template_filename, "w", encoding="utf-8", newline="") as run_file:
+            run_file.write(run_text)
+
+        for extra_path in extra_file_paths:
+            shutil.copy2(extra_path, run_dir / extra_path.name)
+
+    # 清掉「這一輪用不到」的舊 run_* 資料夾（例如上一輪組合數比較多、或補零寬度
+    # 不同而留下的尾端資料夾），刻意放在整個寫入迴圈「成功跑完之後」才做，不是
+    # 一開始就先清：如果寫到一半才失敗（例如磁碟滿、檔案被鎖住），舊的完整結果
+    # 依然保留在原地，不會因為這次嘗試失敗就連舊資料一起報銷、只剩半套新結果
+    # 卻沒有任何可以復原的東西。find_stale_run_folders_to_delete 只有在既有資料
+    # 的起始編號跟這一輪的 start_index 相同時才會真的列出東西，起始序號不同
+    # （使用者刻意用不同序號區分成另一批）就完全不清，見該函式說明。自訂
+    # run_ids（依對照表產生）不走這套清理邏輯，見本函式 run_ids 參數說明。
+    if not using_custom_run_ids:
+        new_run_ids = set(resolved_run_ids)
+        for existing_dir in find_stale_run_folders_to_delete(
+            output_dir, run_prefix, new_run_ids, start_index
+        ):
+            shutil.rmtree(existing_dir)
+
+    return len(combinations)
+
+
+def build_combination_table_rows(
+    active_configs: list[VariableConfig],
+    combinations: list[list],
+    run_prefix: str = RUN_FOLDER_PREFIX,
+    start_index: int = 1,
+) -> tuple[list[str], list[list[str]]]:
+    """把組合結果轉成表格用的 (header, rows)，用於 GUI Treeview 與落地對照表。
+
+    header 是 ["資料夾"] + 各變數的 display_name；每個 row 是 [run_id] +
+    該組合每個變數依 format_value_for_config 格式化後的字串，run_id 跟
+    generate_run_folders 用同一個 format_run_id，確保跟實際資料夾名稱對得上。
+    """
+    header = ["資料夾"] + [config.display_name for config in active_configs]
+    total = len(combinations)
+    rows: list[list[str]] = []
+    for index, combo in enumerate(combinations, start=1):
+        run_id = format_run_id(index, total, run_prefix, start_index)
+        row = [run_id] + [
+            format_value_for_config(value, config)
+            for value, config in zip(combo, active_configs)
+        ]
+        rows.append(row)
+    return header, rows
+
+
+def write_combinations_summary(path: Path, header: list[str], rows: list[list[str]]) -> None:
+    """寫成 tab 分隔的 txt（UTF-8 without BOM），可直接全選複製貼到 Excel。"""
+    lines = ["\t".join(header)] + ["\t".join(row) for row in rows]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# ── APDL 語法上色（規則內嵌自 apdl syntax.xml，不再於執行期讀取該檔案）─────────
+SYNTAX_KEYWORD_STYLE_NAMES = [f"KEYWORDS{i}" for i in range(1, 9)]
+SYNTAX_LINE_COMMENT_STYLE = "LINE COMMENTS"
+SYNTAX_NUMBER_STYLE = "NUMBERS"
+SYNTAX_OPERATOR_STYLE = "OPERATORS"
+
+# 關鍵字 token：允許帶一個領先的 / 或 *（APDL 的 slash 指令與 star 指令，如
+# /prep7、*if），比對時整個 token（含前綴）轉小寫跟關鍵字集合比對。
+SYNTAX_TOKEN_PATTERN = re.compile(r"[/*]?[A-Za-z_][A-Za-z0-9_]*")
+
+# 單引號／雙引號字串（含引號本身），用來在上色前先挖出「引號範圍」整段排除：
+# 引號內的 ! 不是行註解起點，引號內的文字也不該被誤判成數字/關鍵字/運算子
+# （例如 /INPUT,'a!b','txt' 或 *MSG,INFO,'A-B=1!'）。跟 QUOTED_STRING_INNER_
+# PATTERN（只抓引號裡面的內容，供 Ctrl+單擊取字用）不同，這裡刻意連引號本身
+# 一起算進範圍內。沒有處理跨行字串或字串內跳脫引號（APDL 本身也沒有這種語法），
+# 單引號找不到配對的右引號時該次比對直接失敗、不會誤吞到下一個不相關的引號。
+STRING_LITERAL_PATTERN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+# 以下三份常數內嵌自原本外部的 Notepad++ UDL 設定檔（apdl syntax.xml，原始檔
+# 仍保留在同資料夾供對照／日後用 Notepad++ 重新編輯語法規則，但執行期已不再
+# 讀取它），內容逐字對應該檔案的 Keywords1~8／Operators1／WordsStyle fgColor，
+# 只是從 XML 屬性改成 Python 字面值，數值本身未變動。
+SYNTAX_KEYWORDS_RAW: dict[str, str] = {
+    "KEYWORDS1": "/anfile /angle /annot /anum /assign /auto /aux2 /aux12 /aux15 /axlab /batch /clabel /clear /clog /cmap /color /com /config /contour /copy /cplane /ctype /cval /delete /devdisp /device /dist /dscale /dv3d /edge /efacet /eof /erase /eshape /exit /expand /facet /fdele /filname /focus /format /ftype /gcmd /gcolumn /gfile /gformat /gline /gmarker /go /golist /gopr /graphics /gresume /grid /gropt /grtyp /gsave /gst /gthk /gtype /header /input /larc /light /line /lspec /lsymbol /menu /mplib /mrep /mstart /nerr /noerase /nolist /nopr /normal /number /opt /output /page /pbc /pbf /pcircle /pcopy /plopts /pmacro /pmeth /pmore /pnum /polygon /post1 /post26 /prep7 /psearch /psf /pspec /pstatus /psymb /pwedge /quit /ratio /rename /replot /reset /rgb /runst /seclib /seg /shade /show /showdisp /shrink /solu /sscale /status /stitle /syp /sys /title /tlabel /triad /trlcy /tspec /type /ucmd /ui /uis /units /user /vcone /view /vscale /vup /wait /window /xrange /yrange /zoom /ANFILE /ANGLE /ANNOT /ANUM /ASSIGN /AUTO /AUX2 /AUX12 /AUX15 /AXLAB /BATCH /CLABEL /CLEAR /CLOG /CMAP /COLOR /COM /CONFIG /CONTOUR /COPY /CPLANE /CTYPE /CVAL /DELETE /DEVDISP /DEVICE /DIST /DSCALE /DV3D /EDGE /EFACET /EOF /ERASE /ESHAPE /EXIT /EXPAND /FACET /FDELE /FILNAME /FOCUS /FORMAT /FTYPE /GCMD /GCOLUMN /GFILE /GFORMAT /GLINE /GMARKER /GO /GOLIST /GOPR /GRAPHICS /GRESUME /GRID /GROPT /GRTYP /GSAVE /GST /GTHK /GTYPE /HEADER /INPUT /LARC /LIGHT /LINE /LSPEC /LSYMBOL /MENU /MPLIB /MREP /MSTART /NERR /NOERASE /NOLIST /NOPR /NORMAL /NUMBER /OPT /OUTPUT /PAGE /PBC /PBF /PCIRCLE /PCOPY /PLOPTS /PMACRO /PMETH /PMORE /PNUM /POLYGON /POST1 /POST26 /PREP7 /PSEARCH /PSF /PSPEC /PSTATUS /PSYMB /PWEDGE /QUIT /RATIO /RENAME /REPLOT /RESET /RGB /RUNST /SECLIB /SEG /SHADE /SHOW /SHOWDISP /SHRINK /SOLU /SSCALE /STATUS /STITLE /SYP /SYS /TITLE /TLABEL /TRIAD /TRLCY /TSPEC /TYPE /UCMD /UI /UIS /UNITS /USER /VCONE /VIEW /VSCALE /VUP /WAIT /WINDOW /XRANGE /YRANGE /ZOOM solve /nop /udoc /dev /ang /foc /an3d /anno /image /wb /directory /cwd /REP",
+    "KEYWORDS2": "*abbr *afun *ask *cfclos *cfopen *cfwrite *create *cycle *del *dim *do *else *elseif *end *enddo *endif *eval *exit *get *go *if *list *mfouri *mfun *mooney *moper *msg *repeat *set *status *tread *vabs *vcol *vcum *vedit *vfact *vfill *vfun *vget *vitrp *vlen *vmask *voper *vplot *vput *vread *vscfun *vstat *vwrite *ABBR *AFUN *ASK *CFCLOS *CFOPEN *CFWRITE *CREATE *CYCLE *DEL *DIM *DO *ELSE *ELSEIF *END *ENDDO *ENDIF *EVAL *EXIT *GET *GO *IF *LIST *MFOURI *MFUN *MOONEY *MOPER *MSG *REPEAT *SET *STATUS *TREAD *VABS *VCOL *VCUM *VEDIT *VFACT *VFILL *VFUN *VGET *VITRP *VLEN *VMASK *VOPER *VPLOT *VPUT *VREAD *VSCFUN *VSTAT *VWRITE *dowhile then *MWRITE *cfclose *SREAD",
+    "KEYWORDS3": "a aadd aatt abbres abbsav abs accat acel aclear adapt add addam adele adgl adrag afillt aflist afsurf agen aglue aina ainp ainv al alist alpfill allsel alphad amap amesh ancntr ancut andata andscl andyna anflow anim anisos anmode anorm antime antype aoffst aovlap aplot append aptn arclen arcollapse arctrm ardetach areas arefine areverse arfill armerge arotat arscale arsplit arsym asba asbl asbv asbw asel askin asll aslv asub asum atan atran atype autots avprin avres bellow bend betad bf bfa bfadele bfalist bfcum bfdele bfe bfecum bfedele bfelist bfescal bfint bfk bfkdele bfklist bfl bfldele bflist bfllist bfscale bftran bfunif bfv bfvdele bfvlist bioopt biot blc4 blc5 block bool boptn branch bsplin btol bucopt calc cbdof cdread cdwrite ce cecmod cecyc cedele ceintf celist center ceqn cerig cesgen cfact cgloc cgomga check chkmsh circle clocal clog clrmshln cm cmdele cmedit cmgrp cmlist cmplot cmsel cnvtol con4 cone conjug couple coval cp cpdele cpintf cplgen cplist cpngen cpsgen cqc crplim cs cscir csdele cskp cslist cswpla csys curr2d cutcontrol cvar cycgen cycsol cyl4 cyl5 cylind d da dadele dalist datadef dcgomg dcum ddele deact define deltim deriv desize desol detab dig digit display dk dkdele dklist dl dldele dlist dllist dmove dmprat dnsol dof dofsel domega dscale dset dsum dsurf dsym dsys dtran dump dynopt e ealive edbound edbvis edcdele edcgen edclist edcontact edcpu edcrb edcsc edcts edcurve eddamp eddrelax edele edenergy edfplot edhgls edhist edhtime edint edivelo edlcs edldplot edload edmp edndtsd ednrot edopt edout edread edrst edshell edsolv edstart edweld edwrite egen eintf ekill elist emagerr emf emid emis emodif emore emsym emunit en engen enorm ensym eplot eqslv erase eread erefine eresx ernorm errang esel esize esla esll esln eslv esol esort estif esurf esym esys et etable etchg etdele etlist etype eusort ewrite exp expand expass expsol extopt extrem f fatigue fcum fdele fe febody fecons fefor felist fesurf file fileaux2 filedisp fill filldata finish fitem fk fkdele fklist fl flange fldata fldata1 fldata2 fldata3 fldata4 fldata4a fldata5 fldata6 fldata7 fldata8 fldata9 fldata10 fldata11 fldata12 fldata13 fldata14 fldata15 fldata16 fldata17 fldata18 fldata19 fldata20 fldata20a fldata21 fldata22 fldata23 fldata24 fldata24a fldata24b fldata24c fldata24d fldata25 fldata26 fldata27 fldata28 fldata29 fldata30 fldata31 fldata32 fldata33 flist fllist flocheck flotran flread flst fluxv fmagbc fmagsum for2d force form fp fplist freq fs fscale fsdele fslist fsnode fsplot fssect fsum ftcalc ftran ftsize ftwrite fvmesh gap gapf gapfinish gaplist gapmerge gapopt gapplot gauge gcgen genopt geom geometry gp gpdele gplist gplot grp gsum harfrq help helpdisp hfsweep hmagsolv hpgl hptcreate hptdelete hrcplx hrexp hropt hrout ic icdele iclist igesin igesout imagin immed impd inres inrtia int1 intsrf ioptn irlf irlist k katt kbc kbetw kcalc kcenter kclear kdele kdist kesize keyopt keypts keyw kfill kgen kl klist kmesh kmodif kmove knode kplot kpscale krefine kscale kscon ksel ksll ksln ksum ksymm ktran kuse kwpave kwplan l l2ang l2tan lang larc larea large latt layer layerp26 laylist layplot lcabs lcase lccalc lccat lcdef lcfact lcfile lclear lcomb lcoper lcsel lcsl lcsum lcwrite lczero ldele ldiv ldrag ldread lesize lextnd lfillt lfsurf lgen lglue lgwrite lina line lines linl linp linv llist lmatrix lmesh lncollapse lndetach lnfill lnmerge lnsplit lnsrch local lovlap lplot lptn lrefine lreverse lrotat lsba lsbl lsbv lsbw lsclear lsdele lsel lsla lslk lsoper lsread lsscale lssolve lstr lsum lswrite lsymm ltan ltran lumpm lvscale lwplan m magopt magsolv master mat mater mdamp mdele meshing mgen miter mlist mmf mode modmsh modopt monitor mopt move mp mpamod mpchg mpdata mpdele mpdres mplist mpmod mpundo mpplot mpread mprint mptemp mptgen mptres mpwrite msadv mscap msdata mshape mshkey mshmid mshpattern msmeth msnomf msprop msquad msrelax mssolu msspec msterm msvary mxpand n nang ncnv ndele ndist neqit nforce ngen nkpt nlgeom nlist nlog nlopt nmodif nocolor nodes noorder nplot nprint nread nrefine nrlsum nropt nrotat nrrang nscale nsel nsla nsle nslk nsll nslv nsol nsort nstore nsubst nsvr nsym numcmp numexp nummrg numoff numstr numvar nusort nwpave nwplan nwrite omega opadd opanl opclr opdata opdel opeqn operate opexe opfact opfrst opgrad opkeep oplfa oplgr oplist oploop oplsw opmake opncontrol opprnt oprand opresu oprfa oprgr oprsw opsave opsel opsubp opsweep optype opuser opvar outopt outpr outres padele paget paput paresu parres parsav pasave path pcalc pcirc pconv pcorro pcross pdef pdot pdrag perbc2d pexclude pfact pfluid pgap physics pinclude pinsul pipe pivcheck planewave plconv plcplx plcrack pldisp plesol pletab plf2d plls plnsol plot plotting plpagm plpath plsect pltime pltrac plvar plvaropt plvect pmap pmeth pmgtran pmopts point poly popt portopt powerh ppath pplot pprange ppres prange prconv prcplx precision pred prerr presol pretab pri2 prim print prism priter prnld prnsol prod prpath prrfor prrsol prsect prssol prtime prvar prvaropt prvect pscr psdcom psdfrq psdres psdspl psdunit psdval psdwav psel psolve pspec psprng pstres ptemp ptxy punit pvect qdval qfact quad quot race rall rappnd rbe3 rcon rdele real realvar rectng reduce reflcoef reorder reset resp resume rexport rfilsz rforce rigid rimport riter rlist rmemry rmodif rmore rock rpoly rpr4 rprism rpsd rspeed rstat rsys rtimst run rwfrnt sabs sadd sallow sarplot save sbclist sbctran sdelete se secdata secnum secoffset secplot secread sectype secwrite sed sedlist seexp selist selm senergy seopt sesymm set setran sexp sf sfa sfact sfadele sfalist sfbeam sfcalc sfcum sfdele sfe sfedele sfelist sffun sfgrad sfl sfldele sflist sfllist sfscale sftran shell shpp slist slpplot slsplot small smax smbody smcons smfor smin smrtsize smsurf smult solcontrol solu soluopt solve sort source space sparm spec sph4 sph5 sphere spline spoint spopt spread sptopt sqrt srcs srss ssln sstif ssum stat stef store subopt subset sumtype sv svtyp tallow tb tbcopy tbdata tbdele tble tblist tbmodif tbplot tbpt tbtemp tchg tee term timerange timint timp tintp toffst topdef topexe topiter torq2d torqc2d torqsum torus total trans transfer tref trnopt trpdel trplis trpoin trtime tshap tsres tunif tvar uimp upcoord upgeom usrcal v va vadd valve vardel varnam vatt vclear vcross vcvfill vddam vdele vdgl vdot vdrag vext vgen vget vglue vimp vinp vinv vlist vlscale vmesh voffst volumes vovlap vplot vptn vput vrotat vsba vsbv vsbw vsel vsla vsum vsweep vsymm vtran vtype waves werase wfront wmore wpave wpcsys wplane wpoffs wprota wpstyl write wsort wstart xvar xvaropt A AADD AATT ABBRES ABBSAV ABS ACCAT ACEL ACLEAR ADAPT ADD ADDAM ADELE ADGL ADRAG AFILLT AFLIST AFSURF AGEN AGLUE AINA AINP AINV AL ALIST ALPFILL ALLSEL ALPHAD AMAP AMESH ANCNTR ANCUT ANDATA ANDSCL ANDYNA ANFLOW ANIM ANISOS ANMODE ANORM ANTIME ANTYPE AOFFST AOVLAP APLOT APPEND APTN ARCLEN ARCOLLAPSE ARCTRM ARDETACH AREAS AREFINE AREVERSE ARFILL ARMERGE AROTAT ARSCALE ARSPLIT ARSYM ASBA ASBL ASBV ASBW ASEL ASKIN ASLL ASLV ASUB ASUM ATAN ATRAN ATYPE AUTOTS AVPRIN AVRES BELLOW BEND BETAD BF BFA BFADELE BFALIST BFCUM BFDELE BFE BFECUM BFEDELE BFELIST BFESCAL BFINT BFK BFKDELE BFKLIST BFL BFLDELE BFLIST BFLLIST BFSCALE BFTRAN BFUNIF BFV BFVDELE BFVLIST BIOOPT BIOT BLC4 BLC5 BLOCK BOOL BOPTN BRANCH BSPLIN BTOL BUCOPT CALC CBDOF CDREAD CDWRITE CE CECMOD CECYC CEDELE CEINTF CELIST CENTER CEQN CERIG CESGEN CFACT CGLOC CGOMGA CHECK CHKMSH CIRCLE CLOCAL CLOG CLRMSHLN CM CMDELE CMEDIT CMGRP CMLIST CMPLOT CMSEL CNVTOL CON4 CONE CONJUG COUPLE COVAL CP CPDELE CPINTF CPLGEN CPLIST CPNGEN CPSGEN CQC CRPLIM CS CSCIR CSDELE CSKP CSLIST CSWPLA CSYS CURR2D CUTCONTROL CVAR CYCGEN CYCSOL CYL4 CYL5 CYLIND D DA DADELE DALIST DATADEF DCGOMG DCUM DDELE DEACT DEFINE DELTIM DERIV DESIZE DESOL DETAB DIG DIGIT DISPLAY DK DKDELE DKLIST DL DLDELE DLIST DLLIST DMOVE DMPRAT DNSOL DOF DOFSEL DOMEGA DSCALE DSET DSUM DSURF DSYM DSYS DTRAN DUMP DYNOPT E EALIVE EDBOUND EDBVIS EDCDELE EDCGEN EDCLIST EDCONTACT EDCPU EDCRB EDCSC EDCTS EDCURVE EDDAMP EDDRELAX EDELE EDENERGY EDFPLOT EDHGLS EDHIST EDHTIME EDINT EDIVELO EDLCS EDLDPLOT EDLOAD EDMP EDNDTSD EDNROT EDOPT EDOUT EDREAD EDRST EDSHELL EDSOLV EDSTART EDWELD EDWRITE EGEN EINTF EKILL ELIST EMAGERR EMF EMID EMIS EMODIF EMORE EMSYM EMUNIT EN ENGEN ENORM ENSYM EPLOT EQSLV ERASE EREAD EREFINE ERESX ERNORM ERRANG ESEL ESIZE ESLA ESLL ESLN ESLV ESOL ESORT ESTIF ESURF ESYM ESYS ET ETABLE ETCHG ETDELE ETLIST ETYPE EUSORT EWRITE EXP EXPAND EXPASS EXPSOL EXTOPT EXTREM F FATIGUE FCUM FDELE FE FEBODY FECONS FEFOR FELIST FESURF FILE FILEAUX2 FILEDISP FILL FILLDATA FINISH FITEM FK FKDELE FKLIST FL FLANGE FLDATA FLDATA1 FLDATA2 FLDATA3 FLDATA4 FLDATA4A FLDATA5 FLDATA6 FLDATA7 FLDATA8 FLDATA9 FLDATA10 FLDATA11 FLDATA12 FLDATA13 FLDATA14 FLDATA15 FLDATA16 FLDATA17 FLDATA18 FLDATA19 FLDATA20 FLDATA20A FLDATA21 FLDATA22 FLDATA23 FLDATA24 FLDATA24A FLDATA24B FLDATA24C FLDATA24D FLDATA25 FLDATA26 FLDATA27 FLDATA28 FLDATA29 FLDATA30 FLDATA31 FLDATA32 FLDATA33 FLIST FLLIST FLOCHECK FLOTRAN FLREAD FLST FLUXV FMAGBC FMAGSUM FOR2D FORCE FORM FP FPLIST FREQ FS FSCALE FSDELE FSLIST FSNODE FSPLOT FSSECT FSUM FTCALC FTRAN FTSIZE FTWRITE FVMESH GAP GAPF GAPFINISH GAPLIST GAPMERGE GAPOPT GAPPLOT GAUGE GCGEN GENOPT GEOM GEOMETRY GP GPDELE GPLIST GPLOT GRP GSUM HARFRQ HELP HELPDISP HFSWEEP HMAGSOLV HPGL HPTCREATE HPTDELETE HRCPLX HREXP HROPT HROUT IC ICDELE ICLIST IGESIN IGESOUT IMAGIN IMMED IMPD INRES INRTIA INT1 INTSRF IOPTN IRLF IRLIST K KATT KBC KBETW KCALC KCENTER KCLEAR KDELE KDIST KESIZE KEYOPT KEYPTS KEYW KFILL KGEN KL KLIST KMESH KMODIF KMOVE KNODE KPLOT KPSCALE KREFINE KSCALE KSCON KSEL KSLL KSLN KSUM KSYMM KTRAN KUSE KWPAVE KWPLAN L L2ANG L2TAN LANG LARC LAREA LARGE LATT LAYER LAYERP26 LAYLIST LAYPLOT LCABS LCASE LCCALC LCCAT LCDEF LCFACT LCFILE LCLEAR LCOMB LCOPER LCSEL LCSL LCSUM LCWRITE LCZERO LDELE LDIV LDRAG LDREAD LESIZE LEXTND LFILLT LFSURF LGEN LGLUE LGWRITE LINA LINE LINES LINL LINP LINV LLIST LMATRIX LMESH LNCOLLAPSE LNDETACH LNFILL LNMERGE LNSPLIT LNSRCH LOCAL LOVLAP LPLOT LPTN LREFINE LREVERSE LROTAT LSBA LSBL LSBV LSBW LSCLEAR LSDELE LSEL LSLA LSLK LSOPER LSREAD LSSCALE LSSOLVE LSTR LSUM LSWRITE LSYMM LTAN LTRAN LUMPM LVSCALE LWPLAN M MAGOPT MAGSOLV MASTER MAT MATER MDAMP MDELE MESHING MGEN MITER MLIST MMF MODE MODMSH MODOPT MONITOR MOPT MOVE MP MPAMOD MPCHG MPDATA MPDELE MPDRES MPLIST MPMOD MPUNDO MPPLOT MPREAD MPRINT MPTEMP MPTGEN MPTRES MPWRITE MSADV MSCAP MSDATA MSHAPE MSHKEY MSHMID MSHPATTERN MSMETH MSNOMF MSPROP MSQUAD MSRELAX MSSOLU MSSPEC MSTERM MSVARY MXPAND N NANG NCNV NDELE NDIST NEQIT NFORCE NGEN NKPT NLGEOM NLIST NLOG NLOPT NMODIF NOCOLOR NODES NOORDER NPLOT NPRINT NREAD NREFINE NRLSUM NROPT NROTAT NRRANG NSCALE NSEL NSLA NSLE NSLK NSLL NSLV NSOL NSORT NSTORE NSUBST NSVR NSYM NUMCMP NUMEXP NUMMRG NUMOFF NUMSTR NUMVAR NUSORT NWPAVE NWPLAN NWRITE OMEGA OPADD OPANL OPCLR OPDATA OPDEL OPEQN OPERATE OPEXE OPFACT OPFRST OPGRAD OPKEEP OPLFA OPLGR OPLIST OPLOOP OPLSW OPMAKE OPNCONTROL OPPRNT OPRAND OPRESU OPRFA OPRGR OPRSW OPSAVE OPSEL OPSUBP OPSWEEP OPTYPE OPUSER OPVAR OUTOPT OUTPR OUTRES PADELE PAGET PAPUT PARESU PARRES PARSAV PASAVE PATH PCALC PCIRC PCONV PCORRO PCROSS PDEF PDOT PDRAG PERBC2D PEXCLUDE PFACT PFLUID PGAP PHYSICS PINCLUDE PINSUL PIPE PIVCHECK PLANEWAVE PLCONV PLCPLX PLCRACK PLDISP PLESOL PLETAB PLF2D PLLS PLNSOL PLOT PLOTTING PLPAGM PLPATH PLSECT PLTIME PLTRAC PLVAR PLVAROPT PLVECT PMAP PMETH PMGTRAN PMOPTS POINT POLY POPT PORTOPT POWERH PPATH PPLOT PPRANGE PPRES PRANGE PRCONV PRCPLX PRECISION PRED PRERR PRESOL PRETAB PRI2 PRIM PRINT PRISM PRITER PRNLD PRNSOL PROD PRPATH PRRFOR PRRSOL PRSECT PRSSOL PRTIME PRVAR PRVAROPT PRVECT PSCR PSDCOM PSDFRQ PSDRES PSDSPL PSDUNIT PSDVAL PSDWAV PSEL PSOLVE PSPEC PSPRNG PSTRES PTEMP PTXY PUNIT PVECT QDVAL QFACT QUAD QUOT RACE RALL RAPPND RBE3 RCON RDELE REAL REALVAR RECTNG REDUCE REFLCOEF REORDER RESET RESP RESUME REXPORT RFILSZ RFORCE RIGID RIMPORT RITER RLIST RMEMRY RMODIF RMORE ROCK RPOLY RPR4 RPRISM RPSD RSPEED RSTAT RSYS RTIMST RUN RWFRNT SABS SADD SALLOW SARPLOT SAVE SBCLIST SBCTRAN SDELETE SE SECDATA SECNUM SECOFFSET SECPLOT SECREAD SECTYPE SECWRITE SED SEDLIST SEEXP SELIST SELM SENERGY SEOPT SESYMM SET SETRAN SEXP SF SFA SFACT SFADELE SFALIST SFBEAM SFCALC SFCUM SFDELE SFE SFEDELE SFELIST SFFUN SFGRAD SFL SFLDELE SFLIST SFLLIST SFSCALE SFTRAN SHELL SHPP SLIST SLPPLOT SLSPLOT SMALL SMAX SMBODY SMCONS SMFOR SMIN SMRTSIZE SMSURF SMULT SOLCONTROL SOLU SOLUOPT SOLVE SORT SOURCE SPACE SPARM SPEC SPH4 SPH5 SPHERE SPLINE SPOINT SPOPT SPREAD SPTOPT SQRT SRCS SRSS SSLN SSTIF SSUM STAT STEF STORE SUBOPT SUBSET SUMTYPE SV SVTYP TALLOW TB TBCOPY TBDATA TBDELE TBLE TBLIST TBMODIF TBPLOT TBPT TBTEMP TCHG TEE TERM TIMERANGE TIMINT TIMP TINTP TOFFST TOPDEF TOPEXE TOPITER TORQ2D TORQC2D TORQSUM TORUS TOTAL TRANS TRANSFER TREF TRNOPT TRPDEL TRPLIS TRPOIN TRTIME TSHAP TSRES TUNIF TVAR UIMP UPCOORD UPGEOM USRCAL V VA VADD VALVE VARDEL VARNAM VATT VCLEAR VCROSS VCVFILL VDDAM VDELE VDGL VDOT VDRAG VEXT VGEN VGET VGLUE VIMP VINP VINV VLIST VLSCALE VMESH VOFFST VOLUMES VOVLAP VPLOT VPTN VPUT VROTAT VSBA VSBV VSBW VSEL VSLA VSUM VSWEEP VSYMM VTRAN VTYPE WAVES WERASE WFRONT WMORE WPAVE WPCSYS WPLANE WPOFFS WPROTA WPSTYL WRITE WSORT WSTART XVAR XVAROPT ndnext elnext sin cos tan asin acos atan atan2 sinh cosh tanh sqrt abs sign nint mod log log10 rand gdis lwcase upcase valchr chrval ibset ibclr btest bitand bitor bitxor bitset bitclear seltol arface array table sign thopt arr4 arr5 tab4 tab5 CENTRX CENTRy CENTRz KPNEXT LSNEXT ARNEXT VLNEXT NX NY NZ KX KY KZ LX LY LZ LSX LSY LSZ KP DISTND DISTKP DISTEN ANGLEN ANGLEK NNEAR KNEAR ENEARN AREAND AREAKP ARNODE NORMNX NORMNY NORMNZ NORMKX NORMKY NORMKZ ENEXTN NELEM NODEDOF ELADJ NDFACE NMFACE ARFACE EATT RCON SECTOMAT SECTOREAL ROTX ROTY ROTZ VX VY VZ VOLT MAG AZ VIRTINQR KWGET VALCHR VALOCT VALHEX CHRVAL CHROCT CHRHEX STRSUB STRCAT STRFILL STRCOMP STRLEFT STRPOS STRLENG UPCASE LWCASE JOIN SPLIT COPY bbox dither font cntr date gwin typ2 inum bcdc vect surf body psta view misc dele symbol top bottom NCMLS mxloc mnloc index leg1 leg2 leg3 info frame title minm logo wins wp xs zs ys parm names NOOFFSET clear active wall sum medi mean vari stdv rms lmin lmax STRING DMPOPTION COMBINE RESCOMBINE rescontrol stabilize",
+    "KEYWORDS4": "temp freq flue forc ngen ef js vltg mvdi chrgd fvin fsou dgen pres conv hflux rad rdsf fsi impd chrgs mxwf shld free inf port attn bli fsin fflx selv dflux hgen deg blac mred mage bmage blue cblu cyan gcya gree ygre yell oran red dgra lgra whit heat",
+    "KEYWORDS5": "s r a u all none inve stat volu area line kp elem node eq ne lt gt le ge ablt abgt and or xor num max min masd mind count x y z xy yz zx type name data loc ang attr const ext elem on off cart cylin sphe toro etab live cent ux uy uz bft bin cgs mks mpa si umks yes no rst emat esav mpde mlv ist full rfrq rdsp pcg jcg sparse iccg qmr CNVG last first previous next near EQV user LANB LANPCG SNODE SUBSP UNSYM DAMP QRDAMP VT",
+    "KEYWORDS6": "time",
+    "KEYWORDS7": "*use *ulib",
+    "KEYWORDS8": "",
+}
+
+SYNTAX_OPERATORS_RAW = '- " ( ) , . : ; ? ^ ~ + < > ** ='
+
+SYNTAX_STYLE_COLORS: dict[str, str] = {
+    "DEFAULT": "#C0C0C0",
+    "COMMENTS": "#C0C0C0",
+    "LINE COMMENTS": "#008040",
+    "NUMBERS": "#C0C0C0",
+    "KEYWORDS1": "#FF0000",
+    "KEYWORDS2": "#00FFFF",
+    "KEYWORDS3": "#0080FF",
+    "KEYWORDS4": "#FF8040",
+    "KEYWORDS5": "#FF00FF",
+    "KEYWORDS6": "#FF80FF",
+    "KEYWORDS7": "#8080FF",
+    "KEYWORDS8": "#00FF80",
+    "OPERATORS": "#FF8080",
+    "FOLDER IN CODE1": "#8080FF",
+    "FOLDER IN CODE2": "#8080FF",
+    "FOLDER IN COMMENT": "#000000",
+    "DELIMITERS1": "#0080FF",
+    "DELIMITERS2": "#800040",
+    "DELIMITERS3": "#FF8000",
+    "DELIMITERS4": "#000000",
+    "DELIMITERS5": "#000000",
+    "DELIMITERS6": "#000000",
+    "DELIMITERS7": "#000000",
+    "DELIMITERS8": "#000000",
+}
+
+
+def load_apdl_syntax_styles() -> dict:
+    """回傳語法上色用的資料（內嵌於 SYNTAX_KEYWORDS_RAW／SYNTAX_OPERATORS_RAW／
+    SYNTAX_STYLE_COLORS，不再於執行期讀取外部的 apdl syntax.xml）。
+
+    只取 APDL 實際會用到的部分：Keywords1~8（整字比對、大小寫不分，對應原始
+    UDL 設定裡 udlVersion 的 caseIgnored="yes"）、Operators1（字元/字串比對）、
+    以及對應 WordsStyle 的前景色。不實作 Notepad++ UDL 完整的通用
+    delimiter/folding 引擎（APDL 沒有區塊註解，用不到那套機制）。
+    """
+    keyword_sets = {
+        style_name: {word.lower() for word in raw_text.split()}
+        for style_name, raw_text in SYNTAX_KEYWORDS_RAW.items()
+    }
+    operators = sorted(set(SYNTAX_OPERATORS_RAW.split()), key=len, reverse=True)
+    return {
+        "keyword_sets": keyword_sets,
+        "operators": operators,
+        "colors": dict(SYNTAX_STYLE_COLORS),
+    }
+
+
+def tokenize_apdl_line_for_syntax(line_text: str, styles: dict) -> list[tuple[int, int, str]]:
+    """回傳這一行裡 (start_col, end_col, style_name) 的清單，用於套用語法上色 tag。
+
+    先用 STRING_LITERAL_PATTERN 找出整行裡所有引號字串的範圍（含引號本身）；
+    找行註解（! 到行尾，APDL 沒有區塊註解）時，只認「不在任何引號字串範圍內」
+    的第一個 !，避免 /INPUT,'a!b','txt' 這種引號內剛好出現 ! 的情況被誤判成
+    從引號中間開始變成整段註解。
+
+    註解之前的部分依序比對數字（重用既有 NUMBER_TOKEN_PATTERN）、關鍵字
+    （Keywords1~8，依序比對、取第一個命中的分類）、運算子（Operators1），
+    三者都會先排除掉落在引號字串範圍內的比對結果（引號內的文字不分析語法，
+    例如 *MSG,INFO,'A-B=1!' 裡的 A、B、-、=、1 都不應該被上色）；數字之後的
+    關鍵字／運算子比對，還會排除掉落在「已經比對到的數字」範圍內的結果——
+    像 2.5E+5 這種科學記號數字字面上同時含有字母 E（恰好也是合法的 APDL
+    單字元指令）跟運算子 . /+，如果不排除，會在同一段文字上疊好幾個 tag，
+    最後顯示的顏色就取決於 tag 優先順序而不是「這是一個數字」這個事實。
+    """
+    string_spans = [match.span() for match in STRING_LITERAL_PATTERN.finditer(line_text)]
+
+    def inside_any_string(index: int) -> bool:
+        return any(start <= index < end for start, end in string_spans)
+
+    def overlaps_any_span(start: int, end: int, candidate_spans: list[tuple[int, int]]) -> bool:
+        return any(start < span_end and end > span_start for span_start, span_end in candidate_spans)
+
+    comment_index = -1
+    search_from = 0
+    while True:
+        idx = line_text.find("!", search_from)
+        if idx == -1:
+            break
+        if not inside_any_string(idx):
+            comment_index = idx
+            break
+        search_from = idx + 1
+
+    code_part_end = comment_index if comment_index != -1 else len(line_text)
+    spans: list[tuple[int, int, str]] = []
+
+    if comment_index != -1:
+        spans.append((comment_index, len(line_text), SYNTAX_LINE_COMMENT_STYLE))
+
+    code_text = line_text[:code_part_end]
+    code_string_spans = [(start, end) for start, end in string_spans if start < code_part_end]
+
+    number_spans: list[tuple[int, int]] = []
+    for match in NUMBER_TOKEN_PATTERN.finditer(code_text):
+        if overlaps_any_span(match.start(), match.end(), code_string_spans):
+            continue
+        # 排除「黏在字母後面的數字」（如 /prep7、post26 結尾的 7、26），那些是
+        # 指令名稱的一部分，應該整個被 Keywords 上色、不應該再被標成數字。
+        preceding_char = code_text[match.start() - 1] if match.start() > 0 else ""
+        if preceding_char.isalpha() or preceding_char == "_":
+            continue
+        number_spans.append((match.start(), match.end()))
+        spans.append((match.start(), match.end(), SYNTAX_NUMBER_STYLE))
+
+    keyword_sets = styles["keyword_sets"]
+    for match in SYNTAX_TOKEN_PATTERN.finditer(code_text):
+        if overlaps_any_span(match.start(), match.end(), code_string_spans) or overlaps_any_span(
+            match.start(), match.end(), number_spans
+        ):
+            continue
+        word_lower = match.group(0).lower()
+        for style_name in SYNTAX_KEYWORD_STYLE_NAMES:
+            if word_lower in keyword_sets[style_name]:
+                spans.append((match.start(), match.end(), style_name))
+                break
+
+    for operator in styles["operators"]:
+        start = 0
+        while True:
+            idx = code_text.find(operator, start)
+            if idx == -1:
+                break
+            end = idx + len(operator)
+            if not overlaps_any_span(idx, end, code_string_spans) and not overlaps_any_span(
+                idx, end, number_spans
+            ):
+                spans.append((idx, end, SYNTAX_OPERATOR_STYLE))
+            start = end
+
+    return spans
+
+
+# ── 安全讀寫 APDL 檔案（備份＋原子寫入＋外部修改偵測）────────────────────────
+class ExternalChangeError(Exception):
+    """存檔前發現磁碟上的檔案已經被其他程式改過。"""
+
+
+@dataclass(frozen=True)
+class FileStamp:
+    """用來偵測檔案是否被外部程式改過的指紋（mtime + 檔案大小）。"""
+
+    modified_ns: int
+    size_bytes: int
+
+
+def file_stamp(path: Path) -> FileStamp:
+    """回傳檔案目前的指紋。"""
+    stat_result = path.stat()
+    return FileStamp(stat_result.st_mtime_ns, stat_result.st_size)
+
+
+LONE_CR_PATTERN = re.compile(r"\r(?!\n)")
+
+
+def read_apdl_text(path: Path) -> tuple[str, FileStamp]:
+    """讀取 APDL input file，回傳 (文字內容, 檔案指紋)。
+
+    刻意用 read_bytes()+decode() 而不是 Path.read_text()：後者是文字模式開檔，
+    在 Windows 上會把 \\r\\n 正規化成 \\n，讀出來的字串就已經遺失原始換行格式，
+    之後不管怎麼存檔都救不回來。容忍（但不保留）UTF-8 BOM；非 UTF-8 時 fail
+    loud，不自動猜編碼轉碼。
+
+    單獨出現、沒有配對 \\n 的 \\r（舊 Mac 式換行，通常是從別處貼上文字不小心
+    夾帶進來的，不是這個工作區會刻意使用的格式）會在這裡就地補成 \\r\\n：
+    Tk 的 Text widget 的行索引（index/line number）只認 \\n 當作換行，不會把
+    單獨的 \\r 當成另一行，但畫面上的文字排版引擎（尤其 Windows）卻會把它當成
+    視覺上的斷行，導致使用者在 GUI 看到的行數跟 Tk 內部、跟 Notepad 開到的行數
+    三方對不上。單獨 \\r 補成 \\r\\n 不會增加或減少「換行事件」的數量，只是把
+    本來就代表斷行的字元换成這份檔案裡本來就通用的 \\r\\n 寫法，讓三邊一致。
+    """
+    raw_bytes = path.read_bytes()
+    has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
+    try:
+        text = raw_bytes.decode("utf-8-sig" if has_bom else "utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"「{path.name}」不是 UTF-8 編碼，為避免誤寫入，不會自動轉碼。") from exc
+    text = LONE_CR_PATTERN.sub("\r\n", text)
+    return text, file_stamp(path)
+
+
+def write_apdl_text(
+    path: Path,
+    text: str,
+    expected_stamp: FileStamp | None = None,
+    overwrite_external_change: bool = False,
+) -> FileStamp:
+    """原子寫入 APDL input file（UTF-8 without BOM，保留 text 裡原有的換行字元)。
+
+    存檔前若 expected_stamp 跟磁碟目前指紋不一致（代表檔案被其他程式改過），
+    且 overwrite_external_change 不是 True，就丟 ExternalChangeError、不寫入。
+    寫入本身先寫到同目錄的暫存檔、flush+fsync、再 os.replace() 原子取代，
+    避免寫到一半被中斷時損壞原始檔案。
+    """
+    if path.exists() and expected_stamp is not None:
+        current_stamp = file_stamp(path)
+        if current_stamp != expected_stamp and not overwrite_external_change:
+            raise ExternalChangeError(f"檔案已由其他程式修改：{path.name}")
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=str(path.parent),
+            prefix=f".{path.name}_",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(text)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(str(temp_path), str(path))
+    except OSError:
+        if temp_path is not None and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
+        raise
+
+    return file_stamp(path)
+
+
+def backup_original_file_once(path: Path) -> Path | None:
+    """第一次寫入某個檔案前備份一份 .bak，回傳新建立的備份路徑（已存在則回傳 None）。
+
+    用「磁碟上是否已經有 .bak」判斷要不要備份，不是看記憶體裡的旗標：不然
+    重開一次工具、對同一個檔案做第一次編輯，就會用「已經被改過一次」的內容
+    覆蓋掉原本保護真正原始內容的備份。
+    """
+    backup_path = path.with_name(path.name + ".bak")
+    if backup_path.is_file():
+        return None
+    shutil.copy2(path, backup_path)
+    return backup_path
+
+
+# ── GUI ───────────────────────────────────────────────────────────────────
+# 變數設定表欄位對齊：表頭跟每一列各自是獨立的 Frame，欄寬如果各自依文字
+# 字元數換算（舊作法），Label/Entry/Checkbutton 預設的 bd/highlightthickness
+# 不同，字元寬度換算成像素後會對不齊；改成所有欄位共用同一份像素寬度／伸縮
+# 權重規格（COLUMN_SPECS），表頭跟每一列都呼叫 configure_table_columns()
+# 套用同一份 grid_columnconfigure(minsize=..., weight=...)，欄寬在任何視窗
+# 寬度下都保持一致（作法參考
+# 010_vendor_refs/015_python/table_alignment_demo.pyw）。
+@dataclass(frozen=True)
+class ColumnSpec:
+    """描述變數設定表一個欄位的識別名稱、標題、最小像素寬度與伸縮權重。"""
+
+    key: str
+    title: str
+    min_width_px: int
+    weight: int = 0
+
+
+TABLE_CELL_PAD_X = 2
+TABLE_CELL_PAD_Y = 1
+
+# 自動 fit 欄寬時，量到的文字像素寬度之外再加這麼多像素（caret、邊框、跟旁邊
+# 欄位的視覺間隔），避免量出來的寬度剛好貼著文字邊緣。
+AUTOFIT_EXTRA_PADDING_PX = 16
+
+COLUMN_SPECS: tuple[ColumnSpec, ...] = (
+    ColumnSpec("active", "Active", 56),
+    ColumnSpec("label", "Label", 90, weight=1),
+    ColumnSpec("low", "low", 80),
+    ColumnSpec("nominal", "Nominal", 80),
+    ColumnSpec("upper", "Upper", 80),
+    ColumnSpec("spacing", "Spacing", 80),
+    ColumnSpec("manual", "Manual Values", 170, weight=2),
+    ColumnSpec("tolerance", "容差(數值/%)", 110),
+    ColumnSpec("decimal_places", "小數位數", 70),
+    ColumnSpec("status", "狀態", 64),
+    ColumnSpec("action", "", 64),
+)
+
+# 自動 fit 時不依內容量測寬度的欄位：Active 只是個勾選框、Action 只是固定
+# 文字的「移除」按鈕，兩者都沒有會隨資料變動的顯示內容，維持 COLUMN_SPECS
+# 原本定義的最小寬度即可。
+AUTOFIT_STATIC_COLUMN_KEYS = frozenset({"active", "action"})
+
+COLUMN_INDEX_BY_KEY: dict[str, int] = {
+    spec.key: index for index, spec in enumerate(COLUMN_SPECS)
+}
+
+# 變數設定表方向鍵導覽：只有文字輸入欄位參與（跳過 Active 勾選框、唯讀的 Nominal、
+# 狀態欄、移除按鈕），順序即視覺上的左到右順序。小數位數欄是 ttk.Spinbox，Tk 原生就用
+# 上下鍵增減數值，若也綁成跨列導覽會蓋掉這個既有功能，所以上下鍵導覽特意排除它
+# （左右鍵導覽仍包含，游標在文字端點時一樣能跳進/跳出這一欄）。
+VARIABLE_ROW_NAV_KEYS: tuple[str, ...] = (
+    "label", "low", "upper", "spacing", "manual", "tolerance", "decimal_places"
+)
+VARIABLE_ROW_VERTICAL_NAV_KEYS: tuple[str, ...] = VARIABLE_ROW_NAV_KEYS[:-1]
+
+
+def configure_table_columns(
+    container: tk.Widget,
+    min_width_by_key: dict[str, int] | None = None,
+    column_specs: tuple[ColumnSpec, ...] = COLUMN_SPECS,
+) -> None:
+    """把 column_specs 的像素欄寬／伸縮權重套用到表頭或任一列的容器。
+
+    column_specs 預設是變數設定表用的 COLUMN_SPECS；組合對照表的欄位是動態的
+    （資料夾欄 + 每個 active 變數各一欄），呼叫端可以傳自己那份 ColumnSpec
+    tuple 進來，共用同一套套用邏輯。
+
+    min_width_by_key 非 None 時，各欄改用這份字典提供的寬度（由
+    _autofit_table_columns 依目前所有列的實際內容量測出來），取代
+    column_specs 裡寫死的靜態 min_width_px；字典裡沒有的 key 仍用
+    column_specs 的原始值。
+    """
+    for column_index, spec in enumerate(column_specs):
+        min_width_px = (
+            min_width_by_key.get(spec.key, spec.min_width_px)
+            if min_width_by_key is not None
+            else spec.min_width_px
+        )
+        container.grid_columnconfigure(
+            column_index, minsize=min_width_px, weight=spec.weight
+        )
+
+
+class VariableRowState:
+    """變數設定表的一列：Tk 變數 + 對應 widget，不含業務邏輯。"""
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        on_remove: Callable[["VariableRowState"], None],
+        on_navigate: Callable[["VariableRowState", str, str], None],
+        varname: str = "",
+        nominal_value: float | str | None = None,
+        label: str = "",
+        kind: str = VARIABLE_KIND_NAMED,
+        start_mark: str | None = None,
+        end_mark: str | None = None,
+        original_text: str | None = None,
+        value_type: str = VALUE_TYPE_NUMERIC,
+    ) -> None:
+        self.on_remove = on_remove
+        self.on_navigate = on_navigate
+        self.nominal_value = nominal_value
+        self.kind = kind
+        self.value_type = value_type
+        self.start_mark = start_mark
+        self.end_mark = end_mark
+        self.original_text = original_text
+        self.text_tag_name: str | None = None
+        self.invalid = False
+
+        # 不再用下拉選單；點進哪一組欄位就自動切換成那個模式。字串類型沒有
+        # Range 這個概念，預設直接從 Manual 開始，不要停在用不到的 Range。
+        self.mode = MODE_MANUAL if value_type == VALUE_TYPE_STRING else MODE_RANGE
+
+        self.active_var = tk.BooleanVar(value=False)
+        self.label_var = tk.StringVar(value=label)
+        self.varname_var = tk.StringVar(value=varname)
+        self.lower_var = tk.StringVar(value="")
+        self.upper_var = tk.StringVar(value="")
+        self.spacing_var = tk.StringVar(value="")
+        self.manual_values_var = tk.StringVar(value="")
+
+        if nominal_value is None:
+            nominal_text = ""
+        elif isinstance(nominal_value, str):
+            nominal_text = nominal_value
+        else:
+            nominal_text = format_value(nominal_value)
+
+        # 每一列都是獨立的 Frame，套用跟表頭同一份 COLUMN_SPECS 像素欄寬規格
+        # （configure_table_columns），再用 pack 疊進 table_body；欄位對齊
+        # 完全由 grid_columnconfigure(minsize=...) 決定，不用再靠 bd/
+        # highlightthickness 手動湊齊不同 widget 類型的邊框厚度差異。
+        self.frame = tk.Frame(parent, bg=BG2)
+        self.frame.pack(fill="x", expand=True)
+        configure_table_columns(self.frame)
+
+        self.widgets: list[tk.Widget] = []
+
+        def add(key: str, widget: tk.Widget) -> None:
+            widget.grid(
+                row=0,
+                column=COLUMN_INDEX_BY_KEY[key],
+                sticky="nsew",
+                padx=TABLE_CELL_PAD_X,
+                pady=TABLE_CELL_PAD_Y,
+            )
+            self.widgets.append(widget)
+
+        # 輸入元件一律設 width=1：字元寬度不再負責決定欄寬（那是 COLUMN_SPECS
+        # 的工作），只是避免 Entry/Spinbox 自己的最小字元寬度把 Grid 欄位撐大。
+        add(
+            "active",
+            tk.Checkbutton(self.frame, variable=self.active_var, bg=BG2, bd=1, highlightthickness=0),
+        )
+        add(
+            "label",
+            tk.Entry(self.frame, textvariable=self.label_var, width=1, bd=1, highlightthickness=0),
+        )
+
+        self.lower_entry = tk.Entry(
+            self.frame, textvariable=self.lower_var, width=1, bd=1, highlightthickness=0
+        )
+        add("low", self.lower_entry)
+        # 用 Entry(state="readonly") 而不是 Label：Label 顯示的文字無法被滑鼠選取/
+        # Ctrl+C 複製，readonly 的 Entry 仍可選取、複製，但一樣不能被使用者編輯。
+        self.nominal_var = tk.StringVar(value=nominal_text)
+        nominal_entry = tk.Entry(
+            self.frame,
+            textvariable=self.nominal_var,
+            width=1,
+            state="readonly",
+            readonlybackground=BG2,
+            fg=FG,
+            bd=1,
+            highlightthickness=0,
+        )
+        add("nominal", nominal_entry)
+        self.upper_entry = tk.Entry(
+            self.frame, textvariable=self.upper_var, width=1, bd=1, highlightthickness=0
+        )
+        add("upper", self.upper_entry)
+        self.spacing_entry = tk.Entry(
+            self.frame, textvariable=self.spacing_var, width=1, bd=1, highlightthickness=0
+        )
+        add("spacing", self.spacing_entry)
+        self.manual_entry = tk.Entry(
+            self.frame, textvariable=self.manual_values_var, width=1, bd=1, highlightthickness=0
+        )
+        add("manual", self.manual_entry)
+
+        # 容差欄位：輸入一個數值（絕對差）或百分比（結尾加 %），按 Enter 或移開焦點
+        # 時依 Nominal 換算出 low/upper，同時寫進 Manual Values（見 _apply_tolerance）——
+        # 不會自動切換 Range/Manual 模式，使用者仍照原來的方式點進其中一組欄位決定要用哪個。
+        self.tolerance_var = tk.StringVar(value="")
+        self.tolerance_entry = tk.Entry(
+            self.frame, textvariable=self.tolerance_var, width=1, bd=1, highlightthickness=0
+        )
+        add("tolerance", self.tolerance_entry)
+        self.tolerance_entry.bind("<Return>", self._apply_tolerance)
+        self.tolerance_entry.bind("<FocusOut>", self._apply_tolerance)
+
+        # 小數位數：使用者用 Spinbox 自帶的上下箭頭按鈕手動增減輸出要顯示幾位小數
+        # （見 _read_decimal_places／format_value_for_config）。預設值取 Nominal
+        # 原始文字的小數位數當初始建議值，字串類型沒有小數位數的概念所以直接鎖住。
+        self.decimal_places_var = tk.IntVar(value=count_decimal_places(nominal_text))
+        self.decimal_places_spinbox = ttk.Spinbox(
+            self.frame, from_=0, to=12, width=1, textvariable=self.decimal_places_var, justify="center"
+        )
+        if value_type == VALUE_TYPE_STRING:
+            self.decimal_places_spinbox.configure(state="disabled")
+        add("decimal_places", self.decimal_places_spinbox)
+
+        self.status_label = tk.Label(
+            self.frame, text="", bg=BG2, fg=FG, width=1, anchor="w", bd=1, highlightthickness=0
+        )
+        add("status", self.status_label)
+
+        remove_button = ttk.Button(
+            self.frame, text="移除", width=1, command=lambda: self.on_remove(self)
+        )
+        add("action", remove_button)
+
+        for range_entry in (self.lower_entry, self.upper_entry, self.spacing_entry):
+            range_entry.bind("<FocusIn>", lambda _event: self._switch_mode(MODE_RANGE))
+        self.manual_entry.bind("<FocusIn>", lambda _event: self._switch_mode(MODE_MANUAL))
+        # Active 勾選或任一水準欄位文字變動時，即時重新判斷要不要套用
+        # BLANK_FIELD_BG 提醒色（見 _sync_mode_state），不用等使用者切欄位
+        # 或按預覽才看得出哪裡還沒填。
+        self.active_var.trace_add("write", self._sync_mode_state)
+        for level_var in (self.lower_var, self.upper_var, self.spacing_var, self.manual_values_var):
+            level_var.trace_add("write", self._sync_mode_state)
+        self._sync_mode_state()
+        self._bind_navigation()
+
+    def _bind_navigation(self) -> None:
+        """幫文字輸入欄位（VARIABLE_ROW_NAV_KEYS）綁方向鍵：左右鍵只有游標已經在欄位
+        文字最前/最後端時才跳欄位，其餘情況讓 Tk 預設的欄位內游標移動照常執行；上下鍵
+        （VARIABLE_ROW_VERTICAL_NAV_KEYS，排除小數位數欄）直接跳同一欄的上一列/下一列。
+        實際跳去哪裡由 DoeApp 透過 on_navigate callback 決定（這一列不持有整張表的參照）。
+        """
+        for key in VARIABLE_ROW_NAV_KEYS:
+            widget = self.widgets[COLUMN_INDEX_BY_KEY[key]]
+            widget.bind("<Left>", lambda event, k=key: self._handle_horizontal_nav(event.widget, k, -1))
+            widget.bind("<Right>", lambda event, k=key: self._handle_horizontal_nav(event.widget, k, 1))
+        for key in VARIABLE_ROW_VERTICAL_NAV_KEYS:
+            widget = self.widgets[COLUMN_INDEX_BY_KEY[key]]
+            widget.bind("<Up>", lambda _event, k=key: self._handle_vertical_nav(k, -1))
+            widget.bind("<Down>", lambda _event, k=key: self._handle_vertical_nav(k, 1))
+
+    def _handle_horizontal_nav(self, widget: tk.Widget, key: str, delta: int) -> str | None:
+        text = widget.get()
+        cursor = widget.index("insert")
+        at_boundary = cursor == 0 if delta < 0 else cursor == len(text)
+        if not at_boundary:
+            return None
+        self.on_navigate(self, key, "left" if delta < 0 else "right")
+        return "break"
+
+    def _handle_vertical_nav(self, key: str, delta: int) -> str:
+        self.on_navigate(self, key, "up" if delta < 0 else "down")
+        return "break"
+
+    def _apply_tolerance(self, _event: tk.Event | None = None) -> None:
+        """依容差欄位（數值或百分比，見 compute_tolerance_bounds）算出 low/upper，
+        同時把 (low, Nominal, upper) 三點寫進 Manual Values，讓 Range／Manual
+        兩種模式都有現成可用的值可以直接用，使用者只要點進其中一組欄位
+        （既有的 FocusIn 行為）就能決定實際採用哪一種。
+
+        文字類型變數（value_type == string）沒有數值容差的概念，直接提示錯誤。
+        容差欄位空白時什麼都不做（讓使用者可以安心把欄位留空、不會被強制填入）。
+        """
+        tolerance_text = self.tolerance_var.get()
+        if not tolerance_text.strip():
+            return
+
+        if self.value_type == VALUE_TYPE_STRING:
+            messagebox.showerror(
+                "容差換算失敗",
+                "文字類型的變數（Manual 候選字串）沒有數值容差概念，"
+                "請直接在 Manual Values 欄位填入候選字串。",
+            )
+            return
+
+        try:
+            nominal_value = float(self.nominal_var.get())
+        except ValueError:
+            messagebox.showerror(
+                "容差換算失敗",
+                f"變數「{self.label_var.get() or self.varname_var.get()}」"
+                "沒有可用的 Nominal 數值，無法套用容差換算。",
+            )
+            return
+
+        try:
+            low, upper = compute_tolerance_bounds(nominal_value, tolerance_text)
+        except ValueError as exc:
+            messagebox.showerror("容差換算失敗", str(exc))
+            return
+
+        # low/upper 現在是用 Decimal 精確運算算出來的乾淨值（見 compute_tolerance_
+        # bounds），repr() 會給出剛好能還原該值的最短十進位字串，位數就是這組換算
+        # 結果本身真正需要的位數（不是使用者打了幾位去猜）。小數位數欄位（Spinbox）
+        # 只「提高」不「降低」：如果使用者已經手動調高過，套用容差不會把它蓋低；
+        # 但換算結果需要比目前設定更多位數才能看出差異時（例如 Nominal=0.1、
+        # 容差 10% 需要 2 位才能看出 0.09/0.11），會自動補上，之後仍可用 Spinbox
+        # 按鈕再調整。
+        needed_decimal_places = max(
+            count_decimal_places(repr(low)),
+            count_decimal_places(repr(upper)),
+            count_decimal_places(self.nominal_var.get()),
+        )
+        try:
+            current_decimal_places = self.decimal_places_var.get()
+        except tk.TclError:
+            current_decimal_places = 0
+        decimal_places = max(current_decimal_places, needed_decimal_places)
+        self.decimal_places_var.set(decimal_places)
+
+        low_text = format_value(low, decimal_places)
+        upper_text = format_value(upper, decimal_places)
+        nominal_text = format_value(nominal_value, decimal_places)
+        self.lower_var.set(low_text)
+        self.upper_var.set(upper_text)
+        self.manual_values_var.set(f"{low_text},{nominal_text},{upper_text}")
+
+    def _switch_mode(self, mode: str) -> None:
+        """使用者點進 Range 或 Manual 其中一組欄位時，自動切到那個模式。
+
+        欄位本身一律保持 state="normal"（不用 disabled/readonly），只靠背景
+        顏色標示目前哪一組是有效的——因為 Tk 的 disabled/readonly 欄位點擊後
+        無法再拿回焦點，會讓使用者卡住、切不回另一組欄位；維持 normal 則點哪組
+        就立刻切到那組，體驗上等同「選了一種方式、另一種就不會被用到」，
+        resolve_variable_levels 也只會依 self.mode 讀取其中一組欄位的值。
+        """
+        if self.mode == mode:
+            return
+        self.mode = mode
+        self._sync_mode_state()
+
+    def _sync_mode_state(self, *_trace_args) -> None:
+        """依目前模式用背景色標示 Range / Manual 哪一組欄位目前有效，並對
+        Active 變數裡「目前有效那組、但還是空白」的欄位改用 BLANK_FIELD_BG
+        提醒使用者「產生」前記得補上——判斷邏輯跟 variable_has_blank_level_
+        input／resolve_variable_levels 的 allow_blank 一致，只是這裡即時依
+        畫面文字判斷，不用等收集成 VariableConfig 之後才知道。非目前模式的
+        欄位（不會被拿去解析）或 Active 未勾選的列，一律不套用提醒色。
+
+        掛在 active_var／lower_var／upper_var／spacing_var／manual_values_var
+        的 trace 上，使用者打字或勾/取消 Active 時都會即時重新上色，*_trace_args
+        吃掉 Tk trace 回呼固定會帶的 (name, index, mode) 三個參數。
+        """
+        is_range = self.mode == MODE_RANGE
+        is_active = self.active_var.get()
+
+        def field_bg(is_current_mode: bool, text: str) -> str:
+            if not is_current_mode:
+                return INACTIVE_FIELD_BG
+            if is_active and not text.strip():
+                return BLANK_FIELD_BG
+            return BG2
+
+        self.lower_entry.configure(bg=field_bg(is_range, self.lower_var.get()))
+        self.upper_entry.configure(bg=field_bg(is_range, self.upper_var.get()))
+        self.spacing_entry.configure(bg=field_bg(is_range, self.spacing_var.get()))
+        self.manual_entry.configure(bg=field_bg(not is_range, self.manual_values_var.get()))
+
+    def set_invalid(self, invalid: bool) -> None:
+        """更新「狀態」欄位的失效提示（marks 指到的文字跟 original_text 對不上，
+        或 reload 後找不到位置可以重掛 marks）。"""
+        self.invalid = invalid
+        self.status_label.configure(
+            text="失效" if invalid else "", fg="#b91c1c" if invalid else FG
+        )
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+    def _read_decimal_places(self) -> int:
+        """讀取使用者在「小數位數」Spinbox 設定的值。
+
+        非法輸入（例如手動把文字框清空或打入非整數文字）或負數都 fail loud，
+        不要悄悄當成 0——使用者在畫面上看到的位數應該跟實際拿去格式化輸出的
+        位數一致，不應該出現「畫面寫 3，實際輸出卻是 0」這種不同步。
+        """
+        try:
+            value = self.decimal_places_var.get()
+        except tk.TclError:
+            raise ValueError(
+                f"變數「{self.label_var.get() or self.varname_var.get()}」"
+                "的小數位數欄位不是合法整數"
+            )
+        if value < 0:
+            raise ValueError(
+                f"變數「{self.label_var.get() or self.varname_var.get()}」的小數位數不能是負數"
+            )
+        return value
+
+    def to_config(self) -> VariableConfig:
+        """回傳純資料快照；position-kind 的 start_offset/end_offset 這裡先留 None，
+        由 DoeApp._collect_active_configs() 現場用 marks 換算出目前的絕對位移再補上
+        （VariableRowState 本身不持有 template_text widget 的參照）。"""
+        return VariableConfig(
+            label=self.label_var.get(),
+            varname=self.varname_var.get(),
+            kind=self.kind,
+            mode=self.mode,
+            lower_text=self.lower_var.get(),
+            upper_text=self.upper_var.get(),
+            spacing_text=self.spacing_var.get(),
+            manual_values_text=self.manual_values_var.get(),
+            original_text=self.original_text,
+            value_type=self.value_type,
+            decimal_places=self._read_decimal_places(),
+            nominal_text=self.nominal_var.get(),
+        )
+
+
+def build_combination_column_specs(header: list[str]) -> tuple[ColumnSpec, ...]:
+    """依 header（["資料夾"] + 每個變數的 display_name）動態組出組合對照表的
+    欄位規格：資料夾欄固定寬度、不伸縮；每個數值欄用 index 當 key（不是
+    display_name，避免 position-kind 標記萬一同名時互相混淆），weight=1
+    平均分配剩餘空間。
+    """
+    specs = [ColumnSpec("folder", header[0], 110)]
+    for index, title in enumerate(header[1:]):
+        specs.append(ColumnSpec(f"value_{index}", title, 100, weight=1))
+    return tuple(specs)
+
+
+def parse_edited_value_text(text: str, config: VariableConfig) -> float | str:
+    """把組合對照表裡使用者編輯過的文字轉成可以丟進 render_run_text／
+    format_value_for_config 的型別：字串類型原樣使用；數值類型要能轉成
+    float，fail loud 並點名是哪個變數，不讓非法輸入悄悄變成 0 或被忽略。
+    """
+    if config.value_type == VALUE_TYPE_STRING:
+        return text
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"變數「{config.display_name}」編輯後的數值「{text}」不是合法數字")
+    if not math.isfinite(value):
+        raise ValueError(
+            f"變數「{config.display_name}」編輯後的數值「{text}」不是合法的 DOE 數值"
+            "（nan/inf 無法寫入 APDL input file）"
+        )
+    return value
+
+
+class CombinationRowState:
+    """組合對照表的一列：資料夾名稱 + 每個 active 變數的數值，皆為可編輯的
+    Entry。用 index（不是變數的 display_name）對應每個數值欄，避免 position
+    -kind 標記萬一同名時互相混淆。
+
+    original_folder_name／original_value_texts 是「上次成功套用／產生時」的
+    快照，供 on_apply_combination_table_changes 比對目前 Entry 文字跟這份
+    快照，判斷使用者實際改過哪些欄位。
+
+    blank_column_flags：跟 value_texts 等長，True 表示這一欄對應的變數在
+    「變數設定表」裡還沒填 Range/Manual、這次只是用 Nominal 墊檔（見
+    DoeApp.on_preview_combinations 的 allow_blank 預覽），該欄的 Entry 用
+    BLANK_FIELD_BG 上色提醒，不是使用者真的已經決定要用的值。
+    """
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        column_specs: tuple[ColumnSpec, ...],
+        folder_name: str,
+        value_texts: list[str],
+        on_navigate: Callable[["CombinationRowState", int, str], None],
+        blank_column_flags: list[bool] | None = None,
+    ) -> None:
+        self.original_folder_name = folder_name
+        self.original_value_texts = list(value_texts)
+        self.on_navigate = on_navigate
+
+        self.frame = tk.Frame(parent, bg=BG2)
+        self.frame.pack(fill="x", expand=True)
+        configure_table_columns(self.frame, column_specs=column_specs)
+
+        self.widgets: list[tk.Widget] = []
+
+        self.folder_var = tk.StringVar(value=folder_name)
+        self.folder_entry = tk.Entry(
+            self.frame, textvariable=self.folder_var, width=1, bd=1, highlightthickness=0
+        )
+        self._place_widget(self.folder_entry, 0)
+
+        blank_column_flags = blank_column_flags or [False] * len(value_texts)
+        self.value_vars: list[tk.StringVar] = []
+        for index, text in enumerate(value_texts):
+            value_var = tk.StringVar(value=text)
+            entry = tk.Entry(
+                self.frame,
+                textvariable=value_var,
+                width=1,
+                bd=1,
+                highlightthickness=0,
+                bg=BLANK_FIELD_BG if blank_column_flags[index] else BG2,
+            )
+            self._place_widget(entry, index + 1)
+            self.value_vars.append(value_var)
+
+        self._bind_navigation()
+
+    def _place_widget(self, widget: tk.Widget, column_index: int) -> None:
+        widget.grid(
+            row=0,
+            column=column_index,
+            sticky="nsew",
+            padx=TABLE_CELL_PAD_X,
+            pady=TABLE_CELL_PAD_Y,
+        )
+        self.widgets.append(widget)
+
+    def _bind_navigation(self) -> None:
+        """組合對照表每一欄都是可編輯 Entry（沒有變數設定表那種 Spinbox 例外），
+        四個方向鍵全部參與導覽；左右鍵一樣只在游標位於文字端點時才跳欄位。"""
+        for index, widget in enumerate(self.widgets):
+            widget.bind("<Left>", lambda event, i=index: self._handle_horizontal_nav(event.widget, i, -1))
+            widget.bind("<Right>", lambda event, i=index: self._handle_horizontal_nav(event.widget, i, 1))
+            widget.bind("<Up>", lambda _event, i=index: self._handle_vertical_nav(i, -1))
+            widget.bind("<Down>", lambda _event, i=index: self._handle_vertical_nav(i, 1))
+
+    def _handle_horizontal_nav(self, widget: tk.Widget, index: int, delta: int) -> str | None:
+        text = widget.get()
+        cursor = widget.index("insert")
+        at_boundary = cursor == 0 if delta < 0 else cursor == len(text)
+        if not at_boundary:
+            return None
+        self.on_navigate(self, index, "left" if delta < 0 else "right")
+        return "break"
+
+    def _handle_vertical_nav(self, index: int, delta: int) -> str:
+        self.on_navigate(self, index, "up" if delta < 0 else "down")
+        return "break"
+
+    def current_folder_name(self) -> str:
+        return self.folder_var.get().strip()
+
+    def current_value_texts(self) -> list[str]:
+        return [value_var.get() for value_var in self.value_vars]
+
+    def folder_changed(self) -> bool:
+        return self.current_folder_name() != self.original_folder_name
+
+    def value_changed(self) -> bool:
+        return self.current_value_texts() != self.original_value_texts
+
+    def commit(self, folder_name: str, value_texts: list[str]) -> None:
+        """套用成功後更新快照，作為下次比對「有沒有改過」的新基準；不用改動
+        畫面上的文字，因為畫面文字本身就是剛寫入磁碟的那份資料。"""
+        self.original_folder_name = folder_name
+        self.original_value_texts = list(value_texts)
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+class DoeApp:
+    """DOE 變數標記與撒點工具的主視窗。"""
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        root.title("DOE 變數標記與撒點工具")
+        root.configure(bg=BG)
+        root.geometry("1200x980")
+
+        self.template_path_var = tk.StringVar(value="")
+        self.output_dir_var = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
+        # "Leg_" 是優先預設值；下拉選單另外還有代表預設 run_ 編號的 "run_N"，
+        # 以及使用者之前打過的自訂前綴歷史（_run_prefix_history，從磁碟讀回來）。
+        self.run_folder_prefix_var = tk.StringVar(value="Leg_")
+        self._run_prefix_history: list[str] = load_run_prefix_history()
+        self._last_logged_run_prefix: str | None = None
+        # 起始序號：留白＝預設從 1 開始編號（跟原本行為一致），見
+        # resolve_run_start_index／format_run_id。
+        self.run_start_index_var = tk.StringVar(value="")
+        self.preview_text_var = tk.StringVar(value="尚未預覽組合數")
+        self.search_var = tk.StringVar(value="")
+        self.search_status_var = tk.StringVar(value="")
+        self.extra_files_var = tk.StringVar(value=EXTRA_FILES_EMPTY_TEXT)
+        self.ansys_workdir_var = tk.StringVar(value="")
+        self.ansys_jobname_var = tk.StringVar(value="")
+
+        self.extra_file_paths: list[Path] = []
+        self.rows: list[VariableRowState] = []
+        self._next_position_var_number = 1  # 點擊標記變數的流水編號，整個 session 持續累加不重置
+        self._last_table_header: list[str] = []
+        self.combination_rows: list[CombinationRowState] = []
+
+        # 「這一批 run 是不是真的產生在磁碟上」的狀態：on_generate 成功後才會
+        # 設置這三個，on_preview_combinations 只是預覽、沒有實際資料夾，必須
+        # 清成 None，讓 on_apply_combination_table_changes 能判斷目前組合對照表
+        # 是否真的對應磁碟上的資料夾（只預覽過的話，套用變更要 fail loud 擋下）。
+        self._last_generated_output_dir: Path | None = None
+        self._last_generated_template_path: Path | None = None
+        self._last_generated_active_configs: list[VariableConfig] | None = None
+
+        # 範本編輯器狀態：目前檔案指紋（用於存檔時偵測外部修改）、是否有未儲存
+        # 變更、載入/重載期間的旗標（避免 <<Modified>> 把程式自己的灌入動作誤判
+        # 成使用者編輯）、語法上色/失效驗證的 debounce 排程 id、搜尋/F3 導覽用的
+        # 上一次搜尋結果快取。
+        self._current_file_stamp: FileStamp | None = None
+        self._template_dirty = False
+        self._loading_template = False
+        self._template_refresh_after_id: str | None = None
+        self._search_matches: list[tuple[str, str]] = []
+        self._search_match_index: int = -1
+        # 上一次「真的執行過一次搜尋」的條件快照（關鍵字、區分大小寫、全字匹配），
+        # 供「尋找及取代」視窗判斷：使用者按「找下一個」時，是該沿用現有的
+        # _search_matches 繼續前進，還是條件已經變了、必須重新搜尋一次。
+        self._search_signature: tuple[str, bool, bool] | None = None
+        self._find_replace_dialog: tk.Toplevel | None = None
+
+        self._build_layout()
+
+    def _build_layout(self) -> None:
+        pad = {"padx": 10, "pady": 6}
+
+        main_notebook = ttk.Notebook(self.root)
+        main_notebook.pack(fill="both", expand=True)
+        self._main_notebook = main_notebook
+
+        edit_tab = tk.Frame(main_notebook, bg=BG)
+        main_notebook.add(edit_tab, text="範本與變數設定")
+
+        result_tab = tk.Frame(main_notebook, bg=BG)
+        main_notebook.add(result_tab, text="組合對照表與紀錄")
+        self._result_tab = result_tab
+
+        workflow_tab = tk.Frame(main_notebook, bg=BG)
+        main_notebook.add(workflow_tab, text="常用工作流程")
+        self._build_workflow_tab(workflow_tab)
+
+        file_frame = tk.LabelFrame(edit_tab, text="檔案與輸出設定", bg=BG2, fg=FG)
+        file_frame.pack(fill="x", **pad)
+
+        template_row = self._path_row(
+            file_frame, "Input File：", self.template_path_var, self._browse_template
+        )
+        ttk.Button(template_row, text="載入範本內容", command=self.on_load_template).pack(
+            side="left", padx=(8, 0)
+        )
+
+        extra_files_row = tk.Frame(file_frame, bg=BG2)
+        extra_files_row.pack(fill="x", padx=8, pady=4)
+        tk.Label(
+            extra_files_row, text="附加檔案：", bg=BG2, fg=FG, width=14, anchor="w"
+        ).pack(side="left")
+        tk.Label(
+            extra_files_row, textvariable=self.extra_files_var, bg=BG2, fg=FG, anchor="w"
+        ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(
+            extra_files_row, text="選擇附加檔案...", command=self._browse_extra_files
+        ).pack(side="left", padx=(0, 4))
+        ttk.Button(extra_files_row, text="清除附加檔案", command=self._clear_extra_files).pack(
+            side="left"
+        )
+
+        output_row = self._path_row(
+            file_frame, "工作目錄：", self.output_dir_var, self._browse_output_dir
+        )
+        # 資料夾名稱前綴：下拉選單可直接選 "Leg_"（優先預設）或 "run_N"（預設
+        # run_ 編號規則），也可以直接在欄位裡打任意自訂文字。例如輸入 Leg_，
+        # 產生的資料夾會是 Leg_1、Leg_2...，數量達兩位數以上時自動補零成
+        # Leg_01、Leg_02...（跟 run_N 的補零規則共用同一套 format_run_id）。
+        # 使用者自己打過的自訂前綴會記住，下次開這個工具時也會出現在選單裡
+        # （見 _on_run_prefix_committed／load_run_prefix_history）。
+        tk.Label(output_row, text="資料夾名稱前綴：", bg=BG2, fg=FG, anchor="w").pack(
+            side="left", padx=(12, 4)
+        )
+        self.run_prefix_combo = ttk.Combobox(
+            output_row,
+            textvariable=self.run_folder_prefix_var,
+            values=self._run_prefix_combo_values(),
+            width=12,
+        )
+        self.run_prefix_combo.pack(side="left")
+        self.run_prefix_combo.bind("<<ComboboxSelected>>", self._on_run_prefix_committed)
+        self.run_prefix_combo.bind("<Return>", self._on_run_prefix_committed)
+        self.run_prefix_combo.bind("<FocusOut>", self._on_run_prefix_committed)
+
+        # 起始序號：資料夾編號預設從 1 開始累加；留白沿用預設值，輸入數字後
+        # 會從該數字開始編號（例如輸入 5、4 組組合會變成 Leg_5~Leg_8），補零
+        # 寬度依實際會出現的最大編號計算（見 format_run_id）。
+        tk.Label(output_row, text="起始序號：", bg=BG2, fg=FG, anchor="w").pack(
+            side="left", padx=(12, 4)
+        )
+        ttk.Spinbox(
+            output_row,
+            from_=0,
+            to=999999,
+            textvariable=self.run_start_index_var,
+            width=6,
+            justify="center",
+        ).pack(side="left")
+        tk.Label(
+            output_row, text="（留空預設從 1 開始）", bg=BG2, fg="#6b7280", anchor="w"
+        ).pack(side="left", padx=(4, 0))
+
+        # 變數設定表／範本內容上下疊放，中間用 PanedWindow 的拉霸讓使用者自己拖
+        # 調整兩者高度比例；這個分頁不再跟「組合對照表／紀錄」搶空間（那兩個
+        # 移到第二個分頁了），範本內容預設高度給大一點。
+        paned = tk.PanedWindow(
+            edit_tab, orient="vertical", bg=BG, sashwidth=6, sashrelief="raised", bd=0
+        )
+        paned.pack(fill="both", expand=True, padx=10, pady=6)
+
+        table_section = tk.Frame(paned, bg=BG)
+
+        table_title_row = tk.Frame(table_section, bg=BG)
+        table_title_row.pack(fill="x", padx=2, pady=(0, 4))
+        tk.Label(table_title_row, text="變數設定表", bg=BG, fg=FG, anchor="w").pack(
+            side="left"
+        )
+        ttk.Button(
+            table_title_row,
+            text="刪除已產生的資料夾及 input file",
+            command=self.on_delete_generated_runs,
+        ).pack(side="right")
+        ttk.Button(
+            table_title_row, text="產生所有資料夾與 input file", command=self.on_generate
+        ).pack(side="right", padx=(0, 8))
+        tk.Label(table_title_row, textvariable=self.preview_text_var, bg=BG, fg=FG).pack(
+            side="right", padx=(0, 8)
+        )
+        ttk.Button(
+            table_title_row, text="預覽組合數", command=self.on_preview_combinations
+        ).pack(side="right", padx=(0, 8))
+
+        # table_container 改用 grid（而不是 pack）佈局表頭／Canvas／捲軸：表頭與
+        # Canvas 都固定在欄 0，捲軸獨立佔欄 1，兩者的可用寬度才會一致，不會像
+        # pack(fill="x") 時那樣，表頭沒扣掉捲軸寬度、Canvas 卻被捲軸擠掉一塊，
+        # 導致捲軸出現時表頭跟資料列的欄位各自對不齊（作法參考
+        # 010_vendor_refs/015_python/table_alignment_demo.pyw 的 table_shell）。
+        table_container = tk.Frame(table_section, bg=BG2)
+        table_container.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        table_container.grid_rowconfigure(1, weight=1)
+        table_container.grid_columnconfigure(0, weight=1)
+
+        header = tk.Frame(table_container, bg=BG2)
+        header.grid(row=0, column=0, sticky="ew")
+        configure_table_columns(header)
+        self._table_header_frame = header
+        for spec in COLUMN_SPECS:
+            header_label = tk.Label(
+                header,
+                text=spec.title,
+                bg=BG2,
+                fg=FG,
+                width=1,
+                anchor="w",
+                font=("TkDefaultFont", 9, "bold"),
+                bd=1,
+                highlightthickness=0,
+            )
+            header_label.grid(
+                row=0,
+                column=COLUMN_INDEX_BY_KEY[spec.key],
+                sticky="nsew",
+                padx=TABLE_CELL_PAD_X,
+                pady=TABLE_CELL_PAD_Y,
+            )
+            header_label.bind("<MouseWheel>", self._on_table_mousewheel)
+
+        canvas = tk.Canvas(table_container, bg=BG2, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(table_container, orient="vertical", command=canvas.yview)
+        self.table_body = tk.Frame(canvas, bg=BG2)
+        self.table_body.bind(
+            "<Configure>", lambda event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        self._table_body_window_id = canvas.create_window(
+            (0, 0), window=self.table_body, anchor="nw"
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        scrollbar.grid(row=1, column=1, sticky="ns")
+
+        self._table_canvas = canvas
+        # Canvas 的內嵌視窗（table_body）不會自動跟著 Canvas 變寬，Canvas 寬度
+        # 變動時要手動同步，資料列裡有伸縮權重的欄位（Label／Manual Values）
+        # 才能跟固定表頭維持同一份像素寬度（見 _on_table_canvas_configure）。
+        canvas.bind("<Configure>", self._on_table_canvas_configure)
+        # 滾輪捲動變數設定表：游標停在 header/canvas 空白處或 table_body 本身都綁得到；
+        # 但滾輪懸停在「列」裡面的 Entry/Checkbutton/Button 等子 widget 上時，事件只會
+        # 送到那個子 widget（不會自動往上傳給 canvas），所以每新增一列都要在
+        # _add_row 裡逐個 widget 額外綁一次，詳見 _add_row。
+        canvas.bind("<MouseWheel>", self._on_table_mousewheel)
+        header.bind("<MouseWheel>", self._on_table_mousewheel)
+        self.table_body.bind("<MouseWheel>", self._on_table_mousewheel, add="+")
+
+        paned.add(table_section, minsize=120, height=260)
+
+        text_section = tk.Frame(paned, bg=BG)
+
+        tk.Label(
+            text_section,
+            text="範本內容（可自由編輯；一般單擊移動游標，Ctrl+單擊標記 DOE 變數）",
+            bg=BG,
+            fg=FG,
+            anchor="w",
+        ).pack(fill="x", padx=2, pady=(0, 4))
+
+        editor_toolbar_row = tk.Frame(text_section, bg=BG)
+        editor_toolbar_row.pack(fill="x", padx=2, pady=(0, 4))
+        ttk.Button(editor_toolbar_row, text="存檔 (Ctrl+S)", command=self.on_save).pack(side="left")
+        ttk.Button(
+            editor_toolbar_row, text="另存新檔 (Ctrl+Shift+S)", command=self.on_save_as
+        ).pack(side="left", padx=(4, 0))
+        self.word_wrap_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            editor_toolbar_row,
+            text="自動換行",
+            variable=self.word_wrap_var,
+            bg=BG,
+            command=self._on_toggle_word_wrap,
+        ).pack(side="left", padx=(12, 0))
+
+        search_row = tk.Frame(text_section, bg=BG)
+        search_row.pack(fill="x", padx=2, pady=(0, 4))
+        tk.Label(search_row, text="搜尋：", bg=BG, fg=FG).pack(side="left")
+        search_entry = tk.Entry(search_row, textvariable=self.search_var, width=24)
+        search_entry.pack(side="left", padx=(0, 8))
+        search_entry.bind("<Return>", lambda _event: self.on_search_template_text())
+        self._search_entry = search_entry
+        ttk.Button(search_row, text="搜尋 (Ctrl+F)", command=self.on_search_template_text).pack(
+            side="left"
+        )
+        ttk.Button(search_row, text="下一個 (F3)", command=self.on_find_next).pack(
+            side="left", padx=(4, 0)
+        )
+        ttk.Button(search_row, text="上一個 (Shift+F3)", command=self.on_find_previous).pack(
+            side="left", padx=(4, 0)
+        )
+        self.search_case_sensitive_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            search_row,
+            text="區分大小寫",
+            variable=self.search_case_sensitive_var,
+            bg=BG,
+        ).pack(side="left", padx=(12, 0))
+        self.search_whole_word_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            search_row,
+            text="全字匹配",
+            variable=self.search_whole_word_var,
+            bg=BG,
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(search_row, text="取代 (Ctrl+H)", command=self.on_open_find_replace).pack(
+            side="left", padx=(12, 0)
+        )
+        tk.Label(search_row, textvariable=self.search_status_var, bg=BG, fg=FG).pack(
+            side="left", padx=(8, 0)
+        )
+
+        text_frame = tk.Frame(text_section, bg=BG2)
+        text_frame.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self._template_font = tkfont.Font(
+            family=TEMPLATE_FONT_FAMILY, size=TEMPLATE_FONT_SIZE_DEFAULT
+        )
+
+        self.line_numbers = tk.Text(
+            text_frame,
+            height=12,
+            width=4,
+            bg="#eef0f3",
+            fg="#6b7280",
+            wrap="none",
+            state="disabled",
+            takefocus=0,
+            font=self._template_font,
+        )
+        self.template_text = tk.Text(
+            text_frame,
+            height=12,
+            bg="#f8fafc",
+            fg=FG,
+            wrap="none",
+            font=self._template_font,
+            undo=True,
+            autoseparators=True,
+            maxundo=-1,
+        )
+        text_scroll_y = ttk.Scrollbar(text_frame, orient="vertical", command=self._on_text_yview)
+        self._text_scroll_y = text_scroll_y
+        text_scroll_x = ttk.Scrollbar(
+            text_frame, orient="horizontal", command=self.template_text.xview
+        )
+        self.template_text.configure(
+            yscrollcommand=self._on_template_text_scroll, xscrollcommand=text_scroll_x.set
+        )
+        self.line_numbers.grid(row=0, column=0, sticky="ns")
+        self.template_text.grid(row=0, column=1, sticky="nsew")
+        text_scroll_y.grid(row=0, column=2, sticky="ns")
+        text_scroll_x.grid(row=1, column=1, sticky="we")
+        text_frame.grid_rowconfigure(0, weight=1)
+        text_frame.grid_columnconfigure(1, weight=1)
+
+        self.status_bar_var = tk.StringVar(value="尚未載入範本")
+        tk.Label(
+            text_section, textvariable=self.status_bar_var, bg=BG, fg=FG, anchor="w"
+        ).pack(fill="x", padx=2, pady=(4, 0))
+
+        self._syntax_styles = load_apdl_syntax_styles()
+        for style_name, color in self._syntax_styles["colors"].items():
+            self.template_text.tag_config(style_name, foreground=color)
+
+        self.template_text.bind("<Button-1>", self._on_template_text_clear_search_highlight)
+        self.template_text.bind("<Control-Button-1>", self._on_template_text_click)
+        self.template_text.bind("<Control-MouseWheel>", self._on_template_text_zoom)
+        self.line_numbers.bind("<Control-MouseWheel>", self._on_template_text_zoom)
+        self.template_text.bind("<<Modified>>", self._on_template_text_modified)
+        self.template_text.bind("<KeyRelease>", self._update_status_bar)
+        self.template_text.bind("<ButtonRelease-1>", self._update_status_bar)
+        self.template_text.bind("<Control-a>", self._on_select_all)
+        self.template_text.bind("<Control-z>", self._on_undo)
+        self.template_text.bind("<Control-y>", self._on_redo)
+        self.template_text.bind("<Control-0>", lambda _event: self._reset_template_font_size())
+        self.template_text.bind("<F3>", lambda _event: self.on_find_next())
+        self.template_text.bind("<Shift-F3>", lambda _event: self.on_find_previous())
+        self.root.bind("<Control-q>", self._on_toggle_comment_shortcut)
+        self.root.bind("<Control-s>", lambda _event: self.on_save())
+        self.root.bind("<Control-S>", lambda _event: self.on_save_as())
+        self.root.bind("<Control-Shift-S>", lambda _event: self.on_save_as())
+        self.root.bind("<Control-f>", lambda _event: self._focus_search_entry())
+        self.root.bind("<Control-h>", lambda _event: self.on_open_find_replace())
+        self.root.bind("<Control-g>", lambda _event: self.on_goto_line())
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
+
+        paned.add(text_section, minsize=150, height=650)
+
+        bottom_notebook = ttk.Notebook(result_tab)
+        bottom_notebook.pack(fill="both", expand=True, padx=10, pady=6)
+
+        table_tab = tk.Frame(bottom_notebook, bg=BG2)
+        bottom_notebook.add(table_tab, text="組合對照表")
+
+        table_toolbar = tk.Frame(table_tab, bg=BG2)
+        table_toolbar.pack(fill="x", padx=4, pady=4)
+        ttk.Button(
+            table_toolbar, text="複製到剪貼簿", command=self.on_copy_combination_table
+        ).pack(side="left")
+        ttk.Button(
+            table_toolbar,
+            text="依對照表產生資料夾與 input file",
+            command=self.on_generate_from_combination_table,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            table_toolbar, text="修正資料夾及input file", command=self.on_apply_combination_table_changes
+        ).pack(side="left", padx=(8, 0))
+
+        # 組合對照表改成跟變數設定表同一套 Frame+Grid 可編輯表格架構（每格是真的
+        # Entry，見 table_alignment_demo.pyw）：表頭跟 Canvas 同在欄 0、捲軸獨立
+        # 佔欄 1，Canvas <Configure> 同步寬度，欄寬才會跟表頭一致。欄位數量是動態
+        # 的（依目前 active 變數數量），表頭內容在 _refresh_combination_table 裡
+        # 依每次算出來的 header 重建，這裡只先搭好空的殼。
+        combination_table_container = tk.Frame(table_tab, bg=BG2)
+        combination_table_container.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        combination_table_container.grid_rowconfigure(1, weight=1)
+        combination_table_container.grid_columnconfigure(0, weight=1)
+
+        self._combination_header_frame = tk.Frame(combination_table_container, bg=BG2)
+        self._combination_header_frame.grid(row=0, column=0, sticky="ew")
+        self._combination_header_frame.bind(
+            "<MouseWheel>", self._on_combination_table_mousewheel
+        )
+
+        combination_canvas = tk.Canvas(combination_table_container, bg=BG2, highlightthickness=0)
+        combination_scroll_y = ttk.Scrollbar(
+            combination_table_container, orient="vertical", command=combination_canvas.yview
+        )
+        self.combination_body = tk.Frame(combination_canvas, bg=BG2)
+        self.combination_body.bind(
+            "<Configure>",
+            lambda event: combination_canvas.configure(
+                scrollregion=combination_canvas.bbox("all")
+            ),
+        )
+        self._combination_body_window_id = combination_canvas.create_window(
+            (0, 0), window=self.combination_body, anchor="nw"
+        )
+        combination_canvas.configure(yscrollcommand=combination_scroll_y.set)
+        combination_canvas.grid(row=1, column=0, sticky="nsew")
+        combination_scroll_y.grid(row=1, column=1, sticky="ns")
+
+        self._combination_canvas = combination_canvas
+        combination_canvas.bind("<Configure>", self._on_combination_canvas_configure)
+        combination_canvas.bind("<MouseWheel>", self._on_combination_table_mousewheel)
+        self.combination_body.bind(
+            "<MouseWheel>", self._on_combination_table_mousewheel, add="+"
+        )
+
+        log_tab = tk.Frame(bottom_notebook, bg=BG2)
+        bottom_notebook.add(log_tab, text="紀錄")
+
+        log_toolbar = tk.Frame(log_tab, bg=BG2)
+        log_toolbar.pack(fill="x", padx=4, pady=4)
+        ttk.Button(log_toolbar, text="清除", command=self.on_clear_log).pack(side="left")
+
+        log_frame = tk.Frame(log_tab, bg=BG2)
+        log_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.log_text = tk.Text(log_frame, height=8, bg="#f8fafc", fg=FG, wrap="word")
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._bottom_notebook = bottom_notebook
+        self._table_tab = table_tab
+
+    def _build_workflow_tab(self, parent: tk.Widget) -> None:
+        ansys_frame = tk.LabelFrame(parent, text="開啟 ANSYS", bg=BG2, fg=FG)
+        ansys_frame.pack(fill="x", padx=10, pady=6)
+
+        self._path_row(
+            ansys_frame, "工作目錄：", self.ansys_workdir_var, self._browse_ansys_workdir
+        )
+
+        jobname_row = tk.Frame(ansys_frame, bg=BG2)
+        jobname_row.pack(fill="x", padx=8, pady=4)
+        tk.Label(
+            jobname_row, text="Job Name：", bg=BG2, fg=FG, width=14, anchor="w"
+        ).pack(side="left")
+        tk.Entry(jobname_row, textvariable=self.ansys_jobname_var).pack(
+            side="left", fill="x", expand=True, padx=(0, 8)
+        )
+
+        button_row = tk.Frame(ansys_frame, bg=BG2)
+        button_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(button_row, text="開啟 ANSYS", command=self.on_launch_ansys).pack(
+            side="left"
+        )
+
+    def _browse_ansys_workdir(self) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            self.ansys_workdir_var.set(path)
+
+    def on_launch_ansys(self) -> None:
+        if not MAPDL_EXE.is_file():
+            message = f"找不到 ANSYS 執行檔：{MAPDL_EXE}"
+            messagebox.showerror("開啟 ANSYS 失敗", message)
+            self.log(f"注意：{message}")
+            return
+
+        workdir = self.ansys_workdir_var.get().strip()
+        if not workdir or not Path(workdir).is_dir():
+            message = f"找不到工作目錄：{workdir}"
+            messagebox.showerror("開啟 ANSYS 失敗", message)
+            self.log(f"注意：{message}")
+            return
+
+        jobname = self.ansys_jobname_var.get().strip()
+        if not jobname:
+            message = "請輸入 Job Name"
+            messagebox.showerror("開啟 ANSYS 失敗", message)
+            self.log(f"注意：{message}")
+            return
+
+        try:
+            subprocess.Popen(
+                [str(MAPDL_EXE), "-g", "-dir", workdir, "-j", jobname],
+                cwd=str(ANSYS_BIN),
+            )
+        except OSError as exc:
+            message = f"啟動 ANSYS 失敗：{exc}"
+            messagebox.showerror("開啟 ANSYS 失敗", message)
+            self.log(f"注意：{message}")
+            return
+
+        self.log(f"已啟動 ANSYS（工作目錄：{workdir}，Job Name：{jobname}）。")
+
+    def _path_row(
+        self, parent: tk.Widget, label: str, var: tk.StringVar, browse_cmd
+    ) -> tk.Frame:
+        """建立一列「標籤+路徑輸入框+瀏覽按鈕」，回傳該列的 Frame 讓呼叫端可以
+        在「瀏覽...」按鈕右側接著放其他按鈕（同一列並排）。"""
+        row = tk.Frame(parent, bg=BG2)
+        row.pack(fill="x", padx=8, pady=4)
+        tk.Label(row, text=label, bg=BG2, fg=FG, width=14, anchor="w").pack(side="left")
+        tk.Entry(row, textvariable=var).pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(row, text="瀏覽...", command=browse_cmd).pack(side="left")
+        return row
+
+    def _browse_template(self) -> None:
+        """選一個新的 input file 路徑；不在這裡直接載入內容，只更新路徑欄位，
+        實際載入要靠「載入範本內容」按鈕。
+
+        先跳出選檔對話框、拿到使用者真的選好的新路徑後，才檢查目前編輯器裡有沒有
+        未儲存的變更（`_confirm_discard_unsaved_changes`）——不是反過來先確認。
+        如果先確認，使用者只是點「瀏覽...」但隨即取消選檔，也會被迫先回答一次
+        存檔提示，是不必要的打擾；只有在真的要把 `template_path_var` 換成新路徑
+        （這才是會造成影響的那一步）時才需要確認。確認當下 `template_path_var`
+        還是舊路徑，所以使用者選「是」會正確存回原本的檔案、選「否」會把 buffer
+        還原成舊路徑磁碟上的版本（`_confirm_discard_unsaved_changes` 內部處理，
+        兩種情況結束後 buffer／dirty 都已經跟舊路徑同步），之後才安全把
+        `template_path_var` 換成新路徑；不會把舊檔案的編輯內容錯寫進新選的檔案，
+        也不會留下「路徑已經換了、buffer 卻還是舊內容、dirty 還是 True」這種
+        不同步的中間狀態。
+        """
+        path = filedialog.askopenfilename(
+            filetypes=[("APDL / 文字檔", "*.txt;*.inp;*.mac"), ("所有檔案", "*.*")]
+        )
+        if not path:
+            return
+        if not self._confirm_discard_unsaved_changes():
+            return
+        self.template_path_var.set(path)
+
+    def _browse_output_dir(self) -> None:
+        path = filedialog.askdirectory()
+        if path:
+            self.output_dir_var.set(path)
+
+    def _run_prefix_combo_values(self) -> list[str]:
+        """組出資料夾名稱前綴下拉選單目前要顯示的清單：固定的 DEFAULT_RUN_
+        PREFIX_OPTIONS（"Leg_"、"run_N"）排最前面，後面接使用者之前打過、
+        還不在預設清單裡的自訂前綴歷史。"""
+        return list(DEFAULT_RUN_PREFIX_OPTIONS) + [
+            prefix for prefix in self._run_prefix_history if prefix not in DEFAULT_RUN_PREFIX_OPTIONS
+        ]
+
+    def _remember_run_prefix(self, prefix_text: str) -> None:
+        """把使用者剛輸入／選擇的自訂前綴（非下拉選單預設值）記進歷史清單，
+        更新下拉選單內容，並寫回磁碟供下次啟動還原；最新使用的排最前面，
+        超過 MAX_RUN_PREFIX_HISTORY 筆時捨棄最舊的。寫檔失敗（例如檔案被
+        鎖住）只記 log、不中斷使用者目前的操作。"""
+        if prefix_text in DEFAULT_RUN_PREFIX_OPTIONS:
+            return
+        if prefix_text in self._run_prefix_history:
+            self._run_prefix_history.remove(prefix_text)
+        self._run_prefix_history.insert(0, prefix_text)
+        del self._run_prefix_history[MAX_RUN_PREFIX_HISTORY:]
+        self.run_prefix_combo.configure(values=self._run_prefix_combo_values())
+        try:
+            save_run_prefix_history(self._run_prefix_history)
+        except OSError as exc:
+            self.log(f"注意：自訂前綴歷史寫入失敗（不影響目前設定）：{exc}")
+
+    def _on_run_prefix_committed(self, _event: tk.Event) -> None:
+        """切換下拉選單選項、或在欄位裡打完字按 Enter／移開焦點時：在「紀錄」
+        頁寫一行目前生效的前綴，並把非預設的自訂文字記進歷史。文字沒變就不
+        重複記 log（FocusOut 可能在沒有任何變更的情況下被觸發多次）。
+        """
+        raw_text = self.run_folder_prefix_var.get()
+        if raw_text == self._last_logged_run_prefix:
+            return
+        self._last_logged_run_prefix = raw_text
+
+        stripped = raw_text.strip()
+        if not stripped or stripped == RUN_FOLDER_PREFIX_DEFAULT_OPTION:
+            self.log("資料夾名稱前綴已切換為：run_N（預設編號規則）")
+            return
+        self.log(f"資料夾名稱前綴已切換為：{stripped}")
+        self._remember_run_prefix(stripped)
+
+    def _browse_extra_files(self) -> None:
+        """複選要一併複製到每個產生資料夾的附加檔案，可多次選取、自動去重。
+
+        filedialog.askopenfilenames() 在某些 Tcl/Tk 版本下不會回傳 tuple，而是
+        回傳一整串 Tcl list 格式的字串；如果直接 for 迴圈跑過去，Python 會把
+        字串拆成一個一個字元，誤判成好幾十個「檔案」。用 self.root.tk.splitlist()
+        正確解析（不管原本是字串還是 tuple 都能處理），才能拿到真正的檔案路徑。
+        """
+        raw_result = filedialog.askopenfilenames(title="選擇要一併複製到每個資料夾的附加檔案")
+        if not raw_result:
+            return
+        paths = self.root.tk.splitlist(raw_result)
+        existing_keys = {str(p).lower() for p in self.extra_file_paths}
+        for raw_path in paths:
+            path_obj = Path(raw_path)
+            key = str(path_obj).lower()
+            if key not in existing_keys:
+                self.extra_file_paths.append(path_obj)
+                existing_keys.add(key)
+        self._refresh_extra_files_label()
+
+    def _clear_extra_files(self) -> None:
+        self.extra_file_paths = []
+        self._refresh_extra_files_label()
+
+    def _refresh_extra_files_label(self) -> None:
+        if not self.extra_file_paths:
+            self.extra_files_var.set(EXTRA_FILES_EMPTY_TEXT)
+            return
+        names = "、".join(path.name for path in self.extra_file_paths)
+        self.extra_files_var.set(f"已選擇 {len(self.extra_file_paths)} 個檔案：{names}")
+
+    def log(self, message: str) -> None:
+        self.log_text.insert("end", message + "\n")
+        self.log_text.see("end")
+
+    def on_clear_log(self) -> None:
+        self.log_text.delete("1.0", "end")
+
+    def _refresh_combination_table(
+        self,
+        header: list[str],
+        rows: list[list[str]],
+        blank_column_flags: list[bool] | None = None,
+    ) -> None:
+        """重建組合對照表：欄位數隨 active 變數數量變動，所以每次都整個重設
+        表頭跟所有列（跟變數設定表不同，變數設定表欄位是固定的 COLUMN_SPECS，
+        這裡欄位本身要先依 header 動態組出來，見 build_combination_column_
+        specs）。rows 裡每一列字串的順序必須跟目前的 active_configs 對應
+        （由呼叫端的 on_preview_combinations／on_generate 保證）。
+
+        blank_column_flags：跟 header[1:]（每個 active 變數各一欄）等長，
+        True 表示該變數在「變數設定表」還沒填 Range/Manual、這次只是用
+        Nominal 墊檔（見 on_preview_combinations 的 allow_blank 預覽）；對應
+        欄位的表頭與每一列儲存格都用 BLANK_FIELD_BG 上色提醒，跟「變數設定
+        表」裡的提醒色一致。None（或未傳）視為全部 False（on_generate 成功
+        時必定如此，因為缺漏早在嚴格模式下 fail loud 擋下了）。
+        """
+        self._last_table_header = header
+        blank_column_flags = blank_column_flags or [False] * (len(header) - 1)
+
+        for row in self.combination_rows:
+            row.destroy()
+        self.combination_rows = []
+        for widget in self._combination_header_frame.winfo_children():
+            widget.destroy()
+
+        column_specs = build_combination_column_specs(header)
+        configure_table_columns(self._combination_header_frame, column_specs=column_specs)
+        for column_index, spec in enumerate(column_specs):
+            is_blank_column = column_index > 0 and blank_column_flags[column_index - 1]
+            header_label = tk.Label(
+                self._combination_header_frame,
+                text=spec.title,
+                bg=BLANK_FIELD_BG if is_blank_column else BG2,
+                fg=FG,
+                width=1,
+                anchor="w",
+                font=("TkDefaultFont", 9, "bold"),
+                bd=1,
+                highlightthickness=0,
+            )
+            header_label.grid(
+                row=0,
+                column=column_index,
+                sticky="nsew",
+                padx=TABLE_CELL_PAD_X,
+                pady=TABLE_CELL_PAD_Y,
+            )
+            header_label.bind("<MouseWheel>", self._on_combination_table_mousewheel)
+
+        for row_values in rows:
+            folder_name, value_texts = row_values[0], row_values[1:]
+            row_state = CombinationRowState(
+                self.combination_body,
+                column_specs,
+                folder_name,
+                value_texts,
+                on_navigate=self._on_combination_row_navigate,
+                blank_column_flags=blank_column_flags,
+            )
+            row_state.frame.bind(
+                "<MouseWheel>", self._on_combination_table_mousewheel, add="+"
+            )
+            for widget in row_state.widgets:
+                widget.bind("<MouseWheel>", self._on_combination_table_mousewheel)
+            self.combination_rows.append(row_state)
+
+        self._bottom_notebook.select(self._table_tab)
+        self._main_notebook.select(self._result_tab)
+
+    def on_copy_combination_table(self) -> None:
+        """把組合對照表目前畫面上的內容複製到剪貼簿（tab 分隔，可直接貼到
+        Excel）。改用即時讀取每一列 Entry 目前的文字，不是上次預覽／產生當下
+        的快照——欄位現在可編輯，使用者還沒按「套用變更」的編輯內容也應該能
+        被複製到，所見即所得。
+        """
+        if not self.combination_rows:
+            messagebox.showinfo("複製到剪貼簿", "目前沒有組合對照表內容可複製，請先「預覽組合數」或「產生」。")
+            return
+        lines = ["\t".join(self._last_table_header)]
+        for row in self.combination_rows:
+            lines.append("\t".join([row.current_folder_name()] + row.current_value_texts()))
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self.log(f"已複製組合對照表（{len(self.combination_rows)} 列）到剪貼簿。")
+
+    def on_apply_combination_table_changes(self) -> None:
+        """把組合對照表裡使用者編輯過的「資料夾」與數值欄位，一次性套用到磁碟：
+        改過的資料夾名稱真的 rename，改過的數值真的改寫該筆 run 資料夾裡的
+        input file。只有在已經真的「產生」過（不是只預覽過）才能套用，見
+        self._last_generated_*（on_generate 設置、on_preview_combinations 清空）。
+        """
+        output_dir = self._last_generated_output_dir
+        if output_dir is None or not output_dir.is_dir():
+            messagebox.showerror(
+                "套用變更", "請先「產生所有資料夾與 input file」，才能套用變更到磁碟上的檔案。"
+            )
+            return
+
+        active_configs = self._last_generated_active_configs
+        template_path = self._last_generated_template_path
+        if active_configs is None or template_path is None or not template_path.is_file():
+            messagebox.showerror(
+                "套用變更", "找不到產生當下使用的範本或變數設定，請重新「產生」一次後再套用變更。"
+            )
+            return
+
+        changed_rows = [
+            row for row in self.combination_rows if row.folder_changed() or row.value_changed()
+        ]
+        if not changed_rows:
+            messagebox.showinfo("套用變更", "沒有偵測到任何變更。")
+            return
+
+        # 驗證所有要改名的資料夾（不管有沒有值也一起變，只要資料夾名稱變了就要驗證）：
+        # 不可空白、不可含非法字元、批次內不可互相重複、不可跟 output_dir 底下
+        # 既有的任何資料夾（不管是這批次裡其他列的舊名稱，還是完全無關的資料夾）
+        # 撞名——直接拿「目標路徑目前是否已存在」當判斷依據，不支援同批次內
+        # 互換名稱（互換的話對方的舊名稱此刻仍存在，一樣會被這條規則擋下）。
+        new_name_counts: dict[str, int] = {}
+        for row in self.combination_rows:
+            name = row.current_folder_name()
+            new_name_counts[name] = new_name_counts.get(name, 0) + 1
+
+        folder_rename_rows = [row for row in self.combination_rows if row.folder_changed()]
+        validation_errors: list[str] = []
+        for row in folder_rename_rows:
+            new_name = row.current_folder_name()
+            if not new_name:
+                validation_errors.append(f"「{row.original_folder_name}」的新資料夾名稱不能是空白")
+            elif INVALID_RUN_PREFIX_CHARS_PATTERN.search(new_name):
+                validation_errors.append(
+                    f"「{row.original_folder_name}」改成的新名稱「{new_name}」"
+                    "含有 Windows 檔案系統不允許的字元"
+                )
+            elif new_name_counts[new_name] > 1:
+                validation_errors.append(f"有多筆要改成同一個名稱「{new_name}」，請確認新名稱都不重複")
+            elif (output_dir / new_name).exists():
+                validation_errors.append(
+                    f"「{row.original_folder_name}」想改成的新名稱「{new_name}」"
+                    f"已經存在於「{output_dir}」，請改用其他名稱"
+                    "（不支援在同一批次內跟其他資料夾互換名稱）"
+                )
+        if validation_errors:
+            messagebox.showerror(
+                "套用變更", "以下資料夾改名無法套用，請修正後再試：\n- " + "\n- ".join(validation_errors)
+            )
+            return
+
+        value_change_rows = [row for row in self.combination_rows if row.value_changed()]
+        confirmed = messagebox.askyesno(
+            "確認套用變更",
+            f"即將重新命名 {len(folder_rename_rows)} 個資料夾、"
+            f"改寫 {len(value_change_rows)} 筆 run 的 input file，確定要繼續嗎？",
+        )
+        if not confirmed:
+            return
+
+        template_text, _stamp = read_apdl_text(template_path)
+        spans = resolve_all_spans(template_text, active_configs)
+
+        rename_errors: list[str] = []
+        value_write_errors: list[str] = []
+        renamed_count = 0
+        rewritten_count = 0
+
+        for row in self.combination_rows:
+            current_path = output_dir / row.original_folder_name
+
+            if row.folder_changed():
+                new_name = row.current_folder_name()
+                new_path = output_dir / new_name
+                try:
+                    current_path.rename(new_path)
+                except OSError as exc:
+                    rename_errors.append(f"「{row.original_folder_name}」改名為「{new_name}」失敗：{exc}")
+                else:
+                    current_path = new_path
+                    row.original_folder_name = new_name
+                    renamed_count += 1
+
+            if row.value_changed():
+                try:
+                    combo = [
+                        parse_edited_value_text(text, config)
+                        for text, config in zip(row.current_value_texts(), active_configs)
+                    ]
+                    run_text = render_run_text(template_text, spans, active_configs, combo)
+                    write_apdl_text(current_path / template_path.name, run_text)
+                except (ValueError, OSError) as exc:
+                    value_write_errors.append(f"「{row.original_folder_name}」改寫 input file 失敗：{exc}")
+                else:
+                    row.original_value_texts = row.current_value_texts()
+                    rewritten_count += 1
+
+        # 不管這次有沒有部分失敗，都用目前每一列最新的 original_folder_name／
+        # original_value_texts（已成功套用的會反映新狀態，失敗的維持舊狀態）
+        # 重寫 combinations_summary.txt，讓它盡量貼近磁碟上的實際現況。
+        summary_rows = [
+            [row.original_folder_name] + row.original_value_texts for row in self.combination_rows
+        ]
+        summary_path = output_dir / "combinations_summary.txt"
+        try:
+            write_combinations_summary(summary_path, self._last_table_header, summary_rows)
+        except OSError as exc:
+            self.log(f"注意：更新組合對照表 combinations_summary.txt 失敗：{exc}")
+
+        if rename_errors or value_write_errors:
+            error_lines = rename_errors + value_write_errors
+            self.log(f"套用變更部分失敗：成功 {renamed_count} 個改名、{rewritten_count} 筆改寫。")
+            messagebox.showerror(
+                "套用變更",
+                f"套用時發生 {len(error_lines)} 個錯誤；已成功的部分"
+                f"（{renamed_count} 個改名、{rewritten_count} 筆改寫）仍會保留：\n- "
+                + "\n- ".join(error_lines),
+            )
+            return
+
+        self.log(f"已套用變更：{renamed_count} 個資料夾改名、{rewritten_count} 筆 input file 改寫。")
+        messagebox.showinfo(
+            "套用變更", f"已套用變更：{renamed_count} 個資料夾改名、{rewritten_count} 筆 input file 改寫。"
+        )
+
+    def _on_table_mousewheel(self, event: tk.Event) -> str:
+        """滾輪捲動變數設定表的 canvas；event.delta 在 Windows 上是 120 的倍數。"""
+        self._table_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_table_canvas_configure(self, event: tk.Event) -> None:
+        """Canvas 寬度變動時同步 table_body 的寬度，讓資料列裡有伸縮權重的欄位
+        （Label／Manual Values）跟固定表頭維持同一份像素寬度，不會各自算各自的。"""
+        self._table_canvas.itemconfigure(self._table_body_window_id, width=event.width)
+
+    def _on_combination_table_mousewheel(self, event: tk.Event) -> str:
+        """滾輪捲動組合對照表的 canvas，邏輯跟 _on_table_mousewheel 相同，只是
+        對照表是另一個獨立的 Canvas（不同分頁、不同元件）。"""
+        self._combination_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_combination_canvas_configure(self, event: tk.Event) -> None:
+        """Canvas 寬度變動時同步 combination_body 的寬度，讓數值欄（weight=1
+        平均分配剩餘空間）跟固定表頭維持同一份像素寬度。"""
+        self._combination_canvas.itemconfigure(
+            self._combination_body_window_id, width=event.width
+        )
+
+    def _row_autofit_display_texts(self, row: VariableRowState) -> dict[str, str]:
+        """回傳這一列會被拿去量測欄寬的欄位目前顯示文字（Active／移除按鈕沒有
+        會變動的內容，見 AUTOFIT_STATIC_COLUMN_KEYS，不需要在這裡回傳）。"""
+        try:
+            decimal_places_text = str(row.decimal_places_var.get())
+        except tk.TclError:
+            decimal_places_text = ""
+        return {
+            "label": row.label_var.get(),
+            "low": row.lower_var.get(),
+            "nominal": row.nominal_var.get(),
+            "upper": row.upper_var.get(),
+            "spacing": row.spacing_var.get(),
+            "manual": row.manual_values_var.get(),
+            "tolerance": row.tolerance_var.get(),
+            "decimal_places": decimal_places_text,
+            "status": row.status_label.cget("text"),
+        }
+
+    def _autofit_table_columns(self) -> None:
+        """依目前變數設定表（表頭文字＋所有列目前顯示的內容）量出每欄實際需要
+        的像素寬度，套用成新的 minsize。
+
+        只在列數變動（新增／移除一列）時呼叫一次，不綁每次鍵盤輸入——那樣
+        每個按鍵都要重新量測＋重新套用所有列的欄寬，使用者打字時欄寬會跟著
+        跳動、游標位置體感上會跑掉。欄寬只會變寬，不會比 COLUMN_SPECS 原本
+        定義的最小寬度更窄（標題文字一律量得到，不會被縮到比表頭文字還窄）。
+        """
+        header_font = tkfont.Font(font=("TkDefaultFont", 9, "bold"))
+        body_font = tkfont.Font(font="TkDefaultFont")
+
+        measured_width_by_key: dict[str, int] = {
+            spec.key: header_font.measure(spec.title) for spec in COLUMN_SPECS
+        }
+        for row in self.rows:
+            for key, text in self._row_autofit_display_texts(row).items():
+                width_px = body_font.measure(text)
+                if width_px > measured_width_by_key[key]:
+                    measured_width_by_key[key] = width_px
+
+        min_width_by_key: dict[str, int] = {}
+        for spec in COLUMN_SPECS:
+            if spec.key in AUTOFIT_STATIC_COLUMN_KEYS:
+                continue
+            min_width_by_key[spec.key] = max(
+                spec.min_width_px,
+                measured_width_by_key[spec.key] + AUTOFIT_EXTRA_PADDING_PX,
+            )
+
+        configure_table_columns(self._table_header_frame, min_width_by_key)
+        for row in self.rows:
+            configure_table_columns(row.frame, min_width_by_key)
+
+    def _add_row(
+        self,
+        varname: str = "",
+        nominal_value: float | str | None = None,
+        label: str = "",
+        kind: str = VARIABLE_KIND_NAMED,
+        original_text: str | None = None,
+        value_type: str = VALUE_TYPE_NUMERIC,
+    ) -> VariableRowState:
+        row = VariableRowState(
+            self.table_body,
+            self._remove_row,
+            self._on_variable_row_navigate,
+            varname=varname,
+            nominal_value=nominal_value,
+            label=label,
+            kind=kind,
+            original_text=original_text,
+            value_type=value_type,
+        )
+        self.rows.append(row)
+        # 滾輪懸停在列內的 widget 上時事件不會自動往上傳給 canvas，逐個子 widget
+        # 補綁一次，才能讓滾輪在整張表的任何地方都生效（見 _build_layout 裡的說明）。
+        row.frame.bind("<MouseWheel>", self._on_table_mousewheel, add="+")
+        for widget in row.widgets:
+            widget.bind("<MouseWheel>", self._on_table_mousewheel)
+        self._autofit_table_columns()
+        return row
+
+    def _remove_row(self, row: VariableRowState) -> None:
+        if row.kind == VARIABLE_KIND_POSITION:
+            if row.text_tag_name is not None:
+                self.template_text.tag_delete(row.text_tag_name)
+            if row.start_mark is not None:
+                self.template_text.mark_unset(row.start_mark, row.end_mark)
+        row.destroy()
+        self.rows.remove(row)
+        self._autofit_table_columns()
+
+    def _on_variable_row_navigate(
+        self, row: VariableRowState, column_key: str, direction: str
+    ) -> None:
+        """變數設定表方向鍵導覽的實際目的地判斷（VariableRowState._bind_navigation
+        綁定的 callback）。用 self.rows.index(row) 現查列號，而不是在綁定當下記住固定
+        索引：_remove_row 刪掉中間列時，後面所有列的索引都會往前位移，現查才不會因為
+        刪列而導到錯的列。"""
+        row_index = self.rows.index(row)
+        if direction in ("left", "right"):
+            col_index = VARIABLE_ROW_NAV_KEYS.index(column_key)
+            target_col_index = col_index + (1 if direction == "right" else -1)
+            if not (0 <= target_col_index < len(VARIABLE_ROW_NAV_KEYS)):
+                return
+            target_widget = row.widgets[
+                COLUMN_INDEX_BY_KEY[VARIABLE_ROW_NAV_KEYS[target_col_index]]
+            ]
+            target_widget.focus_set()
+            target_widget.icursor(0 if direction == "right" else "end")
+        else:
+            target_row_index = row_index + (1 if direction == "down" else -1)
+            if not (0 <= target_row_index < len(self.rows)):
+                return
+            target_widget = self.rows[target_row_index].widgets[COLUMN_INDEX_BY_KEY[column_key]]
+            target_widget.focus_set()
+            target_widget.icursor("end")
+
+    def _on_combination_row_navigate(
+        self, row: CombinationRowState, col_index: int, direction: str
+    ) -> None:
+        """組合對照表方向鍵導覽，邏輯跟 _on_variable_row_navigate 對稱；欄位用整數索引
+        直接對 row.widgets 取值（組合對照表欄位是動態的，天生就用索引，不需要 key 對照表）。
+        """
+        row_index = self.combination_rows.index(row)
+        if direction in ("left", "right"):
+            target_col_index = col_index + (1 if direction == "right" else -1)
+            if not (0 <= target_col_index < len(row.widgets)):
+                return
+            target_widget = row.widgets[target_col_index]
+            target_widget.focus_set()
+            target_widget.icursor(0 if direction == "right" else "end")
+        else:
+            target_row_index = row_index + (1 if direction == "down" else -1)
+            if not (0 <= target_row_index < len(self.combination_rows)):
+                return
+            target_widget = self.combination_rows[target_row_index].widgets[col_index]
+            target_widget.focus_set()
+            target_widget.icursor("end")
+
+    def _on_template_text_scroll(self, *args: str) -> None:
+        """template_text 的 yscrollcommand：同步更新捲軸位置與行號側欄的捲動位置。"""
+        self._text_scroll_y.set(*args)
+        self.line_numbers.yview_moveto(args[0])
+
+    def _on_text_yview(self, *args: str) -> None:
+        """捲軸本身被拖曳時，同時捲動內容與行號側欄。"""
+        self.template_text.yview(*args)
+        self.line_numbers.yview(*args)
+
+    def _char_count_between(self, index1: str, index2: str) -> int:
+        """`Text.count(a, b)` 在 a==b 時 Tk 會回傳 None 而不是 (0,)，這裡統一處理
+        成 0，避免 token 剛好從檔案最開頭算起時當掉。"""
+        result = self.template_text.count(index1, index2)
+        return result[0] if result else 0
+
+    def _char_offset(self, index: str) -> int:
+        """回傳某個 Tk index（可以是 mark 名稱）距離文件開頭的絕對字元位移。"""
+        return self._char_count_between("1.0", index)
+
+    def _attach_position_marks(self, row: VariableRowState, start: int, end: int) -> None:
+        """幫一個 position-kind row 建立/重建一對 marks 包住 [start, end) 這段文字。
+
+        起點 gravity="right"、終點 gravity="left"：Tk 的 mark gravity 規則是
+        「gravity="left" 的 mark 固定跟著它左邊那個字元，插入點剛好在該 mark
+        時新文字會落在它右邊」。所以起點要用 "right"（插入點在起點時，mark 跟著
+        新文字一起往右移，新文字落在 mark 左邊、被排除在標記範圍外）、終點要用
+        "left"（插入點在終點時，mark 留在原地，新文字落在 mark 右邊、一樣被排除
+        在外）。插入剛好在這段文字的任一端邊界時，新文字才不會被誤吞進標記範圍，
+        完全不用手動維護位移。
+        """
+        start_mark = f"doe_start_{id(row)}"
+        end_mark = f"doe_end_{id(row)}"
+        self.template_text.mark_set(start_mark, f"1.0+{start}c")
+        self.template_text.mark_set(end_mark, f"1.0+{end}c")
+        self.template_text.mark_gravity(start_mark, "right")
+        self.template_text.mark_gravity(end_mark, "left")
+        row.start_mark = start_mark
+        row.end_mark = end_mark
+        row.set_invalid(False)
+
+    def _rebuild_line_numbers(self) -> None:
+        """行號側欄的「總行數」要跟 Tk 幫 template_text 算出來的內部行數完全一致
+        （檔案結尾有換行字元時 Tk 會多出一行看不見的空行），改用 Tk 自己回報的
+        end-1c 行號，確保兩個 Text widget 的內部行數結構完全相同。"""
+        tk_line_count = int(self.template_text.index("end-1c").split(".")[0])
+        line_number_text = "\n".join(str(i) for i in range(1, tk_line_count + 1))
+        line_number_width = max(4, len(str(tk_line_count)) + 1)
+        self.line_numbers.configure(state="normal", width=line_number_width)
+        self.line_numbers.delete("1.0", "end")
+        self.line_numbers.insert("1.0", line_number_text)
+        self.line_numbers.configure(state="disabled")
+
+    def _set_template_buffer_content(self, new_text: str) -> None:
+        """把 new_text 整個灌進範本編輯器，盡量重新掛上既有的 DOE marks。
+
+        初次載入時 self.rows 通常是空的，下面的快照迴圈自然不會做任何事，所以
+        這個函式同時服務「初次載入」「換檔」「重新載入」三種情境，不用分開寫。
+        流程：(1) 用目前還有效的舊 marks 換算出絕對位移快照、然後 mark_unset
+        （delete+insert 後舊 marks 會塌陷到同一點，不能留著用）；(2) 整份換內容，
+        順便清掉 undo 歷史與 dirty 旗標（這是全新文件，不是使用者編輯）；
+        (3) 比對舊位移在新文字裡是否仍等於 original_text，吻合才重建 marks，
+        對不上的維持 start_mark=None，交給 _revalidate_position_rows 標成失效。
+        """
+        pending: list[tuple[VariableRowState, int | None, int | None]] = []
+        for row in self.rows:
+            if row.kind != VARIABLE_KIND_POSITION:
+                continue
+            if row.start_mark is not None:
+                start = self._char_offset(row.start_mark)
+                end = self._char_offset(row.end_mark)
+                self.template_text.mark_unset(row.start_mark, row.end_mark)
+            else:
+                start = end = None
+            if row.text_tag_name is not None:
+                self.template_text.tag_delete(row.text_tag_name)
+                row.text_tag_name = None
+            pending.append((row, start, end))
+            row.start_mark = row.end_mark = None
+
+        self._loading_template = True
+        self.template_text.configure(autoseparators=False)
+        self.template_text.delete("1.0", "end")
+        self.template_text.insert("1.0", new_text)
+        self.template_text.edit_reset()
+        self.template_text.edit_modified(False)
+        self.template_text.configure(autoseparators=True)
+        self._loading_template = False
+
+        for row, start, end in pending:
+            if start is None or end > len(new_text) or new_text[start:end] != row.original_text:
+                row.set_invalid(True)
+                continue
+            self._attach_position_marks(row, start, end)
+            tag_name = f"tagged_{id(row)}"
+            row.text_tag_name = tag_name
+            self.template_text.tag_add(tag_name, row.start_mark, row.end_mark)
+
+        self._rebuild_line_numbers()
+        self._apply_syntax_highlighting()
+        self._revalidate_position_rows()
+
+    def _apply_syntax_highlighting(self) -> None:
+        """依 apdl syntax.xml 的規則，幫整份範本內容上色（關鍵字/數字/運算子/行註解）。
+
+        直接逐行問 Tk 目前的內容（不再維護手動鏡像的行清單），每次重新套用前
+        先清掉舊的語法 tag 範圍，避免編輯後文字位移跟舊 tag 範圍對不上。
+        """
+        for style_name in self._syntax_styles["colors"]:
+            self.template_text.tag_remove(style_name, "1.0", "end")
+
+        line_count = int(self.template_text.index("end-1c").split(".")[0])
+        for line_idx in range(1, line_count + 1):
+            line_text = self.template_text.get(f"{line_idx}.0", f"{line_idx}.end")
+            for start_col, end_col, style_name in tokenize_apdl_line_for_syntax(
+                line_text, self._syntax_styles
+            ):
+                self.template_text.tag_add(
+                    style_name, f"{line_idx}.{start_col}", f"{line_idx}.{end_col}"
+                )
+
+    def _raise_selection_tag(self) -> None:
+        """確保內建的文字選取 tag（"sel"）一律顯示在其他背景色 tag 之上。
+
+        Tk 的 tag 疊加順序預設依「建立先後」決定，"sel" 在 Text widget 一建立
+        就存在，順位最低；DOE 標記（黃）、失效標記（紅）、搜尋反白（藍）都是
+        之後才加的 tag，預設會疊在 "sel" 上面。結果使用者想複製已標記文字裡的
+        內容、用滑鼠拖曳選取時，選取範圍該有的藍色反白會被這些背景色蓋住，
+        肉眼看不出來到底選到了沒有（但實際上真的選到了，Ctrl+C 還是有效）。
+        每次異動這些背景色 tag 之後都呼叫這個函式，把 "sel" 重新拉回最上層。
+        """
+        self.template_text.tag_raise("sel")
+
+    def _revalidate_position_rows(self) -> None:
+        """重新驗證每個 position-kind 變數的 marks 是否還指著原本標記的文字。
+
+        tag 範圍不會像 marks 一樣自動跟著文字移動，所以每次都要用「目前的
+        marks」重新 tag_remove+tag_add 一次，不能只在標記當下設一次就放著。
+        """
+        for row in self.rows:
+            if row.kind != VARIABLE_KIND_POSITION:
+                continue
+            if row.start_mark is None:
+                row.set_invalid(True)
+                continue
+            current_text = self.template_text.get(row.start_mark, row.end_mark)
+            row.set_invalid(current_text != row.original_text)
+            if row.text_tag_name is not None:
+                self.template_text.tag_remove(row.text_tag_name, "1.0", "end")
+                self.template_text.tag_add(row.text_tag_name, row.start_mark, row.end_mark)
+                self.template_text.tag_config(
+                    row.text_tag_name,
+                    background=INVALID_MARK_BG if row.invalid else TAG_HIGHLIGHT_BG,
+                )
+        self._raise_selection_tag()
+
+    def _set_template_dirty(self, dirty: bool) -> None:
+        self._template_dirty = dirty
+        self._update_status_bar()
+
+    def _on_template_text_modified(self, _event: tk.Event) -> None:
+        """`<<Modified>>` 標準寫法：確認真的被改過→重置旗標（避免同一次修改
+        重複觸發）→設 dirty→排一次 debounce 重新上色/重新驗證失效標記。"""
+        if not self.template_text.edit_modified():
+            return
+        self.template_text.edit_modified(False)
+        if self._loading_template:
+            return
+        self._set_template_dirty(True)
+        # 立即（不等 debounce）清掉搜尋快取：_search_matches 裡存的字元位移是對
+        # 「目前」內容算的，編輯之後就對不上了。等 debounce 結束才清的話，使用者
+        # 打字後、debounce 還沒跑完前按 F3，仍然會用到這段期間內過期的快取。
+        self._clear_search_state()
+        self._schedule_template_refresh()
+
+    def _cancel_template_refresh(self) -> None:
+        if self._template_refresh_after_id is not None:
+            self.root.after_cancel(self._template_refresh_after_id)
+            self._template_refresh_after_id = None
+
+    def _schedule_template_refresh(self) -> None:
+        """debounce：貼上大段文字或快速打字時，不要每個按鍵都整份重新上色/驗證。"""
+        self._cancel_template_refresh()
+        self._template_refresh_after_id = self.root.after(
+            TEMPLATE_MODIFIED_REFRESH_DELAY_MS, self._refresh_template_derived_state
+        )
+
+    def _refresh_template_derived_state(self) -> None:
+        self._template_refresh_after_id = None
+        was_modified = bool(self.template_text.edit_modified())
+        self._apply_syntax_highlighting()
+        self._revalidate_position_rows()
+        self._rebuild_line_numbers()
+        self._update_status_bar()
+        if bool(self.template_text.edit_modified()) != was_modified:
+            self.template_text.edit_modified(was_modified)
+
+    def _update_status_bar(self, _event: tk.Event | None = None) -> None:
+        if not self.template_path_var.get():
+            self.status_bar_var.set("尚未載入範本")
+            return
+        cursor_line, cursor_col = self.template_text.index("insert").split(".")
+        sel_ranges = self.template_text.tag_ranges("sel")
+        selection_text = ""
+        if sel_ranges:
+            selected_chars = self._char_count_between(str(sel_ranges[0]), str(sel_ranges[1]))
+            selection_text = f"選取 {selected_chars} 字 ｜ "
+        total_lines = int(self.template_text.index("end-1c").split(".")[0])
+        dirty_text = "尚未儲存 *" if self._template_dirty else "已儲存"
+        self.status_bar_var.set(
+            f"行 {cursor_line}，欄 {int(cursor_col) + 1} ｜ {selection_text}"
+            f"共 {total_lines} 行 ｜ {dirty_text}"
+        )
+
+    def _on_select_all(self, _event: tk.Event) -> str:
+        self.template_text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _on_undo(self, _event: tk.Event) -> str:
+        try:
+            self.template_text.edit_undo()
+        except tk.TclError:
+            pass  # undo 堆疊已空，忽略
+        return "break"
+
+    def _on_redo(self, _event: tk.Event) -> str:
+        try:
+            self.template_text.edit_redo()
+        except tk.TclError:
+            pass  # redo 堆疊已空，忽略
+        return "break"
+
+    def _on_toggle_word_wrap(self) -> None:
+        self.template_text.configure(wrap="word" if self.word_wrap_var.get() else "none")
+
+    def _reset_template_font_size(self) -> None:
+        self._template_font.configure(size=TEMPLATE_FONT_SIZE_DEFAULT)
+
+    def _focus_search_entry(self) -> None:
+        self._search_entry.focus_set()
+        self._search_entry.select_range(0, "end")
+
+    def _on_template_text_zoom(self, event: tk.Event) -> str:
+        """Ctrl+滾輪縮放範本內容字體；line_numbers 跟 template_text 共用同一個
+        tkFont.Font 物件，改一次兩邊字體大小會一起變、永遠對得齊。"""
+        current_size = int(self._template_font.cget("size"))
+        if event.delta > 0:
+            new_size = min(current_size + TEMPLATE_FONT_ZOOM_STEP, TEMPLATE_FONT_SIZE_MAX)
+        else:
+            new_size = max(current_size - TEMPLATE_FONT_ZOOM_STEP, TEMPLATE_FONT_SIZE_MIN)
+        self._template_font.configure(size=new_size)
+        return "break"  # 不要讓這次滾輪事件同時觸發一般捲動
+
+    def _on_template_text_click(self, event: tk.Event) -> str:
+        """Ctrl+單擊：自動抓出該位置所在的完整 token 並標記成 DOE 變數。
+
+        一定要回傳 "break"：否則 Ctrl+Button-1 除了觸發這裡的標記邏輯，還會
+        被 Text 類別預設綁定接著處理成游標移動/選取拖曳，標記後游標跑掉、
+        甚至拖出一段選取範圍。
+        """
+        click_index = self.template_text.index(f"@{event.x},{event.y}")
+        line_str, col_str = click_index.split(".")
+        line_num, col = int(line_str), int(col_str)
+        line_text = self.template_text.get(f"{line_num}.0", f"{line_num}.end")
+
+        found = find_token_at_position(line_text, col)
+        if found is None:
+            return "break"
+        match, value_type = found
+
+        start_index = f"{line_num}.{match.start()}"
+        end_index = f"{line_num}.{match.end()}"
+        start_offset = self._char_offset(start_index)
+        end_offset = self._char_offset(end_index)
+        original_text = match.group(0)
+
+        for row in self.rows:
+            if row.kind == VARIABLE_KIND_POSITION and row.start_mark is not None:
+                if (
+                    self._char_offset(row.start_mark) == start_offset
+                    and self._char_offset(row.end_mark) == end_offset
+                ):
+                    self.log(f"這段文字已經標記過了：{row.label_var.get() or row.varname_var.get()}")
+                    return "break"
+
+        default_label = format_position_default_label(
+            self._next_position_var_number, line_num
+        )
+        self._next_position_var_number += 1
+        nominal_value = float(original_text) if value_type == VALUE_TYPE_NUMERIC else original_text
+        row = self._add_row(
+            nominal_value=nominal_value,
+            label=default_label,
+            kind=VARIABLE_KIND_POSITION,
+            original_text=original_text,
+            value_type=value_type,
+        )
+        self._attach_position_marks(row, start_offset, end_offset)
+        tag_name = f"tagged_{id(row)}"
+        row.text_tag_name = tag_name
+        self.template_text.tag_add(tag_name, row.start_mark, row.end_mark)
+        self.template_text.tag_config(tag_name, background=TAG_HIGHLIGHT_BG)
+        self._raise_selection_tag()
+        self.log(f"已標記 {default_label}：「{original_text}」。")
+        return "break"
+
+    def _on_toggle_comment_shortcut(self, _event: tk.Event) -> str:
+        """Ctrl+Q：切換游標所在行（或選取範圍涵蓋的所有行）最前面的 ! 註解符號。
+
+        只改編輯緩衝區、不寫磁碟（要落地請 Ctrl+S 存檔）。Tk 的 insert/delete
+        本來就會自動處理 undo 記錄、捲動位置、游標、其他 marks，不用再像以前
+        那樣手動存/還原捲動位置或游標。多行一起切換時用 edit_separator() 包成
+        一個 undo 單位，按一次 Ctrl+Z 可以整批復原；判斷規則：選取範圍內「全部」
+        非空白行都已經是 ! 開頭 → 整批移除，否則整批新增（已經有 ! 的行跳過，
+        不會變成 !!）。
+        """
+        if not self.template_path_var.get():
+            self.log("請先載入範本，再把游標移到要註解的行按 Ctrl+Q。")
+            return "break"
+
+        sel_ranges = self.template_text.tag_ranges("sel")
+        if sel_ranges:
+            first_line = int(str(sel_ranges[0]).split(".")[0])
+            last_line = int(str(sel_ranges[1]).split(".")[0])
+            if str(sel_ranges[1]).endswith(".0") and last_line > first_line:
+                last_line -= 1  # 選取結尾剛好落在下一行開頭，那一行其實沒被選到
+        else:
+            first_line = last_line = int(self.template_text.index("insert").split(".")[0])
+
+        line_numbers = list(range(first_line, last_line + 1))
+        line_texts = {n: self.template_text.get(f"{n}.0", f"{n}.end") for n in line_numbers}
+        non_blank_lines = [n for n in line_numbers if line_texts[n].strip()]
+        remove_mode = bool(non_blank_lines) and all(
+            line_texts[n].startswith("!") for n in non_blank_lines
+        )
+
+        self.template_text.configure(autoseparators=False)
+        self.template_text.edit_separator()
+        changed_count = 0
+        for line_num in line_numbers:
+            text = line_texts[line_num]
+            if remove_mode:
+                if text.startswith("!"):
+                    self.template_text.delete(f"{line_num}.0", f"{line_num}.1")
+                    changed_count += 1
+            else:
+                if not text.startswith("!"):
+                    self.template_text.insert(f"{line_num}.0", "!")
+                    changed_count += 1
+        self.template_text.edit_separator()
+        self.template_text.configure(autoseparators=True)
+
+        action_label = "移除" if remove_mode else "新增"
+        if len(line_numbers) == 1:
+            self.log(f"已{action_label}第 {line_numbers[0]} 行的註解符號「!」。")
+        else:
+            self.log(
+                f"已{action_label}第 {line_numbers[0]}~{line_numbers[-1]} 行"
+                f"（共 {changed_count} 行）的註解符號「!」。"
+            )
+        return "break"
+
+    def _confirm_discard_unsaved_changes(self) -> bool:
+        """有未儲存變更時跳 儲存/放棄/取消 三選項；回傳是否可以繼續往下動作
+        （切換範本／重新載入／關閉視窗／瀏覽新範本共用這個守門）。
+
+        選「否」（放棄變更）時，這裡會直接把編輯器內容還原成目前
+        `template_path_var` 磁碟上的版本，不是只把 dirty 旗標設回 False、卻放著
+        buffer 內容不管：如果只回傳 True 而不真的還原，buffer／dirty 狀態就會
+        跟「使用者已經放棄變更」這個事實不一致——之後如果呼叫端接著把
+        `template_path_var` 換成別的路徑（例如「瀏覽」選了新檔案），下次存檔
+        就可能把這份沒被真的丟棄的舊內容寫進錯的檔案。
+        """
+        if not self._template_dirty:
+            return True
+        choice = messagebox.askyesnocancel(
+            "有未儲存的變更",
+            "目前範本內容有未儲存的修改，要先存檔嗎？\n\n"
+            "是：存檔後繼續　否：放棄變更繼續　取消：不要繼續",
+        )
+        if choice is None:
+            return False
+        if choice:
+            return self._save_template()
+        return self._load_template_from_path(Path(self.template_path_var.get()))
+
+    def _on_close_window(self) -> None:
+        if self._confirm_discard_unsaved_changes():
+            self._cancel_template_refresh()
+            self.root.destroy()
+
+    def _save_template(self) -> bool:
+        """實際寫入目前範本路徑；回傳是否存檔成功。路徑還沒設定就轉給另存新檔。
+
+        偵測到磁碟檔案已被外部修改時，刻意不提供「覆寫」選項（這個檔案會被
+        拿去跑 ANSYS，蓋掉別處修改的風險比一般筆記軟體高），只給「另存新檔」
+        或「取消」（取消的話可以改用「載入範本內容」重新載入、放棄目前變更）。
+        """
+        template_path_text = self.template_path_var.get()
+        if not template_path_text:
+            return self.on_save_as()
+
+        template_path = Path(template_path_text)
+        text = self.template_text.get("1.0", "end-1c")
+
+        if template_path.is_file():
+            backup_path = backup_original_file_once(template_path)
+            if backup_path is not None:
+                self.log(f"已備份原始檔：{backup_path}")
+
+        try:
+            new_stamp = write_apdl_text(template_path, text, expected_stamp=self._current_file_stamp)
+        except ExternalChangeError:
+            choice = messagebox.askyesno(
+                "檔案已被外部修改",
+                f"磁碟上的「{template_path.name}」已經被其他程式修改過，"
+                "為了避免蓋掉別處的修改，不能直接存檔覆寫。\n\n"
+                "要改成「另存新檔」嗎？（選「否」可以改用「載入範本內容」重新載入、放棄目前變更）",
+            )
+            if choice:
+                return self.on_save_as()
+            return False
+        except OSError as exc:
+            messagebox.showerror("存檔失敗", str(exc))
+            return False
+
+        self._current_file_stamp = new_stamp
+        self.template_text.edit_modified(False)
+        self._set_template_dirty(False)
+        self.log(f"已存檔：{template_path}")
+        return True
+
+    def on_save(self) -> bool:
+        return self._save_template()
+
+    def on_save_as(self) -> bool:
+        current_path_text = self.template_path_var.get()
+        current_path = Path(current_path_text) if current_path_text else None
+        path_str = filedialog.asksaveasfilename(
+            title="另存新檔",
+            initialfile=current_path.name if current_path else "",
+            initialdir=str(current_path.parent) if current_path else "",
+            filetypes=[("APDL / 文字檔", "*.txt;*.inp;*.mac"), ("所有檔案", "*.*")],
+        )
+        if not path_str:
+            return False
+
+        new_path = Path(path_str)
+        text = self.template_text.get("1.0", "end-1c")
+        try:
+            new_stamp = write_apdl_text(new_path, text)
+        except OSError as exc:
+            messagebox.showerror("另存新檔失敗", str(exc))
+            return False
+
+        self.template_path_var.set(str(new_path))
+        self._current_file_stamp = new_stamp
+        self.template_text.edit_modified(False)
+        self._set_template_dirty(False)
+        self.log(f"已另存新檔：{new_path}")
+        return True
+
+    def _load_template_from_path(self, template_path: Path) -> bool:
+        """把 template_path 的磁碟內容讀進編輯器緩衝區，重設指紋/dirty/搜尋快取。
+
+        純粹是「重新讀檔灌進畫面」這個動作本身，不含未儲存變更的守門——守門交給
+        呼叫端決定要不要問、問完要怎麼處理（`on_load_template` 是直接擋下繼續；
+        `_browse_template` 的「放棄變更」分支則是先用這個函式把目前路徑的內容
+        還原成磁碟版本，確認 buffer／dirty 乾淨了，才把路徑換成新選的檔案）。
+        回傳是否成功（檔案不存在或讀取失敗都回傳 False，呼叫端可以安全中止）。
+        """
+        if not template_path.is_file():
+            messagebox.showerror("錯誤", f"找不到 input file：\n{template_path}")
+            return False
+
+        try:
+            template_text, stamp = read_apdl_text(template_path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return False
+
+        self._set_template_buffer_content(template_text)
+        self._current_file_stamp = stamp
+        self._set_template_dirty(False)
+        # 換檔/重新載入/放棄變更都是比單一次編輯更大幅度的內容變動，舊搜尋結果的
+        # 字元位移對新內容更不可能還有意義，一併清掉。
+        self._clear_search_state()
+        return True
+
+    def on_load_template(self) -> None:
+        """載入 Input File 欄位目前的路徑；這個函式身兼初次載入／換檔／重新載入
+        三種情境的唯一入口，所以未儲存變更的守門放在這裡就能同時覆蓋三種情境。"""
+        if not self._confirm_discard_unsaved_changes():
+            return
+
+        template_path = Path(self.template_path_var.get())
+        if not self._load_template_from_path(template_path):
+            return
+
+        line_count = int(self.template_text.index("end-1c").split(".")[0])
+        self.log(
+            f"已載入範本內容（共 {line_count} 行），"
+            "一般單擊移動游標，Ctrl+單擊標記 DOE 變數。"
+        )
+
+    def _is_word_boundary_char(self, ch: str) -> bool:
+        return not (ch.isalnum() or ch == "_")
+
+    def _on_template_text_clear_search_highlight(self, _event: tk.Event) -> None:
+        """一般單擊（不含 Ctrl）時清掉搜尋反白：使用者點開別的地方通常表示已經
+        看完搜尋結果，不想再讓整頁反藍。不回傳 "break"，讓 Tk 原本「移動游標／
+        清掉文字選取」的預設行為照常執行；F3/Shift+F3 仍可用上次搜尋到的
+        _search_matches 清單繼續導覽，只是不再整頁反藍提示。"""
+        self.template_text.tag_remove(SEARCH_TAG_NAME, "1.0", "end")
+
+    def _clear_search_state(self) -> None:
+        """清掉搜尋反白與快取的符合位置清單。
+
+        _search_matches 裡存的是「1.0+123c」這種字元位移運算式，不是會跟著文字
+        移動的 Tk mark，內容被編輯之後同一個位移就會對應到錯誤的位置（F3 因此可能
+        選到偏移後的錯字）。內容變動、換檔、或要開始一次新搜尋時都要呼叫這裡，
+        把舊的符合清單跟搜尋條件快照一起清掉，不要讓 F3/Shift+F3 用到過期結果。
+        """
+        self.template_text.tag_remove(SEARCH_TAG_NAME, "1.0", "end")
+        self._search_matches = []
+        self._search_match_index = -1
+        self._search_signature = None
+        self.search_status_var.set("")
+
+    def on_search_template_text(self) -> None:
+        """依搜尋欄位的關鍵字（可選區分大小寫/全字匹配）反白所有符合處，並記住
+        清單供 F3/Shift+F3 導覽；關鍵字清空時只清掉既有反白，不報錯。刻意不用
+        正規表示式（規格排除），全字匹配靠手動檢查前後字元是否屬於識別字字元。
+        """
+        self._clear_search_state()
+        keyword = self.search_var.get()
+        if not keyword:
+            return
+
+        case_sensitive = self.search_case_sensitive_var.get()
+        whole_word = self.search_whole_word_var.get()
+        # 不管這次搜尋有沒有找到符合都要記錄，讓「尋找及取代」視窗能判斷下次按
+        # 「找下一個」時條件有沒有變（見 FindReplaceDialog._find_next）；放在搜尋
+        # 迴圈之前寫入，才能涵蓋「關鍵字有打但完全沒找到符合」這種提早 return 的情況。
+        self._search_signature = (keyword, case_sensitive, whole_word)
+        content = self.template_text.get("1.0", "end-1c")
+        haystack = content if case_sensitive else content.lower()
+        needle = keyword if case_sensitive else keyword.lower()
+
+        matches: list[tuple[str, str]] = []
+        start = 0
+        while True:
+            idx = haystack.find(needle, start)
+            if idx == -1:
+                break
+            end = idx + len(needle)
+            if whole_word:
+                before_ok = idx == 0 or self._is_word_boundary_char(content[idx - 1])
+                after_ok = end == len(content) or self._is_word_boundary_char(content[end])
+                if not (before_ok and after_ok):
+                    start = idx + 1
+                    continue
+            start_index = f"1.0+{idx}c"
+            end_index = f"1.0+{end}c"
+            matches.append((start_index, end_index))
+            self.template_text.tag_add(SEARCH_TAG_NAME, start_index, end_index)
+            start = end
+
+        self.template_text.tag_config(SEARCH_TAG_NAME, background=SEARCH_HIGHLIGHT_BG)
+        self.template_text.tag_raise(SEARCH_TAG_NAME)
+        self._raise_selection_tag()
+
+        self._search_matches = matches
+        if not matches:
+            self.search_status_var.set("找不到符合的文字")
+            return
+        self._search_match_index = 0
+        self._goto_search_match()
+        self.search_status_var.set(f"共 {len(matches)} 個符合（1/{len(matches)}）")
+
+    def _goto_search_match(self) -> None:
+        start_index, end_index = self._search_matches[self._search_match_index]
+        self.template_text.mark_set("insert", start_index)
+        self.template_text.tag_remove("sel", "1.0", "end")
+        self.template_text.tag_add("sel", start_index, end_index)
+        self.template_text.see(start_index)
+        self._update_status_bar()
+
+    def on_find_next(self) -> None:
+        if not self._search_matches:
+            self.on_search_template_text()
+            if not self._search_matches:
+                return
+        else:
+            self._search_match_index = (self._search_match_index + 1) % len(self._search_matches)
+            self._goto_search_match()
+            self.search_status_var.set(
+                f"共 {len(self._search_matches)} 個符合"
+                f"（{self._search_match_index + 1}/{len(self._search_matches)}）"
+            )
+
+    def on_find_previous(self) -> None:
+        if not self._search_matches:
+            self.on_search_template_text()
+            if not self._search_matches:
+                return
+        else:
+            self._search_match_index = (self._search_match_index - 1) % len(self._search_matches)
+            self._goto_search_match()
+            self.search_status_var.set(
+                f"共 {len(self._search_matches)} 個符合"
+                f"（{self._search_match_index + 1}/{len(self._search_matches)}）"
+            )
+
+    def on_open_find_replace(self) -> None:
+        if self._find_replace_dialog is not None and self._find_replace_dialog.winfo_exists():
+            self._find_replace_dialog.lift()
+            self._find_replace_dialog.focus_set()
+            return
+        self._find_replace_dialog = FindReplaceDialog(self)
+
+    def on_goto_line(self) -> None:
+        if not self.template_path_var.get():
+            return
+        total_lines = int(self.template_text.index("end-1c").split(".")[0])
+        line_num = simpledialog.askinteger(
+            "跳至行",
+            f"請輸入行號（1~{total_lines}）：",
+            parent=self.root,
+            minvalue=1,
+            maxvalue=total_lines,
+        )
+        if line_num is None:
+            return
+        self.template_text.mark_set("insert", f"{line_num}.0")
+        self.template_text.see(f"{line_num}.0")
+        self.template_text.focus_set()
+        self._update_status_bar()
+
+    def _collect_active_configs(self) -> list[VariableConfig]:
+        active_rows = [row for row in self.rows if row.active_var.get()]
+        invalid_labels = [
+            row.label_var.get() or row.varname_var.get()
+            for row in active_rows
+            if row.kind == VARIABLE_KIND_POSITION and (row.start_mark is None or row.invalid)
+        ]
+        if invalid_labels:
+            raise ValueError(
+                "以下 Active 變數的標記已經失效（文字被改壞或刪除），"
+                "請先移除舊標記、重新 Ctrl+單擊標記後再試：\n- " + "\n- ".join(invalid_labels)
+            )
+
+        active_configs = [row.to_config() for row in active_rows]
+        for row, config in zip(active_rows, active_configs):
+            if row.kind == VARIABLE_KIND_POSITION:
+                config.start_offset = self._char_offset(row.start_mark)
+                config.end_offset = self._char_offset(row.end_mark)
+        return collect_active_variable_configs(active_configs)
+
+    def _ensure_template_saved_before_run(self) -> bool:
+        """預覽/產生前確保範本已存檔：這兩個流程本來就是重新讀磁碟文字，必須
+        先保證磁碟內容等於畫面內容，之後的邏輯才不用改。"""
+        if not self.template_path_var.get() or not self._template_dirty:
+            return True
+        proceed = messagebox.askyesno(
+            "尚未儲存", "範本內容有未儲存的修改，必須先存檔才能預覽／產生。\n\n現在存檔嗎？"
+        )
+        if not proceed:
+            return False
+        return self._save_template()
+
+    def on_preview_combinations(self) -> None:
+        if not self._ensure_template_saved_before_run():
+            return
+
+        template_path = Path(self.template_path_var.get())
+        if not template_path.is_file():
+            messagebox.showerror("錯誤", f"找不到 input file：\n{template_path}")
+            return
+
+        try:
+            run_prefix = resolve_run_folder_prefix(self.run_folder_prefix_var.get())
+            start_index = resolve_run_start_index(self.run_start_index_var.get())
+            active_configs = self._collect_active_configs()
+            template_text, _stamp = read_apdl_text(template_path)
+            resolve_all_spans(template_text, active_configs)
+            # allow_blank=True：還沒填 Range/Manual 的 Active 變數先用 Nominal
+            # 墊檔，讓預覽不會卡在「全部變數都填完才看得到表格」，缺漏留到按
+            # 「產生所有資料夾與 input file」時才嚴格檢查（見 on_generate）。
+            combinations = build_full_factorial_combinations(active_configs, allow_blank=True)
+        except ValueError as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        self.preview_text_var.set(
+            f"目前啟用 {len(active_configs)} 個變數，共 {len(combinations)} 組"
+        )
+        header, rows = build_combination_table_rows(
+            active_configs, combinations, run_prefix, start_index
+        )
+        # 跟 header[1:]（每個 active 變數各一欄）順序對應：True 表示這個變數
+        # 還沒填 Range/Manual、組合對照表裡那一欄是用 Nominal 墊檔算出來的，
+        # 不是使用者真的已經決定的值，交給 _refresh_combination_table 把該欄
+        # 上色提醒。
+        blank_column_flags = [variable_has_blank_level_input(config) for config in active_configs]
+        self._refresh_combination_table(header, rows, blank_column_flags)
+        # 純預覽，磁碟上沒有實際資料夾；清掉「上一輪產生」的狀態，避免使用者
+        # 預覽完之後誤按「套用變更」，把編輯結果寫進一批可能已經過期的舊資料夾。
+        self._last_generated_output_dir = None
+        self._last_generated_template_path = None
+        self._last_generated_active_configs = None
+        self.log(f"預覽：{len(active_configs)} 個變數，共 {len(combinations)} 組組合。")
+
+        blank_names = [
+            config.display_name
+            for config, is_blank in zip(active_configs, blank_column_flags)
+            if is_blank
+        ]
+        if blank_names:
+            self.log(
+                "注意：以下變數尚未填入 Range/Manual，預覽暫以 Nominal 值代入，"
+                "產生前請記得補上：" + "、".join(blank_names)
+            )
+
+        # 預覽完一律強制重新整理「變數設定表」每一列的提醒色：使用者切回
+        # 「範本與變數設定」分頁時，剛剛被 Nominal 墊檔的變數要能直接看到提醒，
+        # 不要只靠使用者自己動手改過欄位才觸發的即時上色（見 VariableRowState.
+        # _sync_mode_state），避免兩邊顯示不同步。
+        for row in self.rows:
+            row._sync_mode_state()
+
+    def _apply_combination_column_to_row(
+        self, row: VariableRowState, column_index: int
+    ) -> bool:
+        """把組合對照表目前第 column_index 欄（對應某個 active 變數）的值，
+        去重（collect_distinct_column_values）後寫回這一列的 Manual Values，
+        模式一併切成 Manual。欄位內容去重後是空的（理論上不該發生）就不動，
+        回傳是否真的有寫入。
+        """
+        column_texts = [
+            combo_row.current_value_texts()[column_index] for combo_row in self.combination_rows
+        ]
+        distinct_values = collect_distinct_column_values(column_texts)
+        if not distinct_values:
+            return False
+        row.manual_values_var.set(",".join(distinct_values))
+        row._switch_mode(MODE_MANUAL)
+        return True
+
+    def _fill_back_blank_variables_from_combination_table(
+        self, active_rows: list[VariableRowState], active_configs: list[VariableConfig]
+    ) -> list[str]:
+        """產生前，把「變數設定表」還沒填 Range/Manual、但組合對照表目前已經
+        有值的 Active 變數，將該欄的值填回 Manual Values 欄位（見
+        _apply_combination_column_to_row），讓等一下重新收集 active_configs
+        時能讀到剛填回的值，不會被產生時的嚴格檢查擋下——使用者可能已經直接
+        在組合對照表那邊把想要的值填好了，不需要再回頭到變數設定表重打一次。
+        只處理「目前還空白」的變數，已經有 Manual Values 的變數維持原樣不動
+        （跟組合對照表工具列「依對照表產生資料夾與 input file」按鈕不同，那
+        顆鈕完全不碰 Manual Values，直接用對照表逐列的值產生資料夾）。
+
+        只有在組合對照表目前的欄位組成跟這次 active_rows/active_configs 完全
+        對得上（self._last_table_header 等於這次算出來的 header）時才會動手；
+        對不上（例如上次預覽後使用者改過 Active 勾選、增刪過變數列）就什麼都
+        不做，交給後面的嚴格檢查照常 fail loud，避免把錯的欄位值填進錯的變數。
+
+        回傳有被填回的變數顯示名稱清單，供呼叫端記錄 log；active_rows 與
+        active_configs 須是同一次呼叫 _collect_active_configs() 前後、順序
+        對應的那兩份清單（由呼叫端保證）。
+        """
+        if not self.combination_rows:
+            return []
+        expected_header = ["資料夾"] + [config.display_name for config in active_configs]
+        if self._last_table_header != expected_header:
+            return []
+
+        filled_names: list[str] = []
+        for column_index, (row, config) in enumerate(zip(active_rows, active_configs)):
+            if not variable_has_blank_level_input(config):
+                continue
+            if self._apply_combination_column_to_row(row, column_index):
+                filled_names.append(config.display_name)
+        return filled_names
+
+    def on_generate_from_combination_table(self) -> None:
+        """組合對照表工具列「依對照表產生資料夾與 input file」按鈕：直接採用
+        目前對照表裡逐列顯示的內容產生資料夾，取代舊的「依組合對照表填回
+        Manual Values」兩步流程——填回 Manual Values 之後若接著按「產生所有
+        資料夾與 input file」，那顆鈕仍會用 build_full_factorial_combinations
+        對每個變數（去重後的）水準重新展開笛卡兒積，組合數與排列方式跟使用者
+        在對照表裡排好的自訂安排（例如把兩個變數的值配成一一對應）完全不是
+        一回事。這裡改成逐列原樣採用對照表目前的值（build_combinations_
+        from_table_rows），不重新展開，也完全不碰任何變數的 Manual Values。
+        """
+        if not self.combination_rows:
+            messagebox.showinfo(
+                "產生資料夾與 input file",
+                "目前沒有組合對照表內容，請先「預覽組合數」或「產生所有資料夾與 input file」。",
+            )
+            return
+        if not self._ensure_template_saved_before_run():
+            return
+
+        template_path = Path(self.template_path_var.get())
+        if not template_path.is_file():
+            messagebox.showerror("錯誤", f"找不到 input file：\n{template_path}")
+            return
+
+        try:
+            active_configs = self._collect_active_configs()
+        except ValueError as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        expected_header = ["資料夾"] + [config.display_name for config in active_configs]
+        if self._last_table_header != expected_header:
+            messagebox.showerror(
+                "產生資料夾與 input file",
+                "組合對照表目前的欄位組成跟變數設定表的 Active 變數對不上"
+                "（可能是預覽/產生之後又改過 Active 勾選、或增刪過變數列），"
+                "請重新「預覽組合數」後再試一次。",
+            )
+            return
+
+        output_dir = Path(self.output_dir_var.get())
+        folder_names = [row.current_folder_name() for row in self.combination_rows]
+        folder_errors = validate_combination_table_folder_names(folder_names)
+        if folder_errors:
+            messagebox.showerror(
+                "產生資料夾與 input file",
+                "以下資料夾名稱無法使用，請修正後再試：\n- " + "\n- ".join(folder_errors),
+            )
+            return
+
+        try:
+            combinations = build_combinations_from_table_rows(
+                self.combination_rows, active_configs
+            )
+            missing_extra_files = find_missing_extra_files(self.extra_file_paths)
+            if missing_extra_files:
+                raise ValueError(
+                    "找不到以下附加檔案，請確認路徑是否正確：\n- "
+                    + "\n- ".join(str(path) for path in missing_extra_files)
+                )
+            extra_file_collisions = find_extra_file_template_collisions(
+                self.extra_file_paths, template_path.name
+            )
+            if extra_file_collisions:
+                raise ValueError(
+                    "以下附加檔案跟 input file 檔名相同，複製時會蓋掉剛寫好的替換結果，"
+                    "請改名或移除：\n- "
+                    + "\n- ".join(str(path) for path in extra_file_collisions)
+                )
+            duplicate_extra_filenames = find_duplicate_extra_filenames(self.extra_file_paths)
+            if duplicate_extra_filenames:
+                raise ValueError(
+                    "以下附加檔案彼此檔名相同，複製到同一個 run 資料夾時會互相覆蓋，"
+                    "請改名或移除：\n"
+                    + "\n".join(
+                        "- " + "、".join(str(path) for path in group)
+                        for group in duplicate_extra_filenames
+                    )
+                )
+        except ValueError as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        total = len(combinations)
+        existing_targets = [name for name in folder_names if (output_dir / name).is_dir()]
+        overwrite_note = (
+            f"\n\n注意：{len(existing_targets)} 個資料夾已存在於「{output_dir}」，"
+            "裡面同名檔案將被覆寫。"
+            if existing_targets
+            else ""
+        )
+        extra_files_note = (
+            f"，並附帶複製 {len(self.extra_file_paths)} 個附加檔案" if self.extra_file_paths else ""
+        )
+        confirmed = messagebox.askyesno(
+            "確認產生",
+            f"即將依組合對照表目前內容，在「{output_dir}」下產生 {total} 個資料夾與 "
+            f"input file{extra_files_note}，確定要繼續嗎？{overwrite_note}",
+        )
+        if not confirmed:
+            return
+
+        try:
+            run_count = generate_run_folders(
+                template_path,
+                active_configs,
+                combinations,
+                output_dir,
+                self.extra_file_paths,
+                run_ids=folder_names,
+            )
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        value_texts_by_row = [row.current_value_texts() for row in self.combination_rows]
+        for row, folder_name, value_texts in zip(
+            self.combination_rows, folder_names, value_texts_by_row
+        ):
+            row.commit(folder_name, value_texts)
+
+        self._last_generated_output_dir = output_dir
+        self._last_generated_template_path = template_path
+        self._last_generated_active_configs = active_configs
+
+        summary_path = output_dir / "combinations_summary.txt"
+        summary_rows = [
+            [folder_name] + value_texts
+            for folder_name, value_texts in zip(folder_names, value_texts_by_row)
+        ]
+        try:
+            write_combinations_summary(summary_path, self._last_table_header, summary_rows)
+        except OSError as exc:
+            messagebox.showerror(
+                "錯誤",
+                f"{run_count} 個資料夾已成功產生，但寫入組合對照表「{summary_path}」失敗：\n"
+                f"{exc}\n\n請確認該檔案沒有被其他程式（例如 Excel）開啟後再試一次。",
+            )
+            return
+
+        self.log(
+            f"已依組合對照表內容，在「{output_dir}」產生 {run_count} 個資料夾與 input file"
+            f"{extra_files_note}。"
+        )
+        self.log(f"已輸出組合對照表：{summary_path}")
+        messagebox.showinfo("完成", f"已產生 {run_count} 個資料夾。")
+
+    def on_generate(self) -> None:
+        if not self._ensure_template_saved_before_run():
+            return
+
+        template_path = Path(self.template_path_var.get())
+        output_dir = Path(self.output_dir_var.get())
+
+        if not template_path.is_file():
+            messagebox.showerror("錯誤", f"找不到 input file：\n{template_path}")
+            return
+
+        try:
+            run_prefix = resolve_run_folder_prefix(self.run_folder_prefix_var.get())
+            start_index = resolve_run_start_index(self.run_start_index_var.get())
+            active_configs = self._collect_active_configs()
+            active_rows = [row for row in self.rows if row.active_var.get()]
+            filled_from_table_names = self._fill_back_blank_variables_from_combination_table(
+                active_rows, active_configs
+            )
+            if filled_from_table_names:
+                # Manual Values 剛被填回、模式也可能剛被切換，active_configs 裡
+                # 原本的快照已經過期，必須重新收集一次才能讀到剛填回的值。
+                active_configs = self._collect_active_configs()
+            template_text, _stamp = read_apdl_text(template_path)
+            resolve_all_spans(template_text, active_configs)
+            combinations = build_full_factorial_combinations(active_configs)
+            missing_extra_files = find_missing_extra_files(self.extra_file_paths)
+            if missing_extra_files:
+                raise ValueError(
+                    "找不到以下附加檔案，請確認路徑是否正確：\n- "
+                    + "\n- ".join(str(path) for path in missing_extra_files)
+                )
+            extra_file_collisions = find_extra_file_template_collisions(
+                self.extra_file_paths, template_path.name
+            )
+            if extra_file_collisions:
+                raise ValueError(
+                    "以下附加檔案跟 input file 檔名相同，複製時會蓋掉剛寫好的替換結果，"
+                    "請改名或移除：\n- "
+                    + "\n- ".join(str(path) for path in extra_file_collisions)
+                )
+            duplicate_extra_filenames = find_duplicate_extra_filenames(self.extra_file_paths)
+            if duplicate_extra_filenames:
+                raise ValueError(
+                    "以下附加檔案彼此檔名相同，複製到同一個 run 資料夾時會互相覆蓋，"
+                    "請改名或移除：\n"
+                    + "\n".join(
+                        "- " + "、".join(str(path) for path in group)
+                        for group in duplicate_extra_filenames
+                    )
+                )
+        except ValueError as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        if filled_from_table_names:
+            self.log(
+                "已從組合對照表目前的欄位值，自動填回以下變數的 Manual Values："
+                + "、".join(filled_from_table_names)
+            )
+
+        total = len(combinations)
+        extra_files_note = (
+            f"，並附帶複製 {len(self.extra_file_paths)} 個附加檔案" if self.extra_file_paths else ""
+        )
+        warning = ""
+        if total > COMBINATION_COUNT_WARNING_THRESHOLD:
+            warning = f"\n\n注意：{total} 組是相當大的數量，產生與後續 ANSYS 運算會花較長時間。"
+        # 跟 generate_run_folders 用同一個 find_stale_run_folders_to_delete 算出
+        # 「這一輪會不會清掉舊資料夾、清掉哪些」——起始序號跟既有資料的起始編號
+        # 不同時（使用者刻意用不同序號區分成另一批），這裡會是空清單，確認對話框
+        # 也就不會出現「會清掉舊資料」的警告，跟實際行為保持一致。
+        new_run_ids = {
+            format_run_id(index, total, run_prefix, start_index) for index in range(1, total + 1)
+        }
+        stale_run_folders = find_stale_run_folders_to_delete(
+            output_dir, run_prefix, new_run_ids, start_index
+        )
+        stale_note = (
+            f"\n\n注意：全部新資料夾都成功產生後，會接著清掉「{output_dir}」底下"
+            f"{len(stale_run_folders)} 個這一輪用不到的舊 run_* 資料夾，"
+            "請確認裡面沒有還需要保留的結果。"
+            if stale_run_folders
+            else ""
+        )
+        confirmed = messagebox.askyesno(
+            "確認產生",
+            f"即將在「{output_dir}」下產生 {total} 個資料夾與 input file{extra_files_note}，"
+            f"確定要繼續嗎？{warning}{stale_note}",
+        )
+        if not confirmed:
+            return
+
+        if output_dir.is_dir() and any(output_dir.iterdir()):
+            self.log(f"注意：輸出資料夾「{output_dir}」已存在內容，同名檔案將被覆寫。")
+
+        try:
+            run_count = generate_run_folders(
+                template_path,
+                active_configs,
+                combinations,
+                output_dir,
+                self.extra_file_paths,
+                run_prefix,
+                start_index,
+            )
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        header, rows = build_combination_table_rows(
+            active_configs, combinations, run_prefix, start_index
+        )
+        self._refresh_combination_table(header, rows)
+        # 記住這一批 run 是用什麼範本／變數設定產生的，供組合對照表的
+        # 「套用變更」按鈕之後用同一套替換邏輯改寫單一 run 的 input file。
+        self._last_generated_output_dir = output_dir
+        self._last_generated_template_path = template_path
+        self._last_generated_active_configs = active_configs
+        summary_path = output_dir / "combinations_summary.txt"
+        try:
+            write_combinations_summary(summary_path, header, rows)
+        except OSError as exc:
+            # run 資料夾都已經成功產生，只有對照表 txt 寫入失敗（最常見情境：使用者
+            # 正在 Excel 裡開著上一輪的 combinations_summary.txt，檔案被鎖住）——
+            # 跟上面「產生流程本身失敗」用不同措辭區分，避免使用者誤以為資料夾也沒產生。
+            messagebox.showerror(
+                "錯誤",
+                f"{run_count} 個資料夾已成功產生，但寫入組合對照表「{summary_path}」失敗：\n"
+                f"{exc}\n\n請確認該檔案沒有被其他程式（例如 Excel）開啟後再試一次。",
+            )
+            return
+
+        self.log(
+            f"已在「{output_dir}」產生 {run_count} 個資料夾與 input file"
+            f"{extra_files_note}。"
+        )
+        self.log(f"已輸出組合對照表：{summary_path}")
+        messagebox.showinfo("完成", f"已產生 {run_count} 個資料夾。")
+
+    def on_delete_generated_runs(self) -> None:
+        """一鍵刪除「工作目錄」底下、目前資料夾名稱前綴對應的所有 run 資料夾與
+        combinations_summary.txt，取代手動一個一個刪。只刪符合本工具命名規則
+        （前綴+數字，find_existing_run_folders 同一套判斷）的資料夾，不會動
+        工作目錄裡其他不相關的檔案/資料夾。這是破壞性操作，刪除前一定要先確認。
+        """
+        output_dir = Path(self.output_dir_var.get())
+        try:
+            run_prefix = resolve_run_folder_prefix(self.run_folder_prefix_var.get())
+        except ValueError as exc:
+            messagebox.showerror("刪除失敗", str(exc))
+            return
+
+        run_folders = find_existing_run_folders(output_dir, run_prefix)
+        summary_path = output_dir / "combinations_summary.txt"
+        summary_exists = summary_path.is_file()
+
+        if not run_folders and not summary_exists:
+            messagebox.showinfo(
+                "刪除資料夾",
+                f"「{output_dir}」底下沒有符合前綴「{run_prefix}」的資料夾可以刪除。",
+            )
+            return
+
+        sorted_names = sorted(folder.name for folder in run_folders)
+        preview_names = "、".join(sorted_names[:10])
+        more_note = f" 等共 {len(run_folders)} 個" if len(run_folders) > 10 else ""
+        summary_note = "，以及組合對照表 combinations_summary.txt" if summary_exists else ""
+        confirmed = messagebox.askyesno(
+            "確認刪除",
+            f"即將永久刪除「{output_dir}」底下 {len(run_folders)} 個「{run_prefix}*」資料夾"
+            f"{summary_note}，此動作無法復原，確定要繼續嗎？\n\n{preview_names}{more_note}",
+        )
+        if not confirmed:
+            return
+
+        deleted_count = 0
+        errors: list[str] = []
+        for folder in run_folders:
+            try:
+                shutil.rmtree(folder)
+                deleted_count += 1
+            except OSError as exc:
+                errors.append(f"「{folder.name}」刪除失敗：{exc}")
+
+        if summary_exists:
+            try:
+                summary_path.unlink()
+            except OSError as exc:
+                errors.append(f"「{summary_path.name}」刪除失敗：{exc}")
+
+        # 這批資料夾已經被刪掉，之前「產生」留下的狀態不再對應磁碟上的任何東西，
+        # 避免使用者之後誤按組合對照表的「套用變更」改寫到已經不存在的資料夾。
+        self._last_generated_output_dir = None
+        self._last_generated_template_path = None
+        self._last_generated_active_configs = None
+
+        self.log(
+            f"已刪除「{output_dir}」底下 {deleted_count} 個「{run_prefix}*」資料夾"
+            + ("與組合對照表 txt" if summary_exists and not errors else "")
+            + "。"
+        )
+        if errors:
+            messagebox.showerror(
+                "部分刪除失敗",
+                f"成功刪除 {deleted_count} 個資料夾；以下項目刪除失敗：\n- " + "\n- ".join(errors),
+            )
+        else:
+            messagebox.showinfo(
+                "刪除完成",
+                f"已刪除 {deleted_count} 個資料夾" + ("與組合對照表 txt" if summary_exists else "") + "。",
+            )
+
+
+class FindReplaceDialog(tk.Toplevel):
+    """Ctrl+H 開啟的尋找及取代視窗，非強制 modal（可以開著視窗同時回去編輯器操作）。"""
+
+    def __init__(self, app: "DoeApp") -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.title("尋找及取代")
+        self.resizable(False, False)
+
+        self.find_var = tk.StringVar(value=app.search_var.get())
+        self.replace_var = tk.StringVar(value="")
+
+        frame = tk.Frame(self, padx=10, pady=10)
+        frame.pack(fill="both", expand=True)
+
+        tk.Label(frame, text="尋找：").grid(row=0, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.find_var, width=32).grid(
+            row=0, column=1, columnspan=3, sticky="we", pady=(0, 6)
+        )
+        tk.Label(frame, text="取代為：").grid(row=1, column=0, sticky="w")
+        tk.Entry(frame, textvariable=self.replace_var, width=32).grid(
+            row=1, column=1, columnspan=3, sticky="we"
+        )
+
+        ttk.Button(frame, text="找下一個", command=self._find_next).grid(
+            row=2, column=0, pady=(10, 0)
+        )
+        ttk.Button(frame, text="取代", command=self._replace_one).grid(
+            row=2, column=1, pady=(10, 0)
+        )
+        ttk.Button(frame, text="全部取代", command=self._replace_all).grid(
+            row=2, column=2, pady=(10, 0)
+        )
+        ttk.Button(frame, text="關閉", command=self.destroy).grid(row=2, column=3, pady=(10, 0))
+
+    def _sync_search_var(self) -> None:
+        self.app.search_var.set(self.find_var.get())
+
+    def _find_next(self) -> None:
+        """跟搜尋條件（關鍵字、區分大小寫、全字匹配）比對 app 上次「真的搜尋過」
+        的快照：條件沒變就沿用現有的 _search_matches 往前進一格（呼叫
+        on_find_next，行為跟主工具列的 F3 一致）；條件變了（或還沒搜過、或上次
+        搜尋是從主工具列觸發、關鍵字跟這裡不同）才重新搜尋一次。不能每次都無條件
+        呼叫 on_search_template_text()：那樣每次點擊都會把符合索引重設回 0，
+        永遠停在第一筆，等於「找下一個」按鈕沒有作用。
+        """
+        self._sync_search_var()
+        desired_signature = (
+            self.find_var.get(),
+            self.app.search_case_sensitive_var.get(),
+            self.app.search_whole_word_var.get(),
+        )
+        if self.app._search_signature == desired_signature and self.app._search_matches:
+            self.app.on_find_next()
+        else:
+            self.app.on_search_template_text()
+
+    def _replace_one(self) -> None:
+        """取代目前選取範圍（若內容符合搜尋關鍵字），然後找下一個。
+
+        取代完之後要從「剛插入的取代文字後面」開始找下一筆，不能直接沿用一般的
+        「找下一個」邏輯對整份文件從頭重新搜尋：取代動作本身是一次文字編輯，
+        會觸發 `_clear_search_state()` 清空搜尋快取（見 `_on_template_text_
+        modified`），所以 `_find_next()` 這時一定會重新搜尋一次；如果取代文字
+        本身包含搜尋關鍵字（例如 foo -> foobar），從頭搜尋到的第一筆會落在剛
+        取代出來的那段文字裡，導致卡在同一個地方重複取代
+        （foo foo -> foobar foo -> foobarbar foo -> ...），游標從未真的前進。
+        """
+        self._sync_search_var()
+        text_widget = self.app.template_text
+        keyword = self.find_var.get()
+        if not keyword:
+            return
+
+        sel_ranges = text_widget.tag_ranges("sel")
+        resume_from_index = None
+        if sel_ranges:
+            selected = text_widget.get(sel_ranges[0], sel_ranges[1])
+            case_sensitive = self.app.search_case_sensitive_var.get()
+            match = selected == keyword if case_sensitive else selected.lower() == keyword.lower()
+            if match:
+                replacement = self.replace_var.get()
+                start_index = str(sel_ranges[0])
+                text_widget.delete(sel_ranges[0], sel_ranges[1])
+                text_widget.insert(start_index, replacement)
+                resume_from_index = f"{start_index}+{len(replacement)}c"
+
+        if resume_from_index is None:
+            # 沒有實際取代到任何東西（例如目前選取範圍不是搜尋關鍵字），單純當作
+            # 「找下一個」用，沿用既有的續搜邏輯。
+            self._find_next()
+            return
+
+        self.app.on_search_template_text()
+        self._select_first_match_at_or_after(resume_from_index)
+
+    def _select_first_match_at_or_after(self, start_index: str) -> None:
+        """在（剛重新搜尋過的）app._search_matches 裡，挑第一個起點不早於
+        start_index 的符合項當作目前選取；找不到（start_index 之後已經沒有
+        符合項）就維持 on_search_template_text 預設選到的第一筆，等同從文件
+        開頭繞回來繼續找。"""
+        text_widget = self.app.template_text
+        for i, (match_start, _match_end) in enumerate(self.app._search_matches):
+            if text_widget.compare(match_start, ">=", start_index):
+                self.app._search_match_index = i
+                self.app._goto_search_match()
+                self.app.search_status_var.set(
+                    f"共 {len(self.app._search_matches)} 個符合"
+                    f"（{i + 1}/{len(self.app._search_matches)}）"
+                )
+                return
+
+    def _replace_all(self) -> None:
+        self._sync_search_var()
+        keyword = self.find_var.get()
+        if not keyword:
+            return
+        replacement = self.replace_var.get()
+        self.app.on_search_template_text()
+        matches = list(self.app._search_matches)
+        if not matches:
+            messagebox.showinfo("全部取代", "找不到符合的文字。", parent=self)
+            return
+
+        text_widget = self.app.template_text
+        text_widget.configure(autoseparators=False)
+        text_widget.edit_separator()
+        # 從最後一筆往前取代：避免前面的取代改變字元數後，還沒處理的後面那些
+        # 已經記錄好的絕對位移 index 被打亂。
+        for start_index, end_index in reversed(matches):
+            text_widget.delete(start_index, end_index)
+            text_widget.insert(start_index, replacement)
+        text_widget.edit_separator()
+        text_widget.configure(autoseparators=True)
+        self.app.log(f"已全部取代 {len(matches)} 處：「{keyword}」→「{replacement}」。")
+        self.app.on_search_template_text()
+
+
+def main() -> None:
+    root = tk.Tk()
+    DoeApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    _ensure_configured_python()
+    main()
