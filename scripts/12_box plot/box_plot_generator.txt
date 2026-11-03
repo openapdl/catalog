@@ -29,18 +29,24 @@ PYTHONW_EXE = Path(
     r"C:\Users\python3.8\win64\pythonw.exe"
 )
 
-# ====== 兩個最常調整的「數量」參數，故意放在一起方便修改 ======
+# ====== 幾個最常調整的「數量」參數，故意放在一起方便修改 ======
 
 # 要產生的溫度點數量：改這個數字即可，雙擊執行會依此數量自動產生
 # 10、20、30...（每點間距 10）當作溫度點名稱。數量上限見 MAX_TEMPERATURES。
-TEMPERATURE_COUNT = 20
+TEMPERATURE_COUNT = 7
 
 # 每個溫度點收集的樣本數量（「工作表1」每欄 #1~#N 的資料筆數）。改這個數字即可
 # 擴增或縮減樣本數，表格列數、統計公式範圍、輔助工作表欄位與圖表的離群值
 # 系列都會依此數量自動跟著調整，不需要另外改動其他地方。
-SAMPLE_COUNT = 7
+SAMPLE_COUNT = 20
 if not isinstance(SAMPLE_COUNT, int) or SAMPLE_COUNT < 1:
     raise ValueError("SAMPLE_COUNT 至少需要 1 筆樣本。")
+
+# Leg 系列基礎名稱清單：只需列出「基礎名稱」，腳本會自動產生對應的
+# _NT（Non-Temperature-cycled）與 _T（Temperature-cycled）兩條線，列數與
+# 第二張圖表的數列會自動跟著這份清單長度調整。新增/移除 leg 時改這裡即可，
+# 不用動後面任何列號或圖表程式碼。留空串列 [] 代表不產生任何 leg 系列。
+LEG_NAMES = ["Baseline", "Leg_1", "Leg_2", "Leg_3", "Leg_4"]
 
 # Cal Target (Cons.) 紅色線段是否在圖表上顯示資料標籤數值的開關（1=開啟、0=關閉），
 # 以及標籤顯示的小數點位數。
@@ -52,6 +58,11 @@ MAX_TEMPERATURES = 20
 TEMPERATURE_STEP = 10
 
 STRICT_TARGET_STEPS = 5
+
+# Upper Spec / Lower Spec 寫死數值（使用者要求暫不開放調整）。
+SPEC_UPPER_VALUE = 100.0
+SPEC_LOWER_VALUE = -100.0
+
 ERROR_LOG_FILENAME = "box_plot_error.log"
 DEFAULT_FONT = "新細明體"
 CHART_FONT = "Microsoft JhengHei"
@@ -60,6 +71,32 @@ CHART_FONT = "Microsoft JhengHei"
 X_AXIS_TITLE = "Temperature, Heating"
 Y_AXIS_TITLE = "Warpage, Um"
 AXIS_TITLE_FONT_SIZE = 13
+
+# Y 軸上下限（四張圖共用同一組，方便疊圖比較）。留 None 表示自動：從目前這次
+# 產生的所有相關數值（樣本資料、Leg 資料、Upper/Lower Spec）取最大/最小值，
+# 外加一點邊界留白。如果自動抓出來的範圍不合用（例如留白太多/太少、或之後把
+# 公式覆寫成真實量測值後想要固定一組範圍），把這兩個改成固定數字
+# （例如 Y_AXIS_MIN = -300、Y_AXIS_MAX = 300）即可覆蓋掉自動值；兩個可以只改
+# 其中一個，另一個留 None 繼續自動。
+# 不論自動還是手動設定，最終範圍一律會被強制拉到至少涵蓋 0（見
+# _write_workbook() 計算 axis_min/axis_max 之後的收尾），確保 Y=0 基準線
+# 一定畫得出來——手動填的數字如果剛好同號，也會被拉到含 0。
+Y_AXIS_MIN = -300
+Y_AXIS_MAX = 300
+Y_AXIS_AUTO_MARGIN_RATIO = 0.1
+
+# 四張圖表的標題，改這裡即可調整各張圖表名稱（內容差異見 _add_chart()
+# 的 chart_variant 參數說明）：
+# - "primary"：第一張，純箱鬚圖本體，不含 Spec／Leg。
+# - "all"：第二張，疊加 Upper/Lower Spec ＋全部 Leg（_NT 與 _T）。
+# - "uncalibrated"：第三張，內容與 "all" 相同，但 Leg 只放 _NT。
+# - "calibrated"：第四張，內容與 "all" 相同，但 Leg 只放 _T。
+CHART_VARIANT_TITLES = {
+    "primary": "TSM Box Plot",
+    "all": "TSM Box Plot (All DOE)",
+    "uncalibrated": "TSM Box Plot (Uncalibrated)",
+    "calibrated": "TSM Box Plot (Calibrated)",
+}
 
 # 離群值資料標籤：是否在圖表上顯示離群值的數值、小數點位數與字體大小。
 SHOW_OUTLIER_DATA_LABELS = True
@@ -80,6 +117,22 @@ BOX_GAP_WIDTH = 500
 # 而非各溫度點自己的 IQR，確保每個溫度點的扁柱厚度一致，不會因為某些點的箱體
 # （IQR）較大就顯得比較不扁。
 MEDIAN_MARKER_THICKNESS_RATIO = 0.01
+
+# Leg 系列（LEG_NAMES）配色票：每個 base 依序取一組「深／淺」同色系顏色，
+# _NT 用深色＋實線、_T 用淺色＋虛線，同一 base 的兩條線共用同一色系、
+# 靠線型區分，讓使用者一眼看出 NT/T 是同一組配對；base 數量超過色票長度時
+# 會循環重複。顏色刻意避開圖表其他既有元素（鬚端點/平均值/離群值/
+# Cal Target/Upper Spec/Lower Spec）已經用過的色碼，避免混淆。
+LEG_COLOR_PALETTE = [
+    ("#7030A0", "#CCB2DC"),  # 紫
+    ("#1B7F79", "#9DD4CF"),  # 藍綠
+    ("#C55A11", "#F8CBAD"),  # 珊瑚橘
+    ("#9E2A2B", "#F2B6B6"),  # 磚紅
+    ("#A6336B", "#F0B7D1"),  # 洋紅
+    ("#7F4F24", "#E6C9A8"),  # 棕
+    ("#44546A", "#B8C2D1"),  # 靛灰
+    ("#4F6228", "#C5D9A0"),  # 橄欖綠
+]
 
 
 def _default_temperatures(count):
@@ -111,7 +164,20 @@ SUMMARY_AVERAGE_ROW = SUMMARY_MAX_ROW + 1
 TARGET_BASE_ROW = SUMMARY_AVERAGE_ROW + 1
 TARGET_FIRST_STRICT_ROW = TARGET_BASE_ROW + 1
 TARGET_LAST_STRICT_ROW = TARGET_FIRST_STRICT_ROW + STRICT_TARGET_STEPS - 1
-STATS_HEADER_ROW = TARGET_LAST_STRICT_ROW + 2
+SPEC_UPPER_ROW = TARGET_LAST_STRICT_ROW + 1
+SPEC_LOWER_ROW = SPEC_UPPER_ROW + 1
+
+# Leg 系列（LEG_NAMES 的 _NT 全部列在前、_T 全部列在後），列數隨 LEG_NAMES 長度
+# 浮動；LEG_NAMES 為空串列時 LEG_LAST_ROW 會等於 SPEC_LOWER_ROW，版面自動退化
+# 成沒有 leg 區塊的樣子，不需要另外寫分支判斷。
+LEG_SERIES_NAMES = (
+    ["{}_NT".format(name) for name in LEG_NAMES]
+    + ["{}_T".format(name) for name in LEG_NAMES]
+)
+LEG_FIRST_ROW = SPEC_LOWER_ROW + 1
+LEG_LAST_ROW = LEG_FIRST_ROW + len(LEG_SERIES_NAMES) - 1
+
+STATS_HEADER_ROW = LEG_LAST_ROW + 2
 COUNT_ROW = STATS_HEADER_ROW + 1
 MIN_ROW = COUNT_ROW + 1
 Q1_ROW = MIN_ROW + 1
@@ -125,8 +191,6 @@ UPPER_BOUND_ROW = LOWER_BOUND_ROW + 1
 LOWER_WHISKER_ROW = UPPER_BOUND_ROW + 1
 UPPER_WHISKER_ROW = LOWER_WHISKER_ROW + 1
 OUTLIER_COUNT_ROW = UPPER_WHISKER_ROW + 1
-NOTE_ROW = OUTLIER_COUNT_ROW + 2
-EXPLANATION_ROW = NOTE_ROW + 1
 
 # Statistics sheet positions (1-based Excel rows/columns).
 BOX_STATS_LABEL_COL = 10  # J
@@ -330,6 +394,31 @@ def _cached_target(stats, step=None):
     return average + (end_value - average) * step / float(STRICT_TARGET_STEPS)
 
 
+def _nice_axis_major_unit(axis_range, target_tick_count=8):
+    """Round the Y 軸刻度間距到一個「漂亮」數字（1/2/5 × 10 的次方）。
+
+    Excel 的格線是以 0 為基準、按 major unit 的整數倍畫出來的，不是從軸的
+    min 開始算；只要 major unit 是這種漂亮數字，0（只要落在軸範圍內）就
+    一定會剛好對齊到一條格線，Y=0 的刻度標籤才會確實被畫出來，而不是只是
+    「範圍涵蓋 0」卻剛好沒有刻度線經過它。
+    """
+    if axis_range <= 0:
+        return 1.0
+
+    raw_step = axis_range / float(target_tick_count)
+    magnitude = 10.0 ** math.floor(math.log10(raw_step))
+    normalized = raw_step / magnitude
+    if normalized <= 1:
+        nice = 1
+    elif normalized <= 2:
+        nice = 2
+    elif normalized <= 5:
+        nice = 5
+    else:
+        nice = 10
+    return nice * magnitude
+
+
 def _create_formats(workbook, font_name):
     border = {"border": 1, "border_color": "#BFBFBF"}
     centered = {"align": "center", "valign": "vcenter"}
@@ -342,7 +431,7 @@ def _create_formats(workbook, font_name):
             dict(
                 {
                     "font_name": font_name,
-                    "num_format": "0.0000",
+                    "num_format": "0.00",
                 },
                 **centered
             )
@@ -361,7 +450,7 @@ def _create_formats(workbook, font_name):
                 {
                     "font_name": font_name,
                     "bg_color": "#FFD966",
-                    "num_format": "0.0000",
+                    "num_format": "0.00",
                 },
                 **centered
             )
@@ -380,7 +469,44 @@ def _create_formats(workbook, font_name):
                 {
                     "font_name": font_name,
                     "bg_color": "#FFF2CC",
-                    "num_format": "0.0000",
+                    "num_format": "0.00",
+                },
+                **centered
+            )
+        ),
+        "spec_label": workbook.add_format(
+            {
+                "font_name": font_name,
+                "bold": True,
+                "bg_color": "#FCE4D6",
+                "align": "left",
+                "valign": "vcenter",
+            }
+        ),
+        "spec_number": workbook.add_format(
+            dict(
+                {
+                    "font_name": font_name,
+                    "bg_color": "#FCE4D6",
+                    "num_format": "0.00",
+                },
+                **centered
+            )
+        ),
+        "leg_label": workbook.add_format(
+            {
+                "font_name": font_name,
+                "bold": True,
+                "bg_color": "#F2F2F2",
+                "align": "left",
+                "valign": "vcenter",
+            }
+        ),
+        "leg_number": workbook.add_format(
+            dict(
+                {
+                    "font_name": font_name,
+                    "num_format": "0.00",
                 },
                 **centered
             )
@@ -419,7 +545,7 @@ def _create_formats(workbook, font_name):
             dict(
                 {
                     "font_name": font_name,
-                    "num_format": "0.0000",
+                    "num_format": "0.00",
                 },
                 **dict(centered, **border)
             )
@@ -429,7 +555,7 @@ def _create_formats(workbook, font_name):
                 {
                     "font_name": font_name,
                     "bg_color": "#70AD47",
-                    "num_format": "0.0000",
+                    "num_format": "0.00",
                 },
                 **dict(centered, **border)
             )
@@ -442,15 +568,6 @@ def _create_formats(workbook, font_name):
                 "font_color": "#595959",
                 "align": "center",
                 "valign": "vcenter",
-            }
-        ),
-        "explanation": workbook.add_format(
-            {
-                "font_name": font_name,
-                "font_size": 9,
-                "font_color": "#595959",
-                "text_wrap": True,
-                "valign": "top",
             }
         ),
         "info_title": workbook.add_format(
@@ -476,7 +593,7 @@ def _create_formats(workbook, font_name):
     return formats
 
 
-def _write_main_sheet(workbook, worksheet, temperatures, data, stats, formats):
+def _write_main_sheet(workbook, worksheet, temperatures, data, stats, leg_data, formats):
     last_data_col = 1 + len(temperatures)  # 1-based Excel column.
 
     worksheet.hide_gridlines(2)
@@ -501,7 +618,7 @@ def _write_main_sheet(workbook, worksheet, temperatures, data, stats, formats):
     worksheet.add_table(
         HEADER_ROW - 1,
         0,
-        TARGET_LAST_STRICT_ROW - 1,
+        LEG_LAST_ROW - 1,
         last_data_col - 1,
         {
             "name": "tblBoxData2010",
@@ -590,6 +707,30 @@ def _write_main_sheet(workbook, worksheet, temperatures, data, stats, formats):
                 _cached_target(statistic, step),
             )
 
+    worksheet.write(SPEC_UPPER_ROW - 1, 0, "Upper Spec", formats["spec_label"])
+    worksheet.write(SPEC_LOWER_ROW - 1, 0, "Lower Spec", formats["spec_label"])
+    for temperature_index in range(len(temperatures)):
+        col = temperature_index + 2
+        worksheet.write_number(
+            SPEC_UPPER_ROW - 1, col - 1, SPEC_UPPER_VALUE, formats["spec_number"]
+        )
+        worksheet.write_number(
+            SPEC_LOWER_ROW - 1, col - 1, SPEC_LOWER_VALUE, formats["spec_number"]
+        )
+
+    for leg_row_offset, leg_name in enumerate(LEG_SERIES_NAMES):
+        row = LEG_FIRST_ROW + leg_row_offset
+        worksheet.write(row - 1, 0, leg_name, formats["leg_label"])
+        for temperature_index in range(len(temperatures)):
+            col = temperature_index + 2
+            worksheet.write_formula(
+                row - 1,
+                col - 1,
+                "=RAND()*500-250",
+                formats["leg_number"],
+                leg_data[leg_row_offset][temperature_index],
+            )
+
     worksheet.write(STATS_HEADER_ROW - 1, 0, "統計指標", formats["stats_header"])
     for temperature_index, temperature in enumerate(temperatures):
         worksheet.write(
@@ -626,6 +767,8 @@ def _write_main_sheet(workbook, worksheet, temperatures, data, stats, formats):
             "Cal Target (Str.{})".format(step)
             for step in range(1, STRICT_TARGET_STEPS + 1)
         ]
+        + ["Upper Spec", "Lower Spec"]
+        + LEG_SERIES_NAMES
         + ["統計指標"]
         + [label for _, label, _ in statistic_rows]
     )
@@ -721,35 +864,17 @@ def _write_main_sheet(workbook, worksheet, temperatures, data, stats, formats):
                 cached_values[row],
             )
 
-    worksheet.merge_range(
-        NOTE_ROW - 1,
-        0,
-        NOTE_ROW - 1,
-        last_data_col - 1,
-        "Excel 2010 相容作法：QUARTILE（含端點）＋1.5×IQR；"
-        "圖表採標準折線圖、漲跌柱、自訂誤差線與資料標記。",
-        formats["note"],
-    )
-
-    worksheet.merge_range(
-        EXPLANATION_ROW - 1,
-        0,
-        EXPLANATION_ROW - 1,
-        last_data_col - 1,
-        "Cal Target 概念：Cons.（保守作法，第15列）直接以平均值本身作為校正目標，"
-        "正負方向對應上鬚或下鬚，為最寬鬆設定；Str.1～5（第16～20列）則依序將目標從平均值"
-        "往同方向鬚線端點以1/5～5/5比例內插，數字越大越接近鬚線端點、代表校正要求越嚴格，"
-        "Str.5 即等於鬚線端點本身。\n"
-        "盒（Box）代表涵義：盒體：Q1～Q3；分界線：中位數；鬚：1.5×IQR 內最遠值；"
-        "紫色×：平均值；紅點：離群值；橘色：Cal Target。",
-        formats["explanation"],
-    )
-    worksheet.set_row(EXPLANATION_ROW - 1, 60)
-
     chart_width = max(1000, min(1450, 70 * len(temperatures)))
     chart_height = 620
-    chart_start_row = EXPLANATION_ROW + 1  # Zero-based row for A40 with current layout.
-    chart_end_row = chart_start_row + int(math.ceil(chart_height / 20.0)) + 1
+    rows_per_chart = int(math.ceil(chart_height / 20.0)) + 1
+    chart_gap_rows = 2
+    # Zero-based row for the first chart, one blank row below the stats block;
+    # the remaining charts stack directly below it with a small gap each.
+    chart_start_rows = [
+        OUTLIER_COUNT_ROW + 1 + chart_index * (rows_per_chart + chart_gap_rows)
+        for chart_index in range(len(CHART_VARIANT_TITLES))
+    ]
+    chart_end_row = chart_start_rows[-1] + rows_per_chart
 
     worksheet.set_landscape()
     worksheet.set_paper(9)  # A4.
@@ -758,7 +883,7 @@ def _write_main_sheet(workbook, worksheet, temperatures, data, stats, formats):
     worksheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
     worksheet.print_area(0, 0, chart_end_row, last_data_col - 1)
 
-    return chart_start_row, chart_width, chart_height
+    return chart_start_rows, chart_width, chart_height
 
 
 def _write_stats_sheet(worksheet, temperatures, stats, formats):
@@ -1042,7 +1167,21 @@ def _write_helper_sheet(worksheet, temperatures, data, stats, formats):
     worksheet.hide()
 
 
-def _add_chart(workbook, worksheet, temperatures, chart_start_row, chart_width, chart_height):
+def _add_chart(
+    workbook,
+    worksheet,
+    temperatures,
+    chart_start_row,
+    chart_width,
+    chart_height,
+    axis_min,
+    axis_max,
+    axis_major_unit,
+    chart_variant="primary",
+):
+    include_nt_legs = chart_variant in ("all", "uncalibrated")
+    include_t_legs = chart_variant in ("all", "calibrated")
+
     first_helper_row = 2
     last_helper_row = first_helper_row + len(temperatures) - 1
     categories = _sheet_range(
@@ -1192,6 +1331,88 @@ def _add_chart(workbook, worksheet, temperatures, chart_start_row, chart_width, 
     add_series(
         chart,
         {
+            "name": "Upper Spec",
+            "categories": categories,
+            "values": _sheet_range(
+                MAIN_SHEET, SPEC_UPPER_ROW, 2, SPEC_UPPER_ROW, last_data_col
+            ),
+            "line": {
+                "color": calibration_color,
+                "width": 0.25,
+            },
+            "marker": {"type": "none"},
+        },
+        show_in_legend=True,
+    )
+    add_series(
+        chart,
+        {
+            "name": "Lower Spec",
+            "categories": categories,
+            "values": _sheet_range(
+                MAIN_SHEET, SPEC_LOWER_ROW, 2, SPEC_LOWER_ROW, last_data_col
+            ),
+            "line": {
+                "color": calibration_color,
+                "width": 0.25,
+            },
+            "marker": {"type": "none"},
+        },
+        show_in_legend=True,
+    )
+    for leg_index, leg_base_name in enumerate(LEG_NAMES):
+        dark_color, light_color = LEG_COLOR_PALETTE[
+            leg_index % len(LEG_COLOR_PALETTE)
+        ]
+        nt_row = LEG_FIRST_ROW + leg_index
+        t_row = LEG_FIRST_ROW + len(LEG_NAMES) + leg_index
+        if include_nt_legs:
+            add_series(
+                chart,
+                {
+                    "name": "{}_NT".format(leg_base_name),
+                    "categories": categories,
+                    "values": _sheet_range(
+                        MAIN_SHEET, nt_row, 2, nt_row, last_data_col
+                    ),
+                    "line": {"color": dark_color, "width": 1.5},
+                    "marker": {
+                        "type": "diamond",
+                        "size": 5,
+                        "fill": {"color": dark_color},
+                        "border": {"color": dark_color},
+                    },
+                },
+                show_in_legend=True,
+            )
+        if include_t_legs:
+            # "calibrated"（只放 T）要跟 "uncalibrated"（只放 NT）用同一個深淺，
+            # 不要一深一淺；只有兩者都出現的 "all" 才需要靠深淺區分 NT/T。
+            t_color = dark_color if chart_variant == "calibrated" else light_color
+            add_series(
+                chart,
+                {
+                    "name": "{}_T".format(leg_base_name),
+                    "categories": categories,
+                    "values": _sheet_range(
+                        MAIN_SHEET, t_row, 2, t_row, last_data_col
+                    ),
+                    "line": {
+                        "color": t_color,
+                        "width": 1.5,
+                    },
+                    "marker": {
+                        "type": "diamond",
+                        "size": 5,
+                        "fill": {"color": t_color},
+                        "border": {"color": t_color},
+                    },
+                },
+                show_in_legend=True,
+            )
+    add_series(
+        chart,
+        {
             "name": "下鬚端點",
             "categories": categories,
             "values": _sheet_range(
@@ -1269,7 +1490,12 @@ def _add_chart(workbook, worksheet, temperatures, chart_start_row, chart_width, 
     add_series(
         median_chart,
         {
-            "name": "中位數底座",
+            # 名稱刻意留空：Excel 在圖例位置非 "top" 時，似乎不會確實套用
+            # delete_series 把這個輔助系列從圖例裡刪掉（"top" 那張正常，
+            # "right" 那三張會漏），所以不能只靠 delete_series。改成空字串
+            # 當雙重保險：就算刪除沒生效，圖例頂多多一個看不到文字的空白
+            # 列（本來 fill/border 就是 none），不會再顯示「中位數底座」。
+            "name": "",
             "categories": categories,
             "values": helper_range(HELPER_MEDIAN_BASE_COL),
             "fill": {"none": True},
@@ -1290,9 +1516,10 @@ def _add_chart(workbook, worksheet, temperatures, chart_start_row, chart_width, 
         show_in_legend=True,
     )
     chart.combine(median_chart)
+    chart_title = CHART_VARIANT_TITLES[chart_variant]
     chart.set_title(
         {
-            "name": "TSM Box Plot",
+            "name": chart_title,
             "name_font": {"name": CHART_FONT, "size": 18, "bold": True},
         }
     )
@@ -1323,6 +1550,9 @@ def _add_chart(workbook, worksheet, temperatures, chart_start_row, chart_width, 
                 "color": "#404040",
             },
             "crossing": 0,
+            "min": axis_min,
+            "max": axis_max,
+            "major_unit": axis_major_unit,
             "num_format": "0.0##",
             "major_tick_mark": "outside",
             "line": {"color": "#7F7F7F", "width": 0.75},
@@ -1333,9 +1563,12 @@ def _add_chart(workbook, worksheet, temperatures, chart_start_row, chart_width, 
             "num_font": {"name": CHART_FONT, "size": 12, "color": "#404040"},
         }
     )
+    # 第一張（primary，純箱鬚圖本體）圖例維持在上方；其餘三張（all／
+    # uncalibrated／calibrated，數列較多）圖例改放右側，避免跟圖表標題擠在一起。
+    legend_position = "top" if chart_variant == "primary" else "right"
     chart.set_legend(
         {
-            "position": "top",
+            "position": legend_position,
             "delete_series": hidden_legend_series,
             "font": {"name": CHART_FONT, "size": 14, "color": "#404040"},
         }
@@ -1434,6 +1667,26 @@ def _write_workbook(path, temperatures, script_dir):
         for _ in temperatures
     ]
     stats = [_calculate_statistics(values) for values in data]
+    leg_data = [
+        [rng.random() * 500.0 - 250.0 for _ in temperatures]
+        for _ in LEG_SERIES_NAMES
+    ]
+
+    all_values = (
+        [value for column_values in data for value in column_values]
+        + [value for row_values in leg_data for value in row_values]
+        + [SPEC_UPPER_VALUE, SPEC_LOWER_VALUE]
+    )
+    raw_min, raw_max = min(all_values), max(all_values)
+    axis_margin = (raw_max - raw_min) * Y_AXIS_AUTO_MARGIN_RATIO
+    axis_min = Y_AXIS_MIN if Y_AXIS_MIN is not None else raw_min - axis_margin
+    axis_max = Y_AXIS_MAX if Y_AXIS_MAX is not None else raw_max + axis_margin
+    # 不論自動或手動設定，Y=0 一律要落在範圍內，才能保證基準線一定畫得出來。
+    axis_min = min(axis_min, 0.0)
+    axis_max = max(axis_max, 0.0)
+    # 格線間距用「漂亮數字」而非 Excel 自動選值，確保 0 一定剛好落在某條
+    # 格線上、刻度標籤「0」才會真的被畫出來，不是只有範圍涵蓋到而已。
+    axis_major_unit = _nice_axis_major_unit(axis_max - axis_min)
 
     workbook = xlsxwriter.Workbook(str(path))
     try:
@@ -1452,19 +1705,25 @@ def _write_workbook(path, temperatures, script_dir):
         stats_sheet = workbook.add_worksheet(STATS_SHEET)
         helper_sheet = workbook.add_worksheet(HELPER_SHEET)
 
-        chart_start_row, chart_width, chart_height = _write_main_sheet(
-            workbook, main_sheet, temperatures, data, stats, formats
+        chart_start_rows, chart_width, chart_height = _write_main_sheet(
+            workbook, main_sheet, temperatures, data, stats, leg_data, formats
         )
         _write_stats_sheet(stats_sheet, temperatures, stats, formats)
         _write_helper_sheet(helper_sheet, temperatures, data, stats, formats)
-        _add_chart(
-            workbook,
-            main_sheet,
-            temperatures,
-            chart_start_row,
-            chart_width,
-            chart_height,
-        )
+        chart_variants = ["primary", "all", "uncalibrated", "calibrated"]
+        for chart_start_row, chart_variant in zip(chart_start_rows, chart_variants):
+            _add_chart(
+                workbook,
+                main_sheet,
+                temperatures,
+                chart_start_row,
+                chart_width,
+                chart_height,
+                axis_min,
+                axis_max,
+                axis_major_unit,
+                chart_variant=chart_variant,
+            )
         main_sheet.activate()
     finally:
         workbook.close()
