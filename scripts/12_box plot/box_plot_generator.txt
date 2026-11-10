@@ -1,228 +1,134 @@
 # -*- coding: utf-8 -*-
-"""Create an Excel 2010 compatible box plot workbook without a template.
+"""Create the "classic plot" Excel 2010 compatible box plot workbook.
 
-The workbook structure and colors follow ``box plot.xlsx``.  The number of
-temperature points is controlled by the ``TEMPERATURE_COUNT`` constant below;
-double-clicking this .pyw file generates that many points (10, 20, 30, ...)
-into one workbook.  A command line form is also available:
+結構依照 ``tsm data2_盒鬚圖.xlsx``（見本資料夾 ``TSM_Box_Plot_製作SOP.md``）：
+股價圖 hiLowLines + upDownBars 畫箱體/鬚線，另疊加 XY 散點圖把每個溫度點的
+原始樣本與平均值畫上去。這是跟 ``box_plot_generator.pyw``（誤差線版）不同
+的另一套技巧，兩者不相容、不要混用。
 
-    python box_plot_generator.pyw --generate output.xlsx
+溫度點清單與每個溫度點的樣本數量是最常需要擴增的兩個維度，故意放在檔案
+最前面：改 ``TEMPERATURES``／``SAMPLE_COUNT`` 即可擴增，樣本資料
+（``SAMPLE_DATA``）會依這兩個設定自動產生對應形狀的隨機數值，不需要手動
+補資料；其餘列號／輔助資料／圖表都會自動跟著調整。主工作表的樣本格寫的
+是 Excel ``RAND()`` 公式（不是寫死的數字），開啟活頁簿後按 F9 可以重新
+抽樣。
+
+    python tsm_classic_box_plot_generator.pyw --generate output.xlsx
 """
 
 from __future__ import print_function
 
 import argparse
-import math
 import os
 import random
-import re
 import subprocess
 import sys
 import tempfile
 import traceback
-import zipfile
 from pathlib import Path
 
 
 # 換到其他電腦時，只需修改下一行的 pythonw.exe 絕對路徑。
 PYTHONW_EXE = Path(
-    r"C:\Users\python3.8\win64\pythonw.exe"
+    r"C:\Users\015_python\python3.8\win64\pythonw.exe"
 )
 
-# ====== 幾個最常調整的「數量」參數，故意放在一起方便修改 ======
+# ====== 兩個最常調整的「數量」參數，故意放在一起方便修改 ======
 
-# 要產生的溫度點數量：改這個數字即可，雙擊執行會依此數量自動產生
-# 10、20、30...（每點間距 10）當作溫度點名稱。數量上限見 MAX_TEMPERATURES。
-TEMPERATURE_COUNT = 7
+# 溫度點（對應「工作表1」第 3 列、散點圖類別軸文字）。
+TEMPERATURES = ["30", "75", "150", "180", "217", "240", "250", "251", "252", "260"]
 
-# 每個溫度點收集的樣本數量（「工作表1」每欄 #1~#N 的資料筆數）。改這個數字即可
-# 擴增或縮減樣本數，表格列數、統計公式範圍、輔助工作表欄位與圖表的離群值
-# 系列都會依此數量自動跟著調整，不需要另外改動其他地方。
-SAMPLE_COUNT = 20
-if not isinstance(SAMPLE_COUNT, int) or SAMPLE_COUNT < 1:
-    raise ValueError("SAMPLE_COUNT 至少需要 1 筆樣本。")
+# 每個溫度點的原始樣本筆數（「工作表1」每欄 #1~#N 的資料列數）。
+SAMPLE_COUNT = 11
 
-# Leg 系列基礎名稱清單：只需列出「基礎名稱」，腳本會自動產生對應的
-# _NT（Non-Temperature-cycled）與 _T（Temperature-cycled）兩條線，列數與
-# 第二張圖表的數列會自動跟著這份清單長度調整。新增/移除 leg 時改這裡即可，
-# 不用動後面任何列號或圖表程式碼。留空串列 [] 代表不產生任何 leg 系列。
-LEG_NAMES = ["Baseline", "Leg_1", "Leg_2", "Leg_3", "Leg_4"]
+# 原始樣本資料的隨機範圍（均勻分布，min/max）。主工作表的樣本格會寫成
+# Excel RAND() 公式（開啟後按 F9 可重新抽樣），這裡的 Python 亂數只用來
+# 產生當次生成檔案時的初始快取值。
+RANDOM_SAMPLE_MIN = -100.0
+RANDOM_SAMPLE_MAX = 100.0
 
-# Cal Target (Cons.) 紅色線段是否在圖表上顯示資料標籤數值的開關（1=開啟、0=關閉），
-# 以及標籤顯示的小數點位數。
-SHOW_CAL_TARGET_CONS_LABELS = 0
-CAL_TARGET_CONS_LABEL_DECIMALS = 1
-
-# ====== 以下為其他較少調整的參數 ======
-MAX_TEMPERATURES = 20
-TEMPERATURE_STEP = 10
-
-STRICT_TARGET_STEPS = 5
-
-# Upper Spec / Lower Spec 寫死數值（使用者要求暫不開放調整）。
-SPEC_UPPER_VALUE = 100.0
-SPEC_LOWER_VALUE = -100.0
-
-ERROR_LOG_FILENAME = "box_plot_error.log"
-DEFAULT_FONT = "新細明體"
-CHART_FONT = "Microsoft JhengHei"
-
-# 圖表 X/Y 軸標題文字與字體大小，改這裡即可調整軸標籤內容。
-X_AXIS_TITLE = "Temperature, Heating"
-Y_AXIS_TITLE = "Warpage, Um"
-AXIS_TITLE_FONT_SIZE = 13
-
-# Y 軸上下限（四張圖共用同一組，方便疊圖比較）。留 None 表示自動：從目前這次
-# 產生的所有相關數值（樣本資料、Leg 資料、Upper/Lower Spec）取最大/最小值，
-# 外加一點邊界留白。如果自動抓出來的範圍不合用（例如留白太多/太少、或之後把
-# 公式覆寫成真實量測值後想要固定一組範圍），把這兩個改成固定數字
-# （例如 Y_AXIS_MIN = -300、Y_AXIS_MAX = 300）即可覆蓋掉自動值；兩個可以只改
-# 其中一個，另一個留 None 繼續自動。
-# 不論自動還是手動設定，最終範圍一律會被強制拉到至少涵蓋 0（見
-# _write_workbook() 計算 axis_min/axis_max 之後的收尾），確保 Y=0 基準線
-# 一定畫得出來——手動填的數字如果剛好同號，也會被拉到含 0。
-Y_AXIS_MIN = -300
-Y_AXIS_MAX = 300
-Y_AXIS_AUTO_MARGIN_RATIO = 0.1
-
-# 四張圖表的標題，改這裡即可調整各張圖表名稱（內容差異見 _add_chart()
-# 的 chart_variant 參數說明）：
-# - "primary"：第一張，純箱鬚圖本體，不含 Spec／Leg。
-# - "all"：第二張，疊加 Upper/Lower Spec ＋全部 Leg（_NT 與 _T）。
-# - "uncalibrated"：第三張，內容與 "all" 相同，但 Leg 只放 _NT。
-# - "calibrated"：第四張，內容與 "all" 相同，但 Leg 只放 _T。
-CHART_VARIANT_TITLES = {
-    "primary": "TSM Box Plot",
-    "all": "TSM Box Plot (All DOE)",
-    "uncalibrated": "TSM Box Plot (Uncalibrated)",
-    "calibrated": "TSM Box Plot (Calibrated)",
-}
-
-# 離群值資料標籤：是否在圖表上顯示離群值的數值、小數點位數與字體大小。
-SHOW_OUTLIER_DATA_LABELS = True
-OUTLIER_LABEL_DECIMALS = 1
-OUTLIER_LABEL_FONT_SIZE = 9
-
-# 工作表結構鎖定密碼：防止 _BoxPlot2010、盒鬚圖等隱藏工作表被人從
-# Excel 介面（右鍵→取消隱藏）直接叫出來。留空字串（""）則不啟用鎖定。
-# 注意：這是 Excel 內建的結構保護，屬於嚇阻層級、不是真正的檔案加密——
-# 熟悉 OOXML 格式的人仍可直接編輯 xlsx 內部 XML 移除保護，不能取代開啟密碼。
-# 不要把真正重要的密碼寫在這裡（這個檔案可能會被複製、分享）。
-WORKBOOK_STRUCTURE_PASSWORD = ""
-
-# 箱體（Q1~Q3）漲跌柱的 gapWidth：同時套用到中位數扁柱，讓兩者寬度一致。
-BOX_GAP_WIDTH = 500
-
-# 中位數扁柱厚度：以「所有溫度點整體數值範圍」（整體最大值-整體最小值）的比例計算，
-# 而非各溫度點自己的 IQR，確保每個溫度點的扁柱厚度一致，不會因為某些點的箱體
-# （IQR）較大就顯得比較不扁。
-MEDIAN_MARKER_THICKNESS_RATIO = 0.01
-
-# Leg 系列（LEG_NAMES）配色票：每個 base 依序取一組「深／淺」同色系顏色，
-# _NT 用深色＋實線、_T 用淺色＋虛線，同一 base 的兩條線共用同一色系、
-# 靠線型區分，讓使用者一眼看出 NT/T 是同一組配對；base 數量超過色票長度時
-# 會循環重複。顏色刻意避開圖表其他既有元素（鬚端點/平均值/離群值/
-# Cal Target/Upper Spec/Lower Spec）已經用過的色碼，避免混淆。
-LEG_COLOR_PALETTE = [
-    ("#7030A0", "#CCB2DC"),  # 紫
-    ("#1B7F79", "#9DD4CF"),  # 藍綠
-    ("#C55A11", "#F8CBAD"),  # 珊瑚橘
-    ("#9E2A2B", "#F2B6B6"),  # 磚紅
-    ("#A6336B", "#F0B7D1"),  # 洋紅
-    ("#7F4F24", "#E6C9A8"),  # 棕
-    ("#44546A", "#B8C2D1"),  # 靛灰
-    ("#4F6228", "#C5D9A0"),  # 橄欖綠
+# 原始樣本資料：依 TEMPERATURES／SAMPLE_COUNT 目前的形狀自動產生隨機數值，
+# 改溫度點清單或樣本數時不需要手動同步這裡，形狀永遠自動吃上面兩個設定。
+SAMPLE_DATA = [
+    [
+        round(random.uniform(RANDOM_SAMPLE_MIN, RANDOM_SAMPLE_MAX), 1)
+        for _ in range(SAMPLE_COUNT)
+    ]
+    for _ in TEMPERATURES
 ]
 
+# Upper Spec / Lower Spec（規格上下限）。
+SPEC_UPPER_VALUE = 75.0
+SPEC_LOWER_VALUE = -75.0
 
-def _default_temperatures(count):
-    if count < 2:
-        raise ValueError("TEMPERATURE_COUNT 至少需要 2 個溫度點。")
-    if count > MAX_TEMPERATURES:
-        raise ValueError(
-            "TEMPERATURE_COUNT 不可超過 {} 個。".format(MAX_TEMPERATURES)
-        )
-    return [str(TEMPERATURE_STEP * index) for index in range(1, count + 1)]
+# Cal Target 嚴謹 1~5 的階數；Leg 系列基礎名稱（只建標籤列，數值留白讓使用者
+# 之後自行填入，與參考檔案一致）。
+STRICT_TARGET_STEPS = 5
+LEG_NAMES = ["Baseline", "Leg_1", "Leg_2", "Leg_3"]
 
+# ====== 以下為其他較少調整的參數 ======
+MAX_TEMPERATURES = 30
 
-DEFAULT_TEMPERATURES = _default_temperatures(TEMPERATURE_COUNT)
-DEFAULT_OUTPUT_FILENAME = "box plot_{}溫度點.xlsx".format(TEMPERATURE_COUNT)
+ERROR_LOG_FILENAME = "tsm_classic_box_plot_error.log"
+DEFAULT_FONT = "新細明體"
+CHART_FONT = "新細明體"
+CHART_TITLE = "TSM Box Plot"
 
 MAIN_SHEET = "工作表1"
-STATS_SHEET = "盒鬚圖"
-HELPER_SHEET = "_BoxPlot2010"
+HELPER_SHEET = "輔助資料2"
 
-# Excel row numbers.  Later positions are derived so the workbook layout stays
-# consistent if the sample or target counts are changed.
-INDEX_ROW = 1
-HEADER_ROW = INDEX_ROW + 1
-DATA_FIRST_ROW = HEADER_ROW + 1
-DATA_LAST_ROW = DATA_FIRST_ROW + SAMPLE_COUNT - 1
-SUMMARY_MIN_ROW = DATA_LAST_ROW + 1
-SUMMARY_MAX_ROW = SUMMARY_MIN_ROW + 1
-SUMMARY_AVERAGE_ROW = SUMMARY_MAX_ROW + 1
-TARGET_BASE_ROW = SUMMARY_AVERAGE_ROW + 1
-TARGET_FIRST_STRICT_ROW = TARGET_BASE_ROW + 1
-TARGET_LAST_STRICT_ROW = TARGET_FIRST_STRICT_ROW + STRICT_TARGET_STEPS - 1
-SPEC_UPPER_ROW = TARGET_LAST_STRICT_ROW + 1
+# 色票：直接取自參考檔案的 Office 佈景主題（Accent 5／藍）。
+NAVY_HEADER_COLOR = "#1F3864"
+PALE_LABEL_COLOR = "#E8EEF5"
+PALE_ACCENT_COLOR = "#DAE3F3"
+
+
+if not (2 <= len(TEMPERATURES) <= MAX_TEMPERATURES):
+    raise ValueError(
+        "TEMPERATURES 須介於 2～{} 個溫度點之間。".format(MAX_TEMPERATURES)
+    )
+if not isinstance(SAMPLE_COUNT, int) or SAMPLE_COUNT < 2:
+    raise ValueError("SAMPLE_COUNT 至少需要 2 筆樣本。")
+
+DEFAULT_OUTPUT_FILENAME = "tsm box plot_{}溫度點.xlsx".format(len(TEMPERATURES))
+
+# Excel 列號（1-based），依 SAMPLE_COUNT／STRICT_TARGET_STEPS／LEG_NAMES
+# 動態推算，維持跟參考檔案一致的區段順序。
+TITLE_ROW = 1
+INDEX_ROW = 2
+TEMPERATURE_ROW = 3
+SAMPLE_FIRST_ROW = TEMPERATURE_ROW + 1
+SAMPLE_LAST_ROW = SAMPLE_FIRST_ROW + SAMPLE_COUNT - 1
+
+STATS_HEADER_ROW = SAMPLE_LAST_ROW + 2
+STDDEV_ROW = STATS_HEADER_ROW + 1
+MAX_ROW = STDDEV_ROW + 1
+MIN_ROW = MAX_ROW + 1
+AVERAGE_ROW = MIN_ROW + 1
+MEDIAN_ROW = AVERAGE_ROW + 1
+Q3_ROW = MEDIAN_ROW + 1
+Q1_ROW = Q3_ROW + 1
+IQR_ROW = Q1_ROW + 1
+LOWER_FENCE_ROW = IQR_ROW + 1
+UPPER_FENCE_ROW = LOWER_FENCE_ROW + 1
+LOWER_WHISKER_ROW = UPPER_FENCE_ROW + 1
+UPPER_WHISKER_ROW = LOWER_WHISKER_ROW + 1
+COUNT_ROW = UPPER_WHISKER_ROW + 1
+OUTLIER_ROW = COUNT_ROW + 1
+
+CAL_HEADER_ROW = OUTLIER_ROW + 2
+SPEC_UPPER_ROW = CAL_HEADER_ROW + 1
 SPEC_LOWER_ROW = SPEC_UPPER_ROW + 1
+CAL_CONS_ROW = SPEC_LOWER_ROW + 1
+CAL_STR_FIRST_ROW = CAL_CONS_ROW + 1
+CAL_STR_LAST_ROW = CAL_STR_FIRST_ROW + STRICT_TARGET_STEPS - 1
 
-# Leg 系列（LEG_NAMES 的 _NT 全部列在前、_T 全部列在後），列數隨 LEG_NAMES 長度
-# 浮動；LEG_NAMES 為空串列時 LEG_LAST_ROW 會等於 SPEC_LOWER_ROW，版面自動退化
-# 成沒有 leg 區塊的樣子，不需要另外寫分支判斷。
 LEG_SERIES_NAMES = (
     ["{}_NT".format(name) for name in LEG_NAMES]
     + ["{}_T".format(name) for name in LEG_NAMES]
 )
-LEG_FIRST_ROW = SPEC_LOWER_ROW + 1
+LEG_FIRST_ROW = CAL_STR_LAST_ROW + 1
 LEG_LAST_ROW = LEG_FIRST_ROW + len(LEG_SERIES_NAMES) - 1
-
-STATS_HEADER_ROW = LEG_LAST_ROW + 2
-COUNT_ROW = STATS_HEADER_ROW + 1
-MIN_ROW = COUNT_ROW + 1
-Q1_ROW = MIN_ROW + 1
-MEDIAN_ROW = Q1_ROW + 1
-Q3_ROW = MEDIAN_ROW + 1
-MAX_ROW = Q3_ROW + 1
-AVERAGE_ROW = MAX_ROW + 1
-IQR_ROW = AVERAGE_ROW + 1
-LOWER_BOUND_ROW = IQR_ROW + 1
-UPPER_BOUND_ROW = LOWER_BOUND_ROW + 1
-LOWER_WHISKER_ROW = UPPER_BOUND_ROW + 1
-UPPER_WHISKER_ROW = LOWER_WHISKER_ROW + 1
-OUTLIER_COUNT_ROW = UPPER_WHISKER_ROW + 1
-
-# Statistics sheet positions (1-based Excel rows/columns).
-BOX_STATS_LABEL_COL = 10  # J
-BOX_STATS_FIRST_VALUE_COL = BOX_STATS_LABEL_COL + 1  # K
-BOX_COUNT_ROW = 2
-BOX_MIN_ROW = 3
-BOX_Q1_ROW = 4
-BOX_MEDIAN_ROW = 5
-BOX_Q3_ROW = 6
-BOX_MAX_ROW = 7
-BOX_AVERAGE_ROW = 8
-BOX_IQR_ROW = 9
-BOX_LOWER_BOUND_ROW = 10
-BOX_UPPER_BOUND_ROW = 11
-BOX_LOWER_WHISKER_ROW = 12
-BOX_UPPER_WHISKER_ROW = 13
-BOX_OUTLIER_COUNT_ROW = 14
-
-# Helper sheet columns (1-based Excel columns).
-HELPER_CATEGORY_COL = 1
-HELPER_Q1_COL = 2
-HELPER_Q1_TO_MEDIAN_COL = 3
-HELPER_MEDIAN_TO_Q3_COL = 4
-HELPER_LOWER_ERROR_COL = 5
-HELPER_UPPER_ERROR_COL = 6
-HELPER_AVERAGE_COL = 7
-HELPER_FIRST_OUTLIER_COL = 8
-HELPER_Q3_COL = HELPER_FIRST_OUTLIER_COL + SAMPLE_COUNT
-HELPER_BOX_LEGEND_COL = HELPER_Q3_COL + 1
-HELPER_ZERO_ERROR_COL = HELPER_BOX_LEGEND_COL + 1
-HELPER_MEDIAN_BASE_COL = HELPER_ZERO_ERROR_COL + 1
-HELPER_MEDIAN_THICKNESS_COL = HELPER_MEDIAN_BASE_COL + 1
 
 
 def _load_xlsxwriter():
@@ -282,14 +188,9 @@ def _sheet_cell(sheet_name, row, col):
     )
 
 
-def _cell(row, col, absolute=False):
+def _cell(row, col, absolute=True):
     _, _, _, xl_rowcol_to_cell = _load_xlsxwriter()
-    return xl_rowcol_to_cell(
-        row - 1,
-        col - 1,
-        row_abs=absolute,
-        col_abs=absolute,
-    )
+    return xl_rowcol_to_cell(row - 1, col - 1, row_abs=absolute, col_abs=absolute)
 
 
 def _column_name(col):
@@ -310,35 +211,12 @@ def _autofit_width(texts, padding=2, minimum=6, maximum=40):
     return max(minimum, min(maximum, longest + padding))
 
 
-def normalize_temperatures(temperatures):
-    cleaned = [str(value).strip() for value in temperatures if str(value).strip()]
-    if len(cleaned) < 2:
-        raise ValueError("至少需要 2 個溫度點。")
-    if len(cleaned) > MAX_TEMPERATURES:
-        raise ValueError("溫度點不可超過 {} 個。".format(MAX_TEMPERATURES))
-
-    normalized_names = [value.casefold() for value in cleaned]
-    duplicates = sorted(
-        {
-            value
-            for value, normalized in zip(cleaned, normalized_names)
-            if normalized_names.count(normalized) > 1
-        }
-    )
-    if duplicates:
-        raise ValueError("溫度點名稱不可重複：{}".format(", ".join(duplicates)))
-
-    for value in cleaned:
-        if len(value) > 255:
-            raise ValueError("溫度點名稱過長：{}".format(value[:30]))
-
-    return cleaned
-
-
 def _percentile_inc(values, fraction):
     ordered = sorted(values)
     if len(ordered) == 1:
         return ordered[0]
+
+    import math
 
     position = (len(ordered) - 1) * fraction
     lower_index = int(math.floor(position))
@@ -355,854 +233,381 @@ def _calculate_statistics(values):
     median = _percentile_inc(values, 0.50)
     q3 = _percentile_inc(values, 0.75)
     iqr = q3 - q1
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
-    non_outliers = [value for value in values if lower_bound <= value <= upper_bound]
-    lower_whisker = min(non_outliers)
-    upper_whisker = max(non_outliers)
-    average = sum(values) / float(len(values))
-    outliers = [value < lower_bound or value > upper_bound for value in values]
+    lower_fence = q1 - 1.5 * iqr
+    upper_fence = q3 + 1.5 * iqr
+    non_outliers = [value for value in values if lower_fence <= value <= upper_fence]
+    stddev = (
+        sum((value - sum(values) / len(values)) ** 2 for value in values)
+        / (len(values) - 1)
+    ) ** 0.5
 
     return {
-        "count": len(values),
+        "stddev": stddev,
+        "max": max(values),
         "min": min(values),
-        "q1": q1,
+        "average": sum(values) / float(len(values)),
         "median": median,
         "q3": q3,
-        "max": max(values),
-        "average": average,
+        "q1": q1,
         "iqr": iqr,
-        "lower_bound": lower_bound,
-        "upper_bound": upper_bound,
-        "lower_whisker": lower_whisker,
-        "upper_whisker": upper_whisker,
-        "outlier_count": sum(outliers),
-        "outliers": outliers,
+        "lower_fence": lower_fence,
+        "upper_fence": upper_fence,
+        "lower_whisker": min(non_outliers),
+        "upper_whisker": max(non_outliers),
+        "count": len(values),
+        "outlier_count": sum(
+            1 for value in values if value < lower_fence or value > upper_fence
+        ),
     }
-
-
-def _cached_target(stats, step=None):
-    average = stats["average"]
-    if step is None:
-        return average
-    if average > 0:
-        end_value = stats["upper_whisker"]
-    elif average < 0:
-        end_value = stats["lower_whisker"]
-    else:
-        return 0.0
-    return average + (end_value - average) * step / float(STRICT_TARGET_STEPS)
-
-
-def _nice_axis_major_unit(axis_range, target_tick_count=8):
-    """Round the Y 軸刻度間距到一個「漂亮」數字（1/2/5 × 10 的次方）。
-
-    Excel 的格線是以 0 為基準、按 major unit 的整數倍畫出來的，不是從軸的
-    min 開始算；只要 major unit 是這種漂亮數字，0（只要落在軸範圍內）就
-    一定會剛好對齊到一條格線，Y=0 的刻度標籤才會確實被畫出來，而不是只是
-    「範圍涵蓋 0」卻剛好沒有刻度線經過它。
-    """
-    if axis_range <= 0:
-        return 1.0
-
-    raw_step = axis_range / float(target_tick_count)
-    magnitude = 10.0 ** math.floor(math.log10(raw_step))
-    normalized = raw_step / magnitude
-    if normalized <= 1:
-        nice = 1
-    elif normalized <= 2:
-        nice = 2
-    elif normalized <= 5:
-        nice = 5
-    else:
-        nice = 10
-    return nice * magnitude
 
 
 def _create_formats(workbook, font_name):
-    border = {"border": 1, "border_color": "#BFBFBF"}
     centered = {"align": "center", "valign": "vcenter"}
+    border = {"border": 1}
 
-    formats = {
-        "plain_center": workbook.add_format(
-            dict({"font_name": font_name}, **centered)
-        ),
-        "number": workbook.add_format(
+    def fmt(extra):
+        merged = dict({"font_name": font_name}, **extra)
+        return workbook.add_format(merged)
+
+    return {
+        "title_header": fmt(
             dict(
-                {
-                    "font_name": font_name,
-                    "num_format": "0.00",
-                },
+                {"bold": True, "font_color": "#FFFFFF", "bg_color": NAVY_HEADER_COLOR},
                 **centered
             )
         ),
-        "summary_label": workbook.add_format(
+        "index_cell": fmt(dict({"bg_color": PALE_ACCENT_COLOR}, **dict(centered, **border))),
+        "sample_label": fmt(dict({"bg_color": PALE_ACCENT_COLOR}, **dict(centered, **border))),
+        "data_number": fmt(
+            dict({"bg_color": "#FFFFFF", "num_format": "0.00"}, **dict(centered, **border))
+        ),
+        "stat_label_cn": fmt(dict({"bg_color": PALE_LABEL_COLOR}, **dict(centered, **border))),
+        "stat_label_en": fmt(dict({"bg_color": PALE_LABEL_COLOR}, **dict(centered, **border))),
+        "stat_number": fmt(
+            dict({"bg_color": "#FFFFFF", "num_format": "0.00"}, **dict(centered, **border))
+        ),
+        "stat_integer": fmt(
+            dict({"bg_color": "#FFFFFF", "num_format": "0"}, **dict(centered, **border))
+        ),
+        "spec_label_cn": fmt(dict({"bg_color": PALE_ACCENT_COLOR}, **dict(centered, **border))),
+        "spec_label_en": fmt(
             dict(
-                {
-                    "font_name": font_name,
-                    "bg_color": "#FFD966",
-                },
-                **centered
-            )
-        ),
-        "summary_number": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "bg_color": "#FFD966",
-                    "num_format": "0.00",
-                },
-                **centered
-            )
-        ),
-        "target_label": workbook.add_format(
-            {
-                "font_name": font_name,
-                "bold": True,
-                "bg_color": "#FFF2CC",
-                "align": "left",
-                "valign": "vcenter",
-            }
-        ),
-        "target_number": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "bg_color": "#FFF2CC",
-                    "num_format": "0.00",
-                },
-                **centered
-            )
-        ),
-        "spec_label": workbook.add_format(
-            {
-                "font_name": font_name,
-                "bold": True,
-                "bg_color": "#FCE4D6",
-                "align": "left",
-                "valign": "vcenter",
-            }
-        ),
-        "spec_number": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "bg_color": "#FCE4D6",
-                    "num_format": "0.00",
-                },
-                **centered
-            )
-        ),
-        "leg_label": workbook.add_format(
-            {
-                "font_name": font_name,
-                "bold": True,
-                "bg_color": "#F2F2F2",
-                "align": "left",
-                "valign": "vcenter",
-            }
-        ),
-        "leg_number": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "num_format": "0.00",
-                },
-                **centered
-            )
-        ),
-        "stats_header": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "bold": True,
-                    "font_color": "#FFFFFF",
-                    "bg_color": "#1F4E79",
-                },
-                **dict(centered, **border)
-            )
-        ),
-        "stats_label": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "bold": True,
-                    "bg_color": "#DDEBF7",
-                },
+                {"bg_color": PALE_LABEL_COLOR, "align": "left", "valign": "vcenter"},
                 **border
             )
         ),
-        "stats_count": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "num_format": "0",
-                },
-                **dict(centered, **border)
-            )
+        "spec_number": fmt(dict({"bg_color": PALE_ACCENT_COLOR}, **dict(centered, **border))),
+        "cal_number": fmt(
+            dict({"bg_color": "#FFFFFF", "num_format": "0.00"}, **dict(centered, **border))
         ),
-        "stats_number": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "num_format": "0.00",
-                },
-                **dict(centered, **border)
-            )
-        ),
-        "stats_average": workbook.add_format(
-            dict(
-                {
-                    "font_name": font_name,
-                    "bg_color": "#70AD47",
-                    "num_format": "0.00",
-                },
-                **dict(centered, **border)
-            )
-        ),
-        "note": workbook.add_format(
-            {
-                "font_name": font_name,
-                "font_size": 9,
-                "italic": True,
-                "font_color": "#595959",
-                "align": "center",
-                "valign": "vcenter",
-            }
-        ),
-        "info_title": workbook.add_format(
-            {
-                "font_name": font_name,
-                "font_size": 15,
-                "bold": True,
-                "align": "left",
-                "valign": "vcenter",
-            }
-        ),
-        "info": workbook.add_format(
-            {
-                "font_name": font_name,
-                "font_size": 9,
-                "font_color": "#595959",
-                "text_wrap": True,
-                "valign": "vcenter",
-            }
-        ),
-        "helper": workbook.add_format({"font_name": font_name}),
+        "leg_blank": fmt(dict({"bg_color": "#FFFFFF"}, **dict(centered, **border))),
+        "helper_index": fmt({}),
+        "helper_value": fmt({}),
     }
-    return formats
 
 
-def _write_main_sheet(workbook, worksheet, temperatures, data, stats, leg_data, formats):
-    last_data_col = 1 + len(temperatures)  # 1-based Excel column.
+def _write_main_sheet(workbook, worksheet, formats):
+    temperature_count = len(TEMPERATURES)
+    last_col = 2 + temperature_count  # column B + 每個溫度點各一欄。
 
-    worksheet.hide_gridlines(2)
-    worksheet.freeze_panes(DATA_FIRST_ROW - 1, 0)
-    worksheet.set_zoom(80 if len(temperatures) > 12 else 100)
-
-    for temperature_index in range(len(temperatures)):
-        col = temperature_index + 2
-        worksheet.write(
-            INDEX_ROW - 1,
-            col - 1,
-            temperature_index + 1,
-            formats["plain_center"],
-        )
-
-    table_columns = [
-        {"header": "樣本", "header_format": formats["plain_center"]}
-    ] + [
-        {"header": temperature, "header_format": formats["plain_center"]}
-        for temperature in temperatures
-    ]
-    worksheet.add_table(
-        HEADER_ROW - 1,
-        0,
-        LEG_LAST_ROW - 1,
-        last_data_col - 1,
-        {
-            "name": "tblBoxData2010",
-            "style": "Table Style Medium 2",
-            "columns": table_columns,
-            "autofilter": False,
-        },
+    worksheet.merge_range(
+        TITLE_ROW - 1, 1, TITLE_ROW - 1, last_col - 1, "TSM Data", formats["title_header"]
     )
+
+    worksheet.write(INDEX_ROW - 1, 1, "數量", formats["sample_label"])
+    for index in range(temperature_count):
+        worksheet.write_number(INDEX_ROW - 1, 2 + index, index + 1, formats["index_cell"])
+
+    worksheet.write(TEMPERATURE_ROW - 1, 1, "樣本", formats["sample_label"])
+    for index, temperature in enumerate(TEMPERATURES):
+        worksheet.write_number(
+            TEMPERATURE_ROW - 1, 2 + index, float(temperature), formats["sample_label"]
+        )
 
     for sample_index in range(SAMPLE_COUNT):
-        excel_row = DATA_FIRST_ROW + sample_index
-        worksheet.write(excel_row - 1, 0, "#{}".format(sample_index + 1), formats["plain_center"])
-        for temperature_index in range(len(temperatures)):
-            value = data[temperature_index][sample_index]
+        row = SAMPLE_FIRST_ROW + sample_index
+        worksheet.write(row - 1, 1, "#{}".format(sample_index + 1), formats["sample_label"])
+        for temperature_index in range(temperature_count):
+            value = SAMPLE_DATA[temperature_index][sample_index]
+            span = RANDOM_SAMPLE_MAX - RANDOM_SAMPLE_MIN
+            sign = "-" if RANDOM_SAMPLE_MIN < 0 else "+"
+            formula = "=RAND()*{}{}{}".format(span, sign, abs(RANDOM_SAMPLE_MIN))
             worksheet.write_formula(
-                excel_row - 1,
-                temperature_index + 1,
-                "=RAND()*500-250",
-                formats["number"],
-                value,
+                row - 1, 2 + temperature_index, formula, formats["data_number"], value
             )
 
-    summary_rows = [
-        (SUMMARY_MIN_ROW, "Min", MIN_ROW, "min"),
-        (SUMMARY_MAX_ROW, "Max", MAX_ROW, "max"),
-        (SUMMARY_AVERAGE_ROW, "Average", AVERAGE_ROW, "average"),
-    ]
-    for row, label, source_row, key in summary_rows:
-        worksheet.write(row - 1, 0, label, formats["summary_label"])
-        for temperature_index, statistic in enumerate(stats):
-            col = temperature_index + 2
-            worksheet.write_formula(
-                row - 1,
-                col - 1,
-                "={}".format(_cell(source_row, col)),
-                formats["summary_number"],
-                statistic[key],
-            )
-
-    worksheet.write(
-        TARGET_BASE_ROW - 1,
-        0,
-        "Cal Target (Cons.)",
-        formats["target_label"],
+    worksheet.write(STATS_HEADER_ROW - 1, 0, "統計指標", formats["title_header"])
+    worksheet.merge_range(
+        STATS_HEADER_ROW - 1,
+        1,
+        STATS_HEADER_ROW - 1,
+        last_col - 1,
+        "統計指標",
+        formats["title_header"],
     )
-    for temperature_index, statistic in enumerate(stats):
-        col = temperature_index + 2
-        average_cell = _cell(AVERAGE_ROW, col)
-        formula = "=IF({0}>0,ABS({0}),IF({0}<0,-ABS({0}),0))".format(average_cell)
-        worksheet.write_formula(
-            TARGET_BASE_ROW - 1,
-            col - 1,
-            formula,
-            formats["target_number"],
-            _cached_target(statistic),
-        )
 
-    for step in range(1, STRICT_TARGET_STEPS + 1):
-        row = TARGET_FIRST_STRICT_ROW + step - 1
-        worksheet.write(
-            row - 1,
-            0,
-            "Cal Target (Str.{})".format(step),
-            formats["target_label"],
+    stat_rows = [
+        (STDDEV_ROW, "標準差", "StdDev"),
+        (MAX_ROW, "最大值", "Max"),
+        (MIN_ROW, "最小值", "Min"),
+        (AVERAGE_ROW, "平均值", "Avg"),
+        (MEDIAN_ROW, "中位數", "Median"),
+        (Q3_ROW, "75%百分位", "Q3"),
+        (Q1_ROW, "25%百分位", "Q1"),
+        (IQR_ROW, "四分位距 (IQR)", "IQR"),
+        (LOWER_FENCE_ROW, "下界 (Q1 - 1.5 × IQR)", "Lower Fence"),
+        (UPPER_FENCE_ROW, "上界 (Q3 + 1.5 × IQR)", "Upper Fence"),
+        (LOWER_WHISKER_ROW, "下鬚（最小非離群值）", "Lower Whisker"),
+        (UPPER_WHISKER_ROW, "上鬚（最大非離群值）", "Upper Whisker"),
+        (COUNT_ROW, "有效數值筆數", "Count"),
+        (OUTLIER_ROW, "離群值數量", "Outliers"),
+    ]
+    for row, label_cn, label_en in stat_rows:
+        worksheet.write(row - 1, 0, label_cn, formats["stat_label_cn"])
+        worksheet.write(row - 1, 1, label_en, formats["stat_label_en"])
+
+    statistics = [_calculate_statistics(column) for column in SAMPLE_DATA]
+
+    for temperature_index, statistic in enumerate(statistics):
+        col = 3 + temperature_index  # 1-based: C, D, E, ...
+        col_name = _column_name(col)
+        data_range = "{0}{1}:{0}{2}".format(col_name, SAMPLE_FIRST_ROW, SAMPLE_LAST_ROW)
+        q1_cell = _cell(Q1_ROW, col)
+        q3_cell = _cell(Q3_ROW, col)
+        iqr_cell = _cell(IQR_ROW, col)
+        lower_fence_cell = _cell(LOWER_FENCE_ROW, col)
+        upper_fence_cell = _cell(UPPER_FENCE_ROW, col)
+        average_cell = _cell(AVERAGE_ROW, col)
+        upper_whisker_cell = _cell(UPPER_WHISKER_ROW, col)
+        lower_whisker_cell = _cell(LOWER_WHISKER_ROW, col)
+
+        formulas_and_values = [
+            (STDDEV_ROW, "=STDEV({})".format(data_range), statistic["stddev"], "stat_number"),
+            (MAX_ROW, "=MAX({})".format(data_range), statistic["max"], "stat_number"),
+            (MIN_ROW, "=MIN({})".format(data_range), statistic["min"], "stat_number"),
+            (
+                AVERAGE_ROW,
+                "=AVERAGE({})".format(data_range),
+                statistic["average"],
+                "stat_number",
+            ),
+            (
+                MEDIAN_ROW,
+                "=MEDIAN({})".format(data_range),
+                statistic["median"],
+                "stat_number",
+            ),
+            (
+                Q3_ROW,
+                "=QUARTILE({},3)".format(data_range),
+                statistic["q3"],
+                "stat_number",
+            ),
+            (
+                Q1_ROW,
+                "=QUARTILE({},1)".format(data_range),
+                statistic["q1"],
+                "stat_number",
+            ),
+            (
+                IQR_ROW,
+                "={}-{}".format(q3_cell, q1_cell),
+                statistic["iqr"],
+                "stat_number",
+            ),
+            (
+                LOWER_FENCE_ROW,
+                "={}-1.5*{}".format(q1_cell, iqr_cell),
+                statistic["lower_fence"],
+                "stat_number",
+            ),
+            (
+                UPPER_FENCE_ROW,
+                "={}+1.5*{}".format(q3_cell, iqr_cell),
+                statistic["upper_fence"],
+                "stat_number",
+            ),
+            (
+                LOWER_WHISKER_ROW,
+                '=IFERROR(_xlfn.AGGREGATE(15,6,{0}/(({0}>={1})*ISNUMBER({0})),1),"")'.format(
+                    data_range, lower_fence_cell
+                ),
+                statistic["lower_whisker"],
+                "stat_number",
+            ),
+            (
+                UPPER_WHISKER_ROW,
+                '=IFERROR(_xlfn.AGGREGATE(14,6,{0}/(({0}<={1})*ISNUMBER({0})),1),"")'.format(
+                    data_range, upper_fence_cell
+                ),
+                statistic["upper_whisker"],
+                "stat_number",
+            ),
+            (
+                COUNT_ROW,
+                "=COUNT({})".format(data_range),
+                statistic["count"],
+                "stat_integer",
+            ),
+            (
+                OUTLIER_ROW,
+                '=COUNTIF({0},"<"&{1})+COUNTIF({0},">"&{2})'.format(
+                    data_range, lower_fence_cell, upper_fence_cell
+                ),
+                statistic["outlier_count"],
+                "stat_integer",
+            ),
+        ]
+        for row, formula, cached_value, format_key in formulas_and_values:
+            worksheet.write_formula(
+                row - 1, col - 1, formula, formats[format_key], cached_value
+            )
+
+        # IF(avg>0,ABS(avg),IF(avg<0,-ABS(avg),0)) 化簡後恆等於 avg 本身
+        # （avg>0 時 ABS(avg)=avg；avg<0 時 -ABS(avg)=avg），只有 avg=0 時為 0。
+        cal_cons_value = statistic["average"]
+        worksheet.write_formula(
+            CAL_CONS_ROW - 1,
+            col - 1,
+            "=IF({0}>0,ABS({0}),IF({0}<0,-ABS({0}),0))".format(average_cell),
+            formats["cal_number"],
+            cal_cons_value,
         )
-        for temperature_index, statistic in enumerate(stats):
-            col = temperature_index + 2
-            average_cell = _cell(AVERAGE_ROW, col)
-            upper_cell = _cell(UPPER_WHISKER_ROW, col)
-            lower_cell = _cell(LOWER_WHISKER_ROW, col)
+        for step in range(1, STRICT_TARGET_STEPS + 1):
+            row = CAL_STR_FIRST_ROW + step - 1
+            if statistic["average"] > 0:
+                cached_value = statistic["average"] + (
+                    statistic["upper_whisker"] - statistic["average"]
+                ) * step / float(STRICT_TARGET_STEPS)
+            elif statistic["average"] < 0:
+                cached_value = statistic["average"] + (
+                    statistic["lower_whisker"] - statistic["average"]
+                ) * step / float(STRICT_TARGET_STEPS)
+            else:
+                cached_value = 0.0
             formula = (
                 "=IF({avg}>0,{avg}+({upper}-{avg})*{step}/{steps},"
                 "IF({avg}<0,{avg}+({lower}-{avg})*{step}/{steps},0))"
             ).format(
                 avg=average_cell,
-                upper=upper_cell,
-                lower=lower_cell,
+                upper=upper_whisker_cell,
+                lower=lower_whisker_cell,
                 step=step,
                 steps=STRICT_TARGET_STEPS,
             )
             worksheet.write_formula(
-                row - 1,
-                col - 1,
-                formula,
-                formats["target_number"],
-                _cached_target(statistic, step),
+                row - 1, col - 1, formula, formats["cal_number"], cached_value
             )
 
-    worksheet.write(SPEC_UPPER_ROW - 1, 0, "Upper Spec", formats["spec_label"])
-    worksheet.write(SPEC_LOWER_ROW - 1, 0, "Lower Spec", formats["spec_label"])
-    for temperature_index in range(len(temperatures)):
-        col = temperature_index + 2
+    worksheet.write(CAL_HEADER_ROW - 1, 0, "校正目標", formats["title_header"])
+    worksheet.merge_range(
+        CAL_HEADER_ROW - 1,
+        1,
+        CAL_HEADER_ROW - 1,
+        last_col - 1,
+        "Cal Target",
+        formats["title_header"],
+    )
+
+    worksheet.write(SPEC_UPPER_ROW - 1, 0, "規格上限", formats["spec_label_cn"])
+    worksheet.write(SPEC_UPPER_ROW - 1, 1, "upper spec", formats["spec_label_en"])
+    worksheet.write(SPEC_LOWER_ROW - 1, 0, "規格下限", formats["spec_label_cn"])
+    worksheet.write(SPEC_LOWER_ROW - 1, 1, "lower spec", formats["spec_label_en"])
+    for temperature_index in range(temperature_count):
+        col = 2 + temperature_index
         worksheet.write_number(
-            SPEC_UPPER_ROW - 1, col - 1, SPEC_UPPER_VALUE, formats["spec_number"]
+            SPEC_UPPER_ROW - 1, col, SPEC_UPPER_VALUE, formats["spec_number"]
         )
         worksheet.write_number(
-            SPEC_LOWER_ROW - 1, col - 1, SPEC_LOWER_VALUE, formats["spec_number"]
+            SPEC_LOWER_ROW - 1, col, SPEC_LOWER_VALUE, formats["spec_number"]
+        )
+
+    worksheet.write(CAL_CONS_ROW - 1, 0, "校正目標（保守）", formats["spec_label_cn"])
+    worksheet.write(CAL_CONS_ROW - 1, 1, "Cal Target (Cons.)", formats["spec_label_en"])
+    for step in range(1, STRICT_TARGET_STEPS + 1):
+        row = CAL_STR_FIRST_ROW + step - 1
+        worksheet.write(
+            row - 1, 0, "校正目標（嚴謹{}）".format(step), formats["spec_label_cn"]
+        )
+        worksheet.write(
+            row - 1, 1, "Cal Target (Str.{})".format(step), formats["spec_label_en"]
         )
 
     for leg_row_offset, leg_name in enumerate(LEG_SERIES_NAMES):
         row = LEG_FIRST_ROW + leg_row_offset
-        worksheet.write(row - 1, 0, leg_name, formats["leg_label"])
-        for temperature_index in range(len(temperatures)):
-            col = temperature_index + 2
-            worksheet.write_formula(
-                row - 1,
-                col - 1,
-                "=RAND()*500-250",
-                formats["leg_number"],
-                leg_data[leg_row_offset][temperature_index],
-            )
-
-    worksheet.write(STATS_HEADER_ROW - 1, 0, "統計指標", formats["stats_header"])
-    for temperature_index, temperature in enumerate(temperatures):
-        worksheet.write(
-            STATS_HEADER_ROW - 1,
-            temperature_index + 1,
-            temperature,
-            formats["stats_header"],
-        )
-
-    statistic_rows = [
-        (COUNT_ROW, "有效數值筆數", "count"),
-        (MIN_ROW, "最小值", "min"),
-        (Q1_ROW, "第一四分位數 (Q1)", "q1"),
-        (MEDIAN_ROW, "中位數", "median"),
-        (Q3_ROW, "第三四分位數 (Q3)", "q3"),
-        (MAX_ROW, "最大值", "max"),
-        (AVERAGE_ROW, "平均值", "average"),
-        (IQR_ROW, "四分位距 (IQR)", "iqr"),
-        (LOWER_BOUND_ROW, "下界 (Q1 - 1.5 × IQR)", "lower_bound"),
-        (UPPER_BOUND_ROW, "上界 (Q3 + 1.5 × IQR)", "upper_bound"),
-        (LOWER_WHISKER_ROW, "下鬚（最小非離群值）", "lower_whisker"),
-        (UPPER_WHISKER_ROW, "上鬚（最大非離群值）", "upper_whisker"),
-        (OUTLIER_COUNT_ROW, "離群值數量", "outlier_count"),
-    ]
-    for row, label, _ in statistic_rows:
-        worksheet.write(row - 1, 0, label, formats["stats_label"])
+        worksheet.write(row - 1, 1, leg_name, formats["spec_label_en"])
+        for temperature_index in range(temperature_count):
+            col = 2 + temperature_index
+            worksheet.write_blank(row - 1, col, None, formats["leg_blank"])
 
     column_a_texts = (
-        ["樣本"]
-        + ["#{}".format(sample_index + 1) for sample_index in range(SAMPLE_COUNT)]
-        + [label for _, label, _, _ in summary_rows]
-        + ["Cal Target (Cons.)"]
-        + [
-            "Cal Target (Str.{})".format(step)
-            for step in range(1, STRICT_TARGET_STEPS + 1)
-        ]
-        + ["Upper Spec", "Lower Spec"]
+        ["統計指標", "校正目標"]
+        + [label for _, label, _ in stat_rows]
+        + ["規格上限", "規格下限", "校正目標（保守）"]
+        + ["校正目標（嚴謹{}）".format(step) for step in range(1, STRICT_TARGET_STEPS + 1)]
+    )
+    column_b_texts = (
+        ["數量", "樣本"]
+        + ["#{}".format(index + 1) for index in range(SAMPLE_COUNT)]
+        + [label for _, _, label in stat_rows]
+        + ["upper spec", "lower spec", "Cal Target (Cons.)"]
+        + ["Cal Target (Str.{})".format(step) for step in range(1, STRICT_TARGET_STEPS + 1)]
         + LEG_SERIES_NAMES
-        + ["統計指標"]
-        + [label for _, label, _ in statistic_rows]
     )
     worksheet.set_column(0, 0, _autofit_width(column_a_texts))
+    worksheet.set_column(1, 1, _autofit_width(column_b_texts))
 
-    flat_values = [value for column_values in data for value in column_values]
-    has_negative = any(value < 0 for value in flat_values)
-    max_abs_value = max((abs(value) for value in flat_values), default=0)
+    flat_values = [value for column in SAMPLE_DATA for value in column]
+    has_negative = any(value < 0 for value in flat_values) or SPEC_LOWER_VALUE < 0
+    max_abs_value = max(
+        [abs(value) for value in flat_values] + [SPEC_UPPER_VALUE, abs(SPEC_LOWER_VALUE)]
+    )
     integer_digits = max(1, len("{:.0f}".format(max_abs_value)))
     sample_number_text = (
-        ("-" if has_negative else "") + ("9" * integer_digits) + "." + ("9" * 4)
+        ("-" if has_negative else "") + ("9" * integer_digits) + "." + ("9" * 2)
     )
-    data_column_width = _autofit_width(list(temperatures) + [sample_number_text])
-    worksheet.set_column(1, last_data_col - 1, data_column_width)
-
-    for temperature_index, statistic in enumerate(stats):
-        col = temperature_index + 2
-        col_name = _column_name(col)
-        data_range = "${0}${1}:${0}${2}".format(
-            col_name, DATA_FIRST_ROW, DATA_LAST_ROW
-        )
-        main_data_range = "{}!{}".format(_quote_sheet_name(MAIN_SHEET), data_range)
-        count_cell = _cell(COUNT_ROW, col)
-        q1_cell = _cell(Q1_ROW, col)
-        q3_cell = _cell(Q3_ROW, col)
-        iqr_cell = _cell(IQR_ROW, col)
-        lower_bound_cell = _cell(LOWER_BOUND_ROW, col)
-        upper_bound_cell = _cell(UPPER_BOUND_ROW, col)
-
-        formulas = {
-            COUNT_ROW: "=COUNT({})".format(main_data_range),
-            MIN_ROW: '=IF({0}=0,"",MIN({1}))'.format(count_cell, main_data_range),
-            Q1_ROW: '=IF({0}=0,"",QUARTILE({1},1))'.format(count_cell, main_data_range),
-            MEDIAN_ROW: '=IF({0}=0,"",MEDIAN({1}))'.format(count_cell, main_data_range),
-            Q3_ROW: '=IF({0}=0,"",QUARTILE({1},3))'.format(count_cell, main_data_range),
-            MAX_ROW: '=IF({0}=0,"",MAX({1}))'.format(count_cell, main_data_range),
-            AVERAGE_ROW: '=IF({0}=0,"",AVERAGE({1}))'.format(count_cell, main_data_range),
-            IQR_ROW: '=IF({0}=0,"",{1}-{2})'.format(count_cell, q3_cell, q1_cell),
-            LOWER_BOUND_ROW: '=IF({0}=0,"",{1}-1.5*{2})'.format(
-                count_cell, q1_cell, iqr_cell
-            ),
-            UPPER_BOUND_ROW: '=IF({0}=0,"",{1}+1.5*{2})'.format(
-                count_cell, q3_cell, iqr_cell
-            ),
-            LOWER_WHISKER_ROW: (
-                '=IF({count}=0,"",IFERROR(_xlfn.AGGREGATE(15,6,'
-                '{data}/(({data}>={bound})*ISNUMBER({data})),1),""))'
-            ).format(count=count_cell, data=main_data_range, bound=lower_bound_cell),
-            UPPER_WHISKER_ROW: (
-                '=IF({count}=0,"",IFERROR(_xlfn.AGGREGATE(14,6,'
-                '{data}/(({data}<={bound})*ISNUMBER({data})),1),""))'
-            ).format(count=count_cell, data=main_data_range, bound=upper_bound_cell),
-            OUTLIER_COUNT_ROW: (
-                '=IF({count}=0,"",COUNTIF({data},"<"&{lower})+'
-                'COUNTIF({data},">"&{upper}))'
-            ).format(
-                count=count_cell,
-                data=main_data_range,
-                lower=lower_bound_cell,
-                upper=upper_bound_cell,
-            ),
-        }
-        cached_values = {
-            COUNT_ROW: statistic["count"],
-            MIN_ROW: statistic["min"],
-            Q1_ROW: statistic["q1"],
-            MEDIAN_ROW: statistic["median"],
-            Q3_ROW: statistic["q3"],
-            MAX_ROW: statistic["max"],
-            AVERAGE_ROW: statistic["average"],
-            IQR_ROW: statistic["iqr"],
-            LOWER_BOUND_ROW: statistic["lower_bound"],
-            UPPER_BOUND_ROW: statistic["upper_bound"],
-            LOWER_WHISKER_ROW: statistic["lower_whisker"],
-            UPPER_WHISKER_ROW: statistic["upper_whisker"],
-            OUTLIER_COUNT_ROW: statistic["outlier_count"],
-        }
-
-        for row, _, _ in statistic_rows:
-            if row == COUNT_ROW:
-                cell_format = formats["stats_count"]
-            elif row == AVERAGE_ROW:
-                cell_format = formats["stats_average"]
-            elif row == OUTLIER_COUNT_ROW:
-                cell_format = formats["stats_count"]
-            else:
-                cell_format = formats["stats_number"]
-            worksheet.write_formula(
-                row - 1,
-                col - 1,
-                formulas[row],
-                cell_format,
-                cached_values[row],
-            )
-
-    chart_width = max(1000, min(1450, 70 * len(temperatures)))
-    chart_height = 620
-    rows_per_chart = int(math.ceil(chart_height / 20.0)) + 1
-    chart_gap_rows = 2
-    # Zero-based row for the first chart, one blank row below the stats block;
-    # the remaining charts stack directly below it with a small gap each.
-    chart_start_rows = [
-        OUTLIER_COUNT_ROW + 1 + chart_index * (rows_per_chart + chart_gap_rows)
-        for chart_index in range(len(CHART_VARIANT_TITLES))
-    ]
-    chart_end_row = chart_start_rows[-1] + rows_per_chart
-
-    worksheet.set_landscape()
-    worksheet.set_paper(9)  # A4.
-    worksheet.fit_to_pages(1, 2)
-    worksheet.center_horizontally()
-    worksheet.set_margins(left=0.25, right=0.25, top=0.5, bottom=0.5)
-    worksheet.print_area(0, 0, chart_end_row, last_data_col - 1)
-
-    return chart_start_rows, chart_width, chart_height
-
-
-def _write_stats_sheet(worksheet, temperatures, stats, formats):
-    worksheet.hide_gridlines(2)
-    worksheet.set_column(0, 7, 12)
-    worksheet.set_column(8, 8, 2)
-    worksheet.set_column(BOX_STATS_LABEL_COL - 1, BOX_STATS_LABEL_COL - 1, 30)
-    worksheet.set_column(
-        BOX_STATS_FIRST_VALUE_COL - 1,
-        BOX_STATS_FIRST_VALUE_COL + len(temperatures) - 2,
-        11,
+    data_column_width = _autofit_width(
+        [str(temperature) for temperature in TEMPERATURES] + [sample_number_text]
     )
+    worksheet.set_column(2, last_col - 1, data_column_width)
 
-    info_lines = [
-        "Excel 2010 相容盒鬚圖（折線圖＋漲跌柱＋誤差線）",
-        "使用方式：在「工作表1」保留第一列標題，直接替換現有數值；"
-        "空白儲存格不納入計算。",
-        "若新資料較少，請先清除多餘舊值；本圖使用 Excel 2010 標準圖表元件。",
-        "盒體：Q1～Q3；分界線：中位數；鬚：1.5×IQR 內最遠值；"
-        "紫色 ×：平均值；紅點：離群值。",
-    ]
-    for index, line in enumerate(info_lines):
-        worksheet.merge_range(
-            index,
-            0,
-            index,
-            7,
-            line,
-            formats["info_title"] if index == 0 else formats["info"],
-        )
-    worksheet.set_row(0, 24)
-    for row in range(1, 4):
-        worksheet.set_row(row, 30)
-
-    statistic_rows = [
-        (BOX_COUNT_ROW, "有效數值筆數", COUNT_ROW, "count"),
-        (BOX_MIN_ROW, "最小值", MIN_ROW, "min"),
-        (BOX_Q1_ROW, "第一四分位數 (Q1)", Q1_ROW, "q1"),
-        (BOX_MEDIAN_ROW, "中位數", MEDIAN_ROW, "median"),
-        (BOX_Q3_ROW, "第三四分位數 (Q3)", Q3_ROW, "q3"),
-        (BOX_MAX_ROW, "最大值", MAX_ROW, "max"),
-        (BOX_AVERAGE_ROW, "平均值", AVERAGE_ROW, "average"),
-        (BOX_IQR_ROW, "四分位距 (IQR)", IQR_ROW, "iqr"),
-        (BOX_LOWER_BOUND_ROW, "下界 (Q1 - 1.5 × IQR)", LOWER_BOUND_ROW, "lower_bound"),
-        (BOX_UPPER_BOUND_ROW, "上界 (Q3 + 1.5 × IQR)", UPPER_BOUND_ROW, "upper_bound"),
-        (BOX_LOWER_WHISKER_ROW, "下鬚（最小非離群值）", LOWER_WHISKER_ROW, "lower_whisker"),
-        (BOX_UPPER_WHISKER_ROW, "上鬚（最大非離群值）", UPPER_WHISKER_ROW, "upper_whisker"),
-        (BOX_OUTLIER_COUNT_ROW, "離群值數量", OUTLIER_COUNT_ROW, "outlier_count"),
-    ]
-
-    worksheet.write(0, BOX_STATS_LABEL_COL - 1, "統計指標", formats["stats_header"])
-    for temperature_index, temperature in enumerate(temperatures):
-        col = BOX_STATS_FIRST_VALUE_COL + temperature_index
-        formula = "={}".format(_sheet_cell(MAIN_SHEET, HEADER_ROW, temperature_index + 2))
-        worksheet.write_formula(
-            0,
-            col - 1,
-            formula,
-            formats["stats_header"],
-            temperature,
-        )
-
-    for row, label, _, _ in statistic_rows:
-        worksheet.write(row - 1, BOX_STATS_LABEL_COL - 1, label, formats["stats_label"])
-
-    for temperature_index, statistic in enumerate(stats):
-        target_col = BOX_STATS_FIRST_VALUE_COL + temperature_index
-        main_col = temperature_index + 2
-        for row, _, main_row, key in statistic_rows:
-            if row == BOX_COUNT_ROW:
-                cell_format = formats["stats_count"]
-            elif row == BOX_OUTLIER_COUNT_ROW:
-                cell_format = formats["stats_count"]
-            else:
-                cell_format = formats["stats_number"]
-            worksheet.write_formula(
-                row - 1,
-                target_col - 1,
-                "={}".format(_sheet_cell(MAIN_SHEET, main_row, main_col)),
-                cell_format,
-                statistic[key],
-            )
-
-    note_last_col = BOX_STATS_FIRST_VALUE_COL + len(temperatures) - 1
-    worksheet.merge_range(
-        15,
-        BOX_STATS_LABEL_COL - 1,
-        15,
-        note_last_col - 1,
-        "Excel 2010 相容作法：QUARTILE（含端點）＋1.5×IQR；"
-        "圖表採標準折線圖、漲跌柱、自訂誤差線與資料標記。",
-        formats["note"],
-    )
-    worksheet.hide()
+    return statistics, last_col
 
 
-def _write_helper_sheet(worksheet, temperatures, data, stats, formats):
-    headers = [
-        "指標",
-        "Q1 底座",
-        "Q1 至中位數",
-        "中位數至 Q3",
-        "下鬚誤差",
-        "上鬚誤差",
-        "平均值",
-    ] + ["離群值_{}".format(index) for index in range(1, SAMPLE_COUNT + 1)] + [
-        "Q3",
-        "BoxLegend",
-        "ZeroError",
-        "MedianBase",
-        "MedianThickness",
-    ]
-    worksheet.write_row(0, 0, headers, formats["helper"])
-
-    overall_min = min(statistic["min"] for statistic in stats)
-    overall_max = max(statistic["max"] for statistic in stats)
-    overall_range = overall_max - overall_min
-    median_thickness = overall_range * MEDIAN_MARKER_THICKNESS_RATIO
-    first_box_col_name = _column_name(BOX_STATS_FIRST_VALUE_COL)
-    last_box_col_name = _column_name(BOX_STATS_FIRST_VALUE_COL + len(temperatures) - 1)
-    median_thickness_formula = (
-        "(MAX({s}!{first}{max_row}:{last}{max_row})-"
-        "MIN({s}!{first}{min_row}:{last}{min_row}))*{ratio}"
-    ).format(
-        s=_quote_sheet_name(STATS_SHEET),
-        first=first_box_col_name,
-        last=last_box_col_name,
-        max_row=BOX_MAX_ROW,
-        min_row=BOX_MIN_ROW,
-        ratio=MEDIAN_MARKER_THICKNESS_RATIO,
-    )
-
-    for temperature_index, (temperature, statistic) in enumerate(zip(temperatures, stats)):
-        row = temperature_index + 2
-        main_col = temperature_index + 2
-        box_col = BOX_STATS_FIRST_VALUE_COL + temperature_index
-        box_col_name = _column_name(box_col)
-
-        worksheet.write_formula(
-            row - 1,
-            HELPER_CATEGORY_COL - 1,
-            "={}".format(_sheet_cell(MAIN_SHEET, HEADER_ROW, main_col)),
-            formats["helper"],
-            temperature,
-        )
-
-        formulas_and_values = [
-            (
-                HELPER_Q1_COL,
-                "={}!{}{}".format(_quote_sheet_name(STATS_SHEET), box_col_name, BOX_Q1_ROW),
-                statistic["q1"],
-            ),
-            (
-                HELPER_Q1_TO_MEDIAN_COL,
-                "={s}!{c}{median}-{s}!{c}{q1}".format(
-                    s=_quote_sheet_name(STATS_SHEET),
-                    c=box_col_name,
-                    median=BOX_MEDIAN_ROW,
-                    q1=BOX_Q1_ROW,
-                ),
-                statistic["median"] - statistic["q1"],
-            ),
-            (
-                HELPER_MEDIAN_TO_Q3_COL,
-                "={s}!{c}{q3}-{s}!{c}{median}".format(
-                    s=_quote_sheet_name(STATS_SHEET),
-                    c=box_col_name,
-                    q3=BOX_Q3_ROW,
-                    median=BOX_MEDIAN_ROW,
-                ),
-                statistic["q3"] - statistic["median"],
-            ),
-            (
-                HELPER_LOWER_ERROR_COL,
-                "={s}!{c}{q1}-{s}!{c}{whisker}".format(
-                    s=_quote_sheet_name(STATS_SHEET),
-                    c=box_col_name,
-                    q1=BOX_Q1_ROW,
-                    whisker=BOX_LOWER_WHISKER_ROW,
-                ),
-                statistic["q1"] - statistic["lower_whisker"],
-            ),
-            (
-                HELPER_UPPER_ERROR_COL,
-                "={s}!{c}{whisker}-{s}!{c}{q3}".format(
-                    s=_quote_sheet_name(STATS_SHEET),
-                    c=box_col_name,
-                    whisker=BOX_UPPER_WHISKER_ROW,
-                    q3=BOX_Q3_ROW,
-                ),
-                statistic["upper_whisker"] - statistic["q3"],
-            ),
-            (
-                HELPER_AVERAGE_COL,
-                "={}!{}{}".format(
-                    _quote_sheet_name(STATS_SHEET), box_col_name, BOX_AVERAGE_ROW
-                ),
-                statistic["average"],
-            ),
-        ]
-        for col, formula, cached_value in formulas_and_values:
-            worksheet.write_formula(
-                row - 1,
-                col - 1,
-                formula,
-                formats["helper"],
-                cached_value,
-            )
-
+def _write_helper_sheet(workbook, worksheet, formats):
+    for temperature_index in range(len(TEMPERATURES)):
+        x_col = 2 + 2 * temperature_index  # 1-based: B, D, F, ...
+        y_col = x_col + 1
+        main_col = 3 + temperature_index  # 工作表1 的溫度欄：C, D, E, ...
+        main_col_name = _column_name(main_col)
         for sample_index in range(SAMPLE_COUNT):
-            col = HELPER_FIRST_OUTLIER_COL + sample_index
-            main_row = DATA_FIRST_ROW + sample_index
-            main_cell = _sheet_cell(MAIN_SHEET, main_row, main_col)
-            lower_cell = "{}!${}${}".format(
-                _quote_sheet_name(STATS_SHEET), box_col_name, BOX_LOWER_BOUND_ROW
+            row = sample_index + 1
+            worksheet.write_number(
+                row - 1, x_col - 1, temperature_index + 1, formats["helper_index"]
             )
-            upper_cell = "{}!${}${}".format(
-                _quote_sheet_name(STATS_SHEET), box_col_name, BOX_UPPER_BOUND_ROW
-            )
-            formula = "=IF(OR({0}<{1},{0}>{2}),{0},NA())".format(
-                main_cell, lower_cell, upper_cell
-            )
-            cached_value = (
-                data[temperature_index][sample_index]
-                if statistic["outliers"][sample_index]
-                else "#N/A"
+            main_row = SAMPLE_FIRST_ROW + sample_index
+            formula = "={}".format(
+                _sheet_cell(MAIN_SHEET, main_row, main_col)
             )
             worksheet.write_formula(
                 row - 1,
-                col - 1,
+                y_col - 1,
                 formula,
-                formats["helper"],
-                cached_value,
+                formats["helper_value"],
+                SAMPLE_DATA[temperature_index][sample_index],
             )
 
-        worksheet.write_formula(
-            row - 1,
-            HELPER_Q3_COL - 1,
-            "={}!${}${}".format(
-                _quote_sheet_name(STATS_SHEET), box_col_name, BOX_Q3_ROW
-            ),
-            formats["helper"],
-            statistic["q3"],
-        )
-        worksheet.write_formula(
-            row - 1,
-            HELPER_BOX_LEGEND_COL - 1,
-            "=NA()",
-            formats["helper"],
-            "#N/A",
-        )
-        worksheet.write_number(
-            row - 1,
-            HELPER_ZERO_ERROR_COL - 1,
-            0,
-            formats["helper"],
-        )
 
-        worksheet.write_formula(
-            row - 1,
-            HELPER_MEDIAN_THICKNESS_COL - 1,
-            "={}".format(median_thickness_formula),
-            formats["helper"],
-            median_thickness,
-        )
-        worksheet.write_formula(
-            row - 1,
-            HELPER_MEDIAN_BASE_COL - 1,
-            "={s}!{c}{median}-(({thickness})/2)".format(
-                s=_quote_sheet_name(STATS_SHEET),
-                c=box_col_name,
-                median=BOX_MEDIAN_ROW,
-                thickness=median_thickness_formula,
-            ),
-            formats["helper"],
-            statistic["median"] - median_thickness / 2,
-        )
+def _add_chart(workbook, worksheet, last_col):
+    temperature_count = len(TEMPERATURES)
 
-    # XlsxWriter 3.0.2 only exposes normal hiding.  The ZIP post-processing
-    # step changes this specific sheet to Excel's veryHidden state.
-    worksheet.hide()
-
-
-def _add_chart(
-    workbook,
-    worksheet,
-    temperatures,
-    chart_start_row,
-    chart_width,
-    chart_height,
-    axis_min,
-    axis_max,
-    axis_major_unit,
-    chart_variant="primary",
-):
-    include_nt_legs = chart_variant in ("all", "uncalibrated")
-    include_t_legs = chart_variant in ("all", "calibrated")
-
-    first_helper_row = 2
-    last_helper_row = first_helper_row + len(temperatures) - 1
     categories = _sheet_range(
-        HELPER_SHEET,
-        first_helper_row,
-        HELPER_CATEGORY_COL,
-        last_helper_row,
-        HELPER_CATEGORY_COL,
+        MAIN_SHEET, TEMPERATURE_ROW, 3, TEMPERATURE_ROW, last_col
     )
+    index_values = _sheet_range(MAIN_SHEET, INDEX_ROW, 3, INDEX_ROW, last_col)
 
-    def helper_range(col):
-        return _sheet_range(
-            HELPER_SHEET,
-            first_helper_row,
-            col,
-            last_helper_row,
-            col,
-        )
-
-    chart = workbook.add_chart({"type": "line"})
-    chart.set_style(2)
+    line_chart = workbook.add_chart({"type": "line"})
+    line_chart.set_style(2)
 
     series_index = [0]
     hidden_legend_series = []
@@ -1213,526 +618,217 @@ def _add_chart(
             hidden_legend_series.append(series_index[0])
         series_index[0] += 1
 
-    # Exact colors resolved from the reference workbook's Office theme.
-    whisker_color = "#B4C6E7"  # accent5, lighter 60%
-    average_color = "#70AD47"  # accent6
-    calibration_color = "#FF0000"
-    whisker_line = {"color": whisker_color, "width": 1.75}
+    def box_row_range(row):
+        return _sheet_range(MAIN_SHEET, row, 3, row, last_col)
+
+    black_line = {"color": "#000000", "width": 1}
+
+    # 系列順序不可打亂：upDownBars 會連接「第一條」(Q1) 跟「最後一條」(Q3)
+    # 系列畫出箱體，順序錯誤箱體位置就會跟著跑掉。
     add_series(
-        chart,
+        line_chart,
         {
-            "name": "Q1",
+            "name": _sheet_cell(MAIN_SHEET, Q1_ROW, 2),
             "categories": categories,
-            "values": helper_range(HELPER_Q1_COL),
+            "values": box_row_range(Q1_ROW),
             "line": {"none": True},
             "marker": {"type": "none"},
-            "y_error_bars": {
-                "type": "custom",
-                "plus_values": helper_range(HELPER_ZERO_ERROR_COL),
-                "minus_values": helper_range(HELPER_LOWER_ERROR_COL),
-                "end_style": 0,
-                "line": whisker_line,
+        },
+        show_in_legend=False,
+    )
+    add_series(
+        line_chart,
+        {
+            "name": _sheet_cell(MAIN_SHEET, LOWER_WHISKER_ROW, 2),
+            "categories": categories,
+            "values": box_row_range(LOWER_WHISKER_ROW),
+            "line": black_line,
+            "marker": {
+                "type": "dash",
+                "size": 7,
+                "fill": {"color": "#000000"},
+                "border": {"color": "#000000"},
             },
         },
         show_in_legend=False,
     )
     add_series(
-        chart,
+        line_chart,
         {
-            "name": "四分位距（Q1–Q3）",
+            "name": _sheet_cell(MAIN_SHEET, MEDIAN_ROW, 2),
             "categories": categories,
-            "values": helper_range(HELPER_BOX_LEGEND_COL),
+            "values": box_row_range(MEDIAN_ROW),
             "line": {"none": True},
             "marker": {
-                "type": "square",
-                "size": 8,
-                "fill": {"color": "#5B9BD5"},
-                "border": {"color": "#1F4E79"},
+                "type": "dash",
+                "size": 12,
+                "fill": {"color": "#000000"},
+                "border": {"none": True},
+            },
+        },
+        show_in_legend=True,
+    )
+    add_series(
+        line_chart,
+        {
+            "name": _sheet_cell(MAIN_SHEET, UPPER_WHISKER_ROW, 2),
+            "categories": categories,
+            "values": box_row_range(UPPER_WHISKER_ROW),
+            "line": black_line,
+            "marker": {
+                "type": "dash",
+                "size": 7,
+                "fill": {"color": "#000000"},
+                "border": {"color": "#000000"},
             },
         },
         show_in_legend=False,
     )
     add_series(
-        chart,
+        line_chart,
+        {
+            "name": _sheet_cell(MAIN_SHEET, Q3_ROW, 2),
+            "categories": categories,
+            "values": box_row_range(Q3_ROW),
+            "line": {"none": True},
+            "marker": {"type": "none"},
+        },
+        show_in_legend=False,
+    )
+    line_chart.set_high_low_lines()
+    line_chart.set_up_down_bars()
+
+    scatter_chart = workbook.add_chart(
+        {"type": "scatter", "subtype": "straight_with_markers"}
+    )
+    for temperature_index in range(temperature_count):
+        x_col = 2 + 2 * temperature_index
+        y_col = x_col + 1
+        add_series(
+            scatter_chart,
+            {
+                "categories": _sheet_range(
+                    HELPER_SHEET, 1, x_col, SAMPLE_COUNT, x_col
+                ),
+                "values": _sheet_range(
+                    HELPER_SHEET, 1, y_col, SAMPLE_COUNT, y_col
+                ),
+                "line": {"none": True},
+                "marker": {
+                    "type": "circle",
+                    "size": 2,
+                    "fill": {"color": "#000000"},
+                    "border": {"color": "#000000", "width": 2},
+                },
+            },
+            show_in_legend=False,
+        )
+    add_series(
+        scatter_chart,
         {
             "name": "平均值",
-            "categories": categories,
-            "values": helper_range(HELPER_AVERAGE_COL),
-            "line": {"color": average_color, "width": 0.25},
+            "categories": index_values,
+            "values": box_row_range(AVERAGE_ROW),
+            "line": {"color": "#00B050", "width": 1, "dash_type": "square_dot"},
             "marker": {
-                "type": "circle",
-                "size": 5,
-                "fill": {"color": average_color},
-                "border": {"color": average_color},
-            },
-        },
-        show_in_legend=True,
-    )
-
-    outlier_label_decimals = max(0, OUTLIER_LABEL_DECIMALS)
-    outlier_label_num_format = (
-        "0" if outlier_label_decimals == 0 else "0." + "0" * outlier_label_decimals
-    )
-    for sample_index in range(SAMPLE_COUNT):
-        series = {
-            "name": "離群值"
-            if sample_index == 0
-            else "離群值_{}".format(sample_index + 1),
-            "categories": categories,
-            "values": helper_range(HELPER_FIRST_OUTLIER_COL + sample_index),
-            "line": {"none": True},
-            "marker": {
-                "type": "circle",
-                "size": 5,
-                "fill": {"color": "#C00000"},
-                "border": {"color": "#C00000"},
-            },
-        }
-        if SHOW_OUTLIER_DATA_LABELS:
-            series["data_labels"] = {
-                "value": True,
-                "num_format": outlier_label_num_format,
-                "font": {"name": CHART_FONT, "size": OUTLIER_LABEL_FONT_SIZE},
-            }
-        add_series(chart, series, show_in_legend=(sample_index == 0))
-
-    last_data_col = 1 + len(temperatures)
-    cal_target_cons_decimals = max(0, CAL_TARGET_CONS_LABEL_DECIMALS)
-    cal_target_cons_num_format = (
-        "0"
-        if cal_target_cons_decimals == 0
-        else "0." + "0" * cal_target_cons_decimals
-    )
-    cal_target_cons_series = {
-        "name": "={}".format(_sheet_cell(MAIN_SHEET, TARGET_BASE_ROW, 1)),
-        "categories": categories,
-        "values": _sheet_range(
-            MAIN_SHEET,
-            TARGET_FIRST_STRICT_ROW,
-            2,
-            TARGET_FIRST_STRICT_ROW,
-            last_data_col,
-        ),
-        "line": {"color": calibration_color, "width": 0.5},
-        "marker": {
-            "type": "triangle",
-            "size": 5,
-            "fill": {"color": calibration_color},
-            "border": {"color": calibration_color},
-        },
-    }
-    if SHOW_CAL_TARGET_CONS_LABELS:
-        cal_target_cons_series["data_labels"] = {
-            "value": True,
-            "num_format": cal_target_cons_num_format,
-            "font": {"name": CHART_FONT, "size": 9},
-        }
-    add_series(chart, cal_target_cons_series, show_in_legend=True)
-    add_series(
-        chart,
-        {
-            "name": "Upper Spec",
-            "categories": categories,
-            "values": _sheet_range(
-                MAIN_SHEET, SPEC_UPPER_ROW, 2, SPEC_UPPER_ROW, last_data_col
-            ),
-            "line": {
-                "color": calibration_color,
-                "width": 0.25,
-            },
-            "marker": {"type": "none"},
-        },
-        show_in_legend=True,
-    )
-    add_series(
-        chart,
-        {
-            "name": "Lower Spec",
-            "categories": categories,
-            "values": _sheet_range(
-                MAIN_SHEET, SPEC_LOWER_ROW, 2, SPEC_LOWER_ROW, last_data_col
-            ),
-            "line": {
-                "color": calibration_color,
-                "width": 0.25,
-            },
-            "marker": {"type": "none"},
-        },
-        show_in_legend=True,
-    )
-    for leg_index, leg_base_name in enumerate(LEG_NAMES):
-        dark_color, light_color = LEG_COLOR_PALETTE[
-            leg_index % len(LEG_COLOR_PALETTE)
-        ]
-        nt_row = LEG_FIRST_ROW + leg_index
-        t_row = LEG_FIRST_ROW + len(LEG_NAMES) + leg_index
-        if include_nt_legs:
-            add_series(
-                chart,
-                {
-                    "name": "{}_NT".format(leg_base_name),
-                    "categories": categories,
-                    "values": _sheet_range(
-                        MAIN_SHEET, nt_row, 2, nt_row, last_data_col
-                    ),
-                    "line": {"color": dark_color, "width": 1.5},
-                    "marker": {
-                        "type": "diamond",
-                        "size": 5,
-                        "fill": {"color": dark_color},
-                        "border": {"color": dark_color},
-                    },
-                },
-                show_in_legend=True,
-            )
-        if include_t_legs:
-            # "calibrated"（只放 T）要跟 "uncalibrated"（只放 NT）用同一個深淺，
-            # 不要一深一淺；只有兩者都出現的 "all" 才需要靠深淺區分 NT/T。
-            t_color = dark_color if chart_variant == "calibrated" else light_color
-            add_series(
-                chart,
-                {
-                    "name": "{}_T".format(leg_base_name),
-                    "categories": categories,
-                    "values": _sheet_range(
-                        MAIN_SHEET, t_row, 2, t_row, last_data_col
-                    ),
-                    "line": {
-                        "color": t_color,
-                        "width": 1.5,
-                    },
-                    "marker": {
-                        "type": "diamond",
-                        "size": 5,
-                        "fill": {"color": t_color},
-                        "border": {"color": t_color},
-                    },
-                },
-                show_in_legend=True,
-            )
-    add_series(
-        chart,
-        {
-            "name": "下鬚端點",
-            "categories": categories,
-            "values": _sheet_range(
-                MAIN_SHEET,
-                LOWER_WHISKER_ROW,
-                2,
-                LOWER_WHISKER_ROW,
-                last_data_col,
-            ),
-            "line": {"color": whisker_color, "width": 0.25},
-            "marker": {
-                "type": "circle",
-                "size": 5,
-                "fill": {"color": whisker_color},
-                "border": {"color": whisker_color},
+                "type": "diamond",
+                "size": 7,
+                "fill": {"none": True},
+                "border": {"color": "#000000"},
             },
         },
         show_in_legend=False,
     )
     add_series(
-        chart,
+        scatter_chart,
         {
-            "name": "上鬚端點",
-            "categories": categories,
-            "values": _sheet_range(
-                MAIN_SHEET,
-                UPPER_WHISKER_ROW,
-                2,
-                UPPER_WHISKER_ROW,
-                last_data_col,
-            ),
-            "line": {"color": whisker_color, "width": 0.25},
+            "name": _sheet_cell(MAIN_SHEET, CAL_CONS_ROW, 2),
+            "categories": index_values,
+            "values": box_row_range(CAL_CONS_ROW),
+            "line": {"color": "#FF0000", "width": 1.5},
             "marker": {
-                "type": "circle",
-                "size": 5,
-                "fill": {"color": whisker_color},
-                "border": {"color": whisker_color},
+                "type": "triangle",
+                "size": 7,
+                "fill": {"color": "#FF0000"},
+                "border": {"color": "#FF0000"},
             },
-        },
-        show_in_legend=False,
-    )
-    add_series(
-        chart,
-        {
-            "name": "Q3",
-            "categories": categories,
-            "values": helper_range(HELPER_Q3_COL),
-            "line": {"none": True},
-            "marker": {"type": "none"},
-            "y_error_bars": {
-                "type": "custom",
-                "plus_values": helper_range(HELPER_UPPER_ERROR_COL),
-                "minus_values": helper_range(HELPER_ZERO_ERROR_COL),
-                "end_style": 0,
-                "line": whisker_line,
-            },
-        },
-        show_in_legend=False,
-    )
-
-    chart.set_up_down_bars(
-        {
-            "up": {
-                "fill": {"color": whisker_color, "transparency": 55},
-                "border": {"none": True},
-            },
-            "down": {
-                "fill": {"color": "#5B9BD5", "transparency": 55},
-                "border": {"none": True},
-            },
-        }
-    )
-
-    median_chart = workbook.add_chart({"type": "column", "subtype": "stacked"})
-    add_series(
-        median_chart,
-        {
-            # 名稱刻意留空：Excel 在圖例位置非 "top" 時，似乎不會確實套用
-            # delete_series 把這個輔助系列從圖例裡刪掉（"top" 那張正常，
-            # "right" 那三張會漏），所以不能只靠 delete_series。改成空字串
-            # 當雙重保險：就算刪除沒生效，圖例頂多多一個看不到文字的空白
-            # 列（本來 fill/border 就是 none），不會再顯示「中位數底座」。
-            "name": "",
-            "categories": categories,
-            "values": helper_range(HELPER_MEDIAN_BASE_COL),
-            "fill": {"none": True},
-            "border": {"none": True},
-            "gap": BOX_GAP_WIDTH,
-        },
-        show_in_legend=False,
-    )
-    add_series(
-        median_chart,
-        {
-            "name": "中位數",
-            "categories": categories,
-            "values": helper_range(HELPER_MEDIAN_THICKNESS_COL),
-            "fill": {"color": whisker_color},
-            "border": {"none": True},
         },
         show_in_legend=True,
     )
-    chart.combine(median_chart)
-    chart_title = CHART_VARIANT_TITLES[chart_variant]
-    chart.set_title(
-        {
-            "name": chart_title,
-            "name_font": {"name": CHART_FONT, "size": 18, "bold": True},
-        }
+
+    line_chart.combine(scatter_chart)
+
+    line_chart.set_title(
+        {"name": CHART_TITLE, "name_font": {"name": CHART_FONT, "size": 14, "bold": True}}
     )
-    chart.set_x_axis(
+    line_chart.set_x_axis(
         {
-            "name": X_AXIS_TITLE,
-            "name_font": {
-                "name": CHART_FONT,
-                "size": AXIS_TITLE_FONT_SIZE,
-                "color": "#404040",
-            },
+            "crossing": 1,
+            # "between"（預設值）：第一個與最後一個類別外側各留半格空白，
+            # 兩側對稱。
+            "position_axis": "between",
             "label_position": "low",
-            "major_tick_mark": "none",
-            "line": {"color": "#595959", "width": 1.1},
-            "num_font": {
-                "name": CHART_FONT,
-                "size": 12,
-                "color": "#404040",
-            },
+            "major_tick_mark": "inside",
+            "minor_tick_mark": "none",
+            "line": {"color": "#000000"},
+            "num_font": {"name": CHART_FONT, "size": 12},
         }
     )
-    chart.set_y_axis(
+    line_chart.set_y_axis(
         {
-            "name": Y_AXIS_TITLE,
-            "name_font": {
-                "name": CHART_FONT,
-                "size": AXIS_TITLE_FONT_SIZE,
-                "color": "#404040",
-            },
-            "crossing": 0,
-            "min": axis_min,
-            "max": axis_max,
-            "major_unit": axis_major_unit,
-            "num_format": "0.0##",
-            "major_tick_mark": "outside",
-            "line": {"color": "#7F7F7F", "width": 0.75},
-            "major_gridlines": {
-                "visible": True,
-                "line": {"color": "#D9E1F2", "width": 0.75},
-            },
-            "num_font": {"name": CHART_FONT, "size": 12, "color": "#404040"},
+            "num_format": "#,##0",
+            "major_tick_mark": "inside",
+            "minor_tick_mark": "none",
+            "major_gridlines": {"visible": False},
+            "line": {"color": "#000000"},
+            "num_font": {"name": CHART_FONT, "size": 12},
         }
     )
-    # 第一張（primary，純箱鬚圖本體）圖例維持在上方；其餘三張（all／
-    # uncalibrated／calibrated，數列較多）圖例改放右側，避免跟圖表標題擠在一起。
-    legend_position = "top" if chart_variant == "primary" else "right"
-    chart.set_legend(
+    line_chart.set_legend(
         {
-            "position": legend_position,
+            "position": "right",
             "delete_series": hidden_legend_series,
-            "font": {"name": CHART_FONT, "size": 14, "color": "#404040"},
+            "font": {"name": CHART_FONT, "size": 12},
         }
     )
-    chart.set_plotarea({"fill": {"color": "#FFFFFF"}, "border": {"none": True}})
-    chart.set_chartarea(
-        {
-            "fill": {"color": "#FFFFFF"},
-            "border": {"color": "#D9D9D9", "width": 0.5},
-        }
-    )
-    chart.show_hidden_data()
-    chart.show_blanks_as("gap")
-    chart.set_size({"width": chart_width, "height": chart_height})
-    worksheet.insert_chart(chart_start_row, 0, chart, {"x_offset": 4, "y_offset": 4})
+    line_chart.set_chartarea({"border": {"none": True}})
+
+    chart_width = max(700, min(1300, 90 * temperature_count))
+    line_chart.set_size({"width": chart_width, "height": 620})
+    worksheet.insert_chart(1, 9, line_chart)
 
 
-def _encode_legacy_password(password):
-    """Legacy Excel password hash (same algorithm XlsxWriter uses for sheet protection)."""
-    digits = []
-    for shift, char in enumerate(password, start=1):
-        value = ord(char) << shift
-        low_15 = value & 0x7FFF
-        high_15 = (value & (0x7FFF << 15)) >> 15
-        digits.append(low_15 | high_15)
-
-    password_hash = 0x0000
-    for digit in digits:
-        password_hash ^= digit
-    password_hash ^= len(password)
-    password_hash ^= 0xCE4B
-
-    return "%X" % password_hash
-
-
-def _patch_generated_xlsx(path):
-    """Apply two OOXML details unavailable in the bundled XlsxWriter 3.0.2."""
-    handle, temporary_name = tempfile.mkstemp(
-        prefix=".box_plot_patch_",
-        suffix=".xlsx",
-        dir=str(path.parent),
-    )
-    os.close(handle)
-    temporary_path = Path(temporary_name)
-
-    try:
-        with zipfile.ZipFile(str(path), "r") as source_zip:
-            with zipfile.ZipFile(str(temporary_path), "w") as target_zip:
-                for info in source_zip.infolist():
-                    content = source_zip.read(info.filename)
-                    if info.filename == "xl/workbook.xml":
-                        content = re.sub(
-                            rb'(<sheet\b[^>]*\bname="_BoxPlot2010"[^>]*\bstate=")hidden(")',
-                            rb"\1veryHidden\2",
-                            content,
-                            count=1,
-                        )
-                        if WORKBOOK_STRUCTURE_PASSWORD:
-                            password_hash = _encode_legacy_password(
-                                WORKBOOK_STRUCTURE_PASSWORD
-                            )
-                            protection_tag = (
-                                '<workbookProtection lockStructure="1" '
-                                'workbookPassword="{}"/>'
-                            ).format(password_hash).encode("ascii")
-                            # Schema order requires workbookProtection right after
-                            # the self-closing <workbookPr .../> element.
-                            content = re.sub(
-                                rb"(<workbookPr\b[^>]*/>)",
-                                lambda match: match.group(1) + protection_tag,
-                                content,
-                                count=1,
-                            )
-                    elif info.filename.startswith("xl/charts/chart") and info.filename.endswith(
-                        ".xml"
-                    ):
-                        content = content.replace(
-                            b'<c:gapWidth val="150"/>',
-                            '<c:gapWidth val="{}"/>'.format(BOX_GAP_WIDTH).encode(
-                                "ascii"
-                            ),
-                            1,
-                        )
-                    target_zip.writestr(info, content)
-        os.replace(str(temporary_path), str(path))
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-
-def _write_workbook(path, temperatures, script_dir):
+def _write_workbook(path, script_dir):
     xlsxwriter, _, _, _ = _load_xlsxwriter()
-    rng = random.Random()
-    data = [
-        [rng.random() * 500.0 - 250.0 for _ in range(SAMPLE_COUNT)]
-        for _ in temperatures
-    ]
-    stats = [_calculate_statistics(values) for values in data]
-    leg_data = [
-        [rng.random() * 500.0 - 250.0 for _ in temperatures]
-        for _ in LEG_SERIES_NAMES
-    ]
-
-    all_values = (
-        [value for column_values in data for value in column_values]
-        + [value for row_values in leg_data for value in row_values]
-        + [SPEC_UPPER_VALUE, SPEC_LOWER_VALUE]
-    )
-    raw_min, raw_max = min(all_values), max(all_values)
-    axis_margin = (raw_max - raw_min) * Y_AXIS_AUTO_MARGIN_RATIO
-    axis_min = Y_AXIS_MIN if Y_AXIS_MIN is not None else raw_min - axis_margin
-    axis_max = Y_AXIS_MAX if Y_AXIS_MAX is not None else raw_max + axis_margin
-    # 不論自動或手動設定，Y=0 一律要落在範圍內，才能保證基準線一定畫得出來。
-    axis_min = min(axis_min, 0.0)
-    axis_max = max(axis_max, 0.0)
-    # 格線間距用「漂亮數字」而非 Excel 自動選值，確保 0 一定剛好落在某條
-    # 格線上、刻度標籤「0」才會真的被畫出來，不是只有範圍涵蓋到而已。
-    axis_major_unit = _nice_axis_major_unit(axis_max - axis_min)
 
     workbook = xlsxwriter.Workbook(str(path))
     try:
         workbook.set_properties(
             {
-                "title": "TSM Box Plot",
+                "title": "TSM Box Plot (classic plot)",
                 "subject": "Excel 2010 compatible box plot",
-                "author": "Box Plot Excel Generator",
-                "comments": "Generated entirely by Python without an Excel template.",
+                "comments": (
+                    "Generated by tsm_classic_box_plot_generator.pyw"
+                    "（hiLowLines + upDownBars + XY scatter 技巧）。"
+                ),
             }
         )
         workbook.set_calc_mode("auto")
         formats = _create_formats(workbook, _read_font_name(script_dir))
 
         main_sheet = workbook.add_worksheet(MAIN_SHEET)
-        stats_sheet = workbook.add_worksheet(STATS_SHEET)
         helper_sheet = workbook.add_worksheet(HELPER_SHEET)
 
-        chart_start_rows, chart_width, chart_height = _write_main_sheet(
-            workbook, main_sheet, temperatures, data, stats, leg_data, formats
-        )
-        _write_stats_sheet(stats_sheet, temperatures, stats, formats)
-        _write_helper_sheet(helper_sheet, temperatures, data, stats, formats)
-        chart_variants = ["primary", "all", "uncalibrated", "calibrated"]
-        for chart_start_row, chart_variant in zip(chart_start_rows, chart_variants):
-            _add_chart(
-                workbook,
-                main_sheet,
-                temperatures,
-                chart_start_row,
-                chart_width,
-                chart_height,
-                axis_min,
-                axis_max,
-                axis_major_unit,
-                chart_variant=chart_variant,
-            )
+        _statistics, last_col = _write_main_sheet(workbook, main_sheet, formats)
+        _write_helper_sheet(workbook, helper_sheet, formats)
+        _add_chart(workbook, main_sheet, last_col)
+
         main_sheet.activate()
     finally:
         workbook.close()
 
-    _patch_generated_xlsx(path)
 
-
-def generate_workbook(output_path, temperatures, overwrite=False):
-    temperatures = normalize_temperatures(temperatures)
+def generate_workbook(output_path, overwrite=False):
     output_path = Path(output_path).expanduser()
     if output_path.suffix.lower() != ".xlsx":
         output_path = output_path.with_suffix(".xlsx")
@@ -1744,7 +840,7 @@ def generate_workbook(output_path, temperatures, overwrite=False):
         raise FileExistsError("檔案已存在：{}".format(output_path))
 
     file_handle, temporary_name = tempfile.mkstemp(
-        prefix=".box_plot_build_",
+        prefix=".tsm_classic_box_plot_build_",
         suffix=".xlsx",
         dir=str(output_path.parent),
     )
@@ -1752,19 +848,13 @@ def generate_workbook(output_path, temperatures, overwrite=False):
     temporary_path = Path(temporary_name)
 
     try:
-        _write_workbook(temporary_path, temperatures, Path(__file__).resolve().parent)
+        _write_workbook(temporary_path, Path(__file__).resolve().parent)
         os.replace(str(temporary_path), str(output_path))
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
 
     return output_path
-
-
-def _parse_cli_temperatures(raw_value):
-    if not raw_value:
-        return DEFAULT_TEMPERATURES
-    return [item.strip() for item in re.split(r"[,;\n]+", raw_value) if item.strip()]
 
 
 def _configured_pythonw():
@@ -1790,9 +880,7 @@ def _relaunch_for_double_click():
     configured = _configured_pythonw()
     if configured is None:
         raise FileNotFoundError(
-            "找不到指定的 pythonw.exe，請修改 PYTHONW_EXE：{}".format(
-                PYTHONW_EXE
-            )
+            "找不到指定的 pythonw.exe，請修改 PYTHONW_EXE：{}".format(PYTHONW_EXE)
         )
 
     subprocess.Popen(
@@ -1825,34 +913,22 @@ def main(argv=None):
     _ensure_allowed_runtime()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--generate",
-        metavar="OUTPUT.xlsx",
-        help="直接產生指定的 Excel 檔案",
+        "--generate", metavar="OUTPUT.xlsx", help="直接產生指定的 Excel 檔案"
     )
     parser.add_argument(
-        "--temperatures",
-        help="以逗號或分號分隔的溫度點，最多 20 個",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="允許覆寫既有輸出檔",
+        "--overwrite", action="store_true", help="允許覆寫既有輸出檔"
     )
     parser.add_argument("--direct-run", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     if args.generate:
-        result = generate_workbook(
-            args.generate,
-            _parse_cli_temperatures(args.temperatures),
-            overwrite=args.overwrite,
-        )
+        result = generate_workbook(args.generate, overwrite=args.overwrite)
         print(result)
         return 0
 
     script_dir = Path(__file__).resolve().parent
     output_path = script_dir / DEFAULT_OUTPUT_FILENAME
-    generate_workbook(output_path, DEFAULT_TEMPERATURES, overwrite=True)
+    generate_workbook(output_path, overwrite=True)
     _clear_error_log(script_dir)
     return 0
 
