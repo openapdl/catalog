@@ -1,0 +1,967 @@
+# -*- coding: utf-8 -*-
+"""建立可依溫度數量與樣本數量擴充的 Excel 盒鬚圖範本。"""
+
+from pathlib import Path
+import os
+import subprocess
+import sys
+import uuid
+
+
+# ========================= 使用者設定 =========================
+# 只需要修改這一區；雙擊腳本後會直接建立 Excel 範本。
+TEMPERATURE_COUNT = 7
+SAMPLE_COUNT = 12
+# NT/T 配對組數：1 = Baseline；4 = Baseline + Leg_1～Leg_3。
+NT_T_PAIR_COUNT = 4
+OUTPUT_FILE_PREFIX = "TSM_Warpage_Box_Plot"
+OPEN_OUTPUT_AFTER_CREATE = False  # 改成 True 才會在建立後自動開啟 Excel
+AXIS_TICK_LABEL_FONT_SIZE = 12
+LEGEND_FONT_SIZE = 12
+
+# 換到其他電腦時，只需修改這個命名常數。
+PYTHONW_EXE = Path(
+    r"C:\Users\\python3.8\win64\pythonw.exe"
+)
+# ==============================================================
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+RELAUNCH_FLAG = "--box-plot-configured-pythonw"
+
+# 工作表結構
+SHEET_NAME = "盒鬚圖"
+TITLE_ROW = 1
+GROUP_INDEX_ROW = 2
+TEMPERATURE_ROW = 3
+DATA_START_ROW = 4
+DESCRIPTION_COLUMN = 1
+ROW_LABEL_COLUMN = 2
+FIRST_DATA_COLUMN = 3
+SUMMARY_KEYS = ("StdDev", "Max", "Min", "Average")
+SUMMARY_TO_NT_GAP_ROWS = 1
+NT_TO_T_GAP_ROWS = 1
+STATS_TABLE_GAP_ROWS = 1
+CHART_COLUMN_GAP = 2
+
+# Excel 工作表本身的容量限制
+MIN_TEMPERATURE_COUNT = 1
+MIN_SAMPLE_COUNT = 2
+MIN_NT_T_PAIR_COUNT = 1
+EXCEL_MAX_ROWS = 1048576
+EXCEL_MAX_COLUMNS = 16384
+
+# 版面常數
+DEFAULT_FONT_NAME = "Microsoft JhengHei"
+TITLE_FONT_SIZE = 14
+BODY_FONT_SIZE = 10
+DESCRIPTION_COLUMN_WIDTH = 26
+ROW_LABEL_COLUMN_WIDTH = 18
+DATA_COLUMN_WIDTH = 12
+CHART_BASE_WIDTH = 440
+CHART_WIDTH_PER_TEMPERATURE = 55
+CHART_MIN_WIDTH = 560
+CHART_MAX_WIDTH = 1100
+CHART_HEIGHT = 390
+CHART_TITLE_TEXT = "TSM Warpage Box Plot"
+X_AXIS_TITLE_TEXT = "Temperature"
+Y_AXIS_TITLE_TEXT = "Warpage (µm)"
+CHART_TITLE_FONT_SIZE = 14
+AXIS_TITLE_FONT_SIZE = 14
+BOX_GAP_WIDTH = 150
+MEDIAN_LINE_WEIGHT = 2.25
+MEDIAN_LEGEND_MARKER_SIZE = 3
+WHISKER_CAP_LINE_WEIGHT = 1.0
+MAX_MIN_LINE_WEIGHT = 1.5
+BOX_FILL_TINT_AND_SHADE = -0.15
+WHISKER_TINT_AND_SHADE = -0.35
+
+# 色彩
+COLOR_HEADER = (31, 78, 121)
+COLOR_HEADER_TEXT = (255, 255, 255)
+COLOR_INPUT = (255, 242, 204)
+COLOR_STATS_HEADER = (68, 114, 196)
+COLOR_STATS_LABEL = (221, 235, 247)
+COLOR_BORDER = (166, 166, 166)
+COLOR_BLACK = (0, 0, 0)
+COLOR_MEDIAN = COLOR_BLACK
+COLOR_AVERAGE = (0, 176, 80)
+COLOR_BOX_FILL_FALLBACK = (217, 217, 217)
+COLOR_WHISKER_FALLBACK = (166, 166, 166)
+
+# Excel / Office 常數（使用 late binding，不依賴電腦上的型別庫快取）
+XL_OPEN_XML_WORKBOOK = 51
+XL_CALCULATION_AUTOMATIC = -4105
+XL_CENTER = -4108
+XL_LINE_MARKERS = 65
+XL_XY_SCATTER = -4169
+XL_XY_SCATTER_LINES = 74
+XL_XY_SCATTER_LINES_NO_MARKERS = 75
+XL_CATEGORY = 1
+XL_VALUE = 2
+XL_X = -4168
+XL_PRIMARY = 1
+XL_LEGEND_POSITION_RIGHT = -4152
+XL_TICK_LABEL_POSITION_LOW = -4134
+XL_ERROR_BAR_INCLUDE_BOTH = 1
+XL_ERROR_BAR_TYPE_FIXED_VALUE = 1
+XL_NO_CAP = 2
+XL_MARKER_STYLE_NONE = -4142
+XL_MARKER_STYLE_DASH = -4115
+XL_MARKER_STYLE_DIAMOND = 2
+XL_CONTINUOUS = 1
+XL_THIN = 2
+MSO_FALSE = 0
+MSO_TRUE = -1
+MSO_LINE_DASH = 4
+MSO_THEME_COLOR_BACKGROUND_1 = 14
+
+
+def _normalised_path(path):
+    """回傳適合 Windows 執行檔比較的正規化路徑。"""
+
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _show_native_error(title, message):
+    """在無設定視窗模式下顯示必要的 Windows 錯誤訊息。"""
+
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x10)
+    except Exception:
+        pass
+
+
+def relaunch_with_configured_pythonw():
+    """確保雙擊腳本時改由指定的 pythonw.exe 執行。"""
+
+    if RELAUNCH_FLAG in sys.argv:
+        return
+
+    if _normalised_path(sys.executable) == _normalised_path(PYTHONW_EXE):
+        return
+
+    if not PYTHONW_EXE.is_file():
+        message = "找不到設定的 pythonw.exe：\n{}\n\n請修改腳本頂端的 PYTHONW_EXE。".format(
+            PYTHONW_EXE
+        )
+        _show_native_error("盒鬚圖範本產生器", message)
+        raise SystemExit(1)
+
+    command = [str(PYTHONW_EXE), str(SCRIPT_PATH), RELAUNCH_FLAG]
+    try:
+        subprocess.Popen(command, cwd=str(SCRIPT_PATH.parent))
+    except OSError as exc:
+        _show_native_error("盒鬚圖範本產生器", "無法啟動指定的 Python：\n{}".format(exc))
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+
+def excel_column_name(column_number):
+    """將 1 起算的欄號轉換成 Excel 欄名。"""
+
+    if column_number < 1:
+        raise ValueError("Excel 欄號必須大於 0。")
+
+    letters = []
+    value = column_number
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
+def rgb(red, green, blue):
+    """轉換成 Excel COM 使用的 RGB 整數。"""
+
+    return red + green * 256 + blue * 65536
+
+
+def set_office_theme_color(color_format, tint_and_shade, fallback_color):
+    """套用「白色、背景 1」主題色，不支援時使用預設佈景的等效 RGB。"""
+
+    try:
+        color_format.ObjectThemeColor = MSO_THEME_COLOR_BACKGROUND_1
+        color_format.TintAndShade = tint_and_shade
+        if color_format.ObjectThemeColor == MSO_THEME_COLOR_BACKGROUND_1:
+            return
+    except Exception:
+        pass
+
+    # 部分 Excel 版本會接受 ObjectThemeColor 指派，卻立即轉成固定 RGB。
+    # 此時直接保存該主題色在預設 Office 佈景中的精確等效色。
+    color_format.RGB = rgb(*fallback_color)
+    color_format.TintAndShade = 0.0
+
+
+def absolute_cell(column_number, row_number):
+    return "${}${}".format(excel_column_name(column_number), row_number)
+
+
+def absolute_range(column_number, first_row, last_row):
+    column_name = excel_column_name(column_number)
+    return "${}${}:${}${}".format(column_name, first_row, column_name, last_row)
+
+
+def quoted_sheet_name(sheet_name):
+    return "'{}'".format(sheet_name.replace("'", "''"))
+
+
+def set_range_border(cell_range):
+    cell_range.Borders.LineStyle = XL_CONTINUOUS
+    cell_range.Borders.Weight = XL_THIN
+    cell_range.Borders.Color = rgb(*COLOR_BORDER)
+
+
+def write_layout(worksheet, temperature_count, sample_count, positions):
+    """寫入輸入區、統計列與所有公式。"""
+
+    last_data_column = positions["last_data_column"]
+    data_end_row = positions["data_end_row"]
+    summary_rows = positions["summary_rows"]
+    nt_t_blocks = positions["nt_t_blocks"]
+    stats_header_row = positions["stats_header_row"]
+    stats_rows = positions["stats_rows"]
+
+    worksheet.Cells(TITLE_ROW, ROW_LABEL_COLUMN).Value = "TSM Data"
+    worksheet.Cells(GROUP_INDEX_ROW, ROW_LABEL_COLUMN).Value = "數量"
+    worksheet.Cells(TEMPERATURE_ROW, ROW_LABEL_COLUMN).Value = "樣本"
+
+    group_indices = tuple(range(1, temperature_count + 1))
+    temperature_labels = tuple(
+        "溫度{}".format(index) for index in range(1, temperature_count + 1)
+    )
+    worksheet.Range(
+        worksheet.Cells(GROUP_INDEX_ROW, FIRST_DATA_COLUMN),
+        worksheet.Cells(GROUP_INDEX_ROW, last_data_column),
+    ).Value = (group_indices,)
+    worksheet.Range(
+        worksheet.Cells(TEMPERATURE_ROW, FIRST_DATA_COLUMN),
+        worksheet.Cells(TEMPERATURE_ROW, last_data_column),
+    ).Value = (temperature_labels,)
+
+    sample_labels = tuple(
+        ("#{}".format(index),) for index in range(1, sample_count + 1)
+    )
+    worksheet.Range(
+        worksheet.Cells(DATA_START_ROW, ROW_LABEL_COLUMN),
+        worksheet.Cells(data_end_row, ROW_LABEL_COLUMN),
+    ).Value = sample_labels
+
+    worksheet.Range(
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[0]], ROW_LABEL_COLUMN),
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[-1]], ROW_LABEL_COLUMN),
+    ).Value = tuple((key,) for key in SUMMARY_KEYS)
+
+    for block in nt_t_blocks:
+        worksheet.Range(
+            worksheet.Cells(block["start_row"], ROW_LABEL_COLUMN),
+            worksheet.Cells(block["end_row"], ROW_LABEL_COLUMN),
+        ).Value = tuple((label,) for label in block["labels"])
+
+    stats_definitions = (
+        ("標準差", "StdDev"),
+        ("最大值", "Max"),
+        ("最小值", "Min"),
+        ("平均值", "Average"),
+        ("中位數", "Median"),
+        ("75% 百分位", "Q3"),
+        ("25% 百分位", "Q1"),
+        ("四分位距 (IQR)", "IQR"),
+        ("下界 (Q1 - 1.5 × IQR)", "Lower Fence"),
+        ("上界 (Q3 + 1.5 × IQR)", "Upper Fence"),
+        ("下鬚（最小非離群值）", "Lower Whisker"),
+        ("上鬚（最大非離群值）", "Upper Whisker"),
+        ("有效數值筆數", "Count"),
+        ("離群值數量", "Outliers"),
+    )
+
+    worksheet.Cells(stats_header_row, DESCRIPTION_COLUMN).Value = "統計指標"
+    worksheet.Cells(stats_header_row, ROW_LABEL_COLUMN).Value = "Statistics"
+    worksheet.Range(
+        worksheet.Cells(stats_header_row + 1, DESCRIPTION_COLUMN),
+        worksheet.Cells(stats_header_row + len(stats_definitions), ROW_LABEL_COLUMN),
+    ).Value = tuple(stats_definitions)
+
+    for data_column in range(FIRST_DATA_COLUMN, last_data_column + 1):
+        data_range = absolute_range(data_column, DATA_START_ROW, data_end_row)
+        count_ref = absolute_cell(data_column, stats_rows["Count"])
+        q3_ref = absolute_cell(data_column, stats_rows["Q3"])
+        q1_ref = absolute_cell(data_column, stats_rows["Q1"])
+        iqr_ref = absolute_cell(data_column, stats_rows["IQR"])
+        lower_fence_ref = absolute_cell(data_column, stats_rows["Lower Fence"])
+        upper_fence_ref = absolute_cell(data_column, stats_rows["Upper Fence"])
+
+        formulas = {
+            "StdDev": "=IF(COUNT({0})>=2,STDEV({0}),NA())".format(data_range),
+            "Max": "=IF(COUNT({0})>0,MAX({0}),NA())".format(data_range),
+            "Min": "=IF(COUNT({0})>0,MIN({0}),NA())".format(data_range),
+            "Average": "=IF(COUNT({0})>0,AVERAGE({0}),NA())".format(data_range),
+            "Median": "=IF(COUNT({0})>0,MEDIAN({0}),NA())".format(data_range),
+            "Q3": "=IF(COUNT({0})>0,QUARTILE({0},3),NA())".format(data_range),
+            "Q1": "=IF(COUNT({0})>0,QUARTILE({0},1),NA())".format(data_range),
+            "IQR": "=IF({0}=0,NA(),{1}-{2})".format(count_ref, q3_ref, q1_ref),
+            "Lower Fence": "=IF({0}=0,NA(),{1}-1.5*{2})".format(
+                count_ref, q1_ref, iqr_ref
+            ),
+            "Upper Fence": "=IF({0}=0,NA(),{1}+1.5*{2})".format(
+                count_ref, q3_ref, iqr_ref
+            ),
+            "Lower Whisker": (
+                "=IF(COUNT({0})=0,NA(),"
+                "AGGREGATE(15,6,{0}/(({0}>={1})*ISNUMBER({0})),1))"
+            ).format(data_range, lower_fence_ref),
+            "Upper Whisker": (
+                "=IF(COUNT({0})=0,NA(),"
+                "AGGREGATE(14,6,{0}/(({0}<={1})*ISNUMBER({0})),1))"
+            ).format(data_range, upper_fence_ref),
+            "Count": "=COUNT({})".format(data_range),
+            "Outliers": (
+                '=IF({0}=0,0,COUNTIF({1},"<"&{2})+'
+                'COUNTIF({1},">"&{3}))'
+            ).format(count_ref, data_range, lower_fence_ref, upper_fence_ref),
+        }
+
+        for key, formula in formulas.items():
+            worksheet.Cells(stats_rows[key], data_column).Formula = formula
+
+        for key in SUMMARY_KEYS:
+            worksheet.Cells(summary_rows[key], data_column).Formula = "={}".format(
+                absolute_cell(data_column, stats_rows[key])
+            )
+
+
+def format_worksheet(worksheet, temperature_count, positions):
+    """套用版面與清楚區分可輸入儲存格。"""
+
+    last_data_column = positions["last_data_column"]
+    data_end_row = positions["data_end_row"]
+    summary_rows = positions["summary_rows"]
+    nt_t_blocks = positions["nt_t_blocks"]
+    stats_header_row = positions["stats_header_row"]
+    stats_end_row = positions["stats_end_row"]
+    stats_rows = positions["stats_rows"]
+
+    used_range = worksheet.Range(
+        worksheet.Cells(TITLE_ROW, DESCRIPTION_COLUMN),
+        worksheet.Cells(stats_end_row, last_data_column),
+    )
+    used_range.Font.Name = DEFAULT_FONT_NAME
+    used_range.Font.Size = BODY_FONT_SIZE
+    used_range.VerticalAlignment = XL_CENTER
+
+    title_cell = worksheet.Cells(TITLE_ROW, ROW_LABEL_COLUMN)
+    title_cell.Font.Bold = True
+    title_cell.Font.Size = TITLE_FONT_SIZE
+
+    data_header_range = worksheet.Range(
+        worksheet.Cells(GROUP_INDEX_ROW, ROW_LABEL_COLUMN),
+        worksheet.Cells(TEMPERATURE_ROW, last_data_column),
+    )
+    data_header_range.Interior.Color = rgb(*COLOR_HEADER)
+    data_header_range.Font.Color = rgb(*COLOR_HEADER_TEXT)
+    data_header_range.Font.Bold = True
+    data_header_range.HorizontalAlignment = XL_CENTER
+    set_range_border(data_header_range)
+
+    sample_label_range = worksheet.Range(
+        worksheet.Cells(DATA_START_ROW, ROW_LABEL_COLUMN),
+        worksheet.Cells(data_end_row, ROW_LABEL_COLUMN),
+    )
+    sample_label_range.HorizontalAlignment = XL_CENTER
+    set_range_border(sample_label_range)
+
+    input_range = worksheet.Range(
+        worksheet.Cells(DATA_START_ROW, FIRST_DATA_COLUMN),
+        worksheet.Cells(data_end_row, last_data_column),
+    )
+    input_range.Interior.Color = rgb(*COLOR_INPUT)
+    input_range.NumberFormat = "0.00"
+    input_range.HorizontalAlignment = XL_CENTER
+    set_range_border(input_range)
+
+    summary_label_range = worksheet.Range(
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[0]], ROW_LABEL_COLUMN),
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[-1]], ROW_LABEL_COLUMN),
+    )
+    summary_label_range.Interior.Color = rgb(*COLOR_STATS_LABEL)
+    summary_label_range.Font.Bold = True
+    summary_label_range.HorizontalAlignment = XL_CENTER
+
+    summary_value_range = worksheet.Range(
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[0]], FIRST_DATA_COLUMN),
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[-1]], last_data_column),
+    )
+    summary_value_range.Interior.Color = rgb(*COLOR_INPUT)
+    summary_value_range.NumberFormat = "0.00"
+    summary_value_range.HorizontalAlignment = XL_CENTER
+
+    summary_full_range = worksheet.Range(
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[0]], ROW_LABEL_COLUMN),
+        worksheet.Cells(summary_rows[SUMMARY_KEYS[-1]], last_data_column),
+    )
+    set_range_border(summary_full_range)
+
+    for block in nt_t_blocks:
+        block_label_range = worksheet.Range(
+            worksheet.Cells(block["start_row"], ROW_LABEL_COLUMN),
+            worksheet.Cells(block["end_row"], ROW_LABEL_COLUMN),
+        )
+        block_label_range.Interior.Color = rgb(*COLOR_STATS_LABEL)
+        block_label_range.Font.Bold = True
+        block_label_range.HorizontalAlignment = XL_CENTER
+
+        block_value_range = worksheet.Range(
+            worksheet.Cells(block["start_row"], FIRST_DATA_COLUMN),
+            worksheet.Cells(block["end_row"], last_data_column),
+        )
+        block_value_range.Interior.Color = rgb(*COLOR_INPUT)
+        block_value_range.NumberFormat = "0.00"
+        block_value_range.HorizontalAlignment = XL_CENTER
+
+        block_full_range = worksheet.Range(
+            worksheet.Cells(block["start_row"], ROW_LABEL_COLUMN),
+            worksheet.Cells(block["end_row"], last_data_column),
+        )
+        set_range_border(block_full_range)
+
+    stats_header_range = worksheet.Range(
+        worksheet.Cells(stats_header_row, DESCRIPTION_COLUMN),
+        worksheet.Cells(stats_header_row, last_data_column),
+    )
+    stats_header_range.Interior.Color = rgb(*COLOR_STATS_HEADER)
+    stats_header_range.Font.Color = rgb(*COLOR_HEADER_TEXT)
+    stats_header_range.Font.Bold = True
+    stats_header_range.HorizontalAlignment = XL_CENTER
+    set_range_border(stats_header_range)
+
+    stats_label_range = worksheet.Range(
+        worksheet.Cells(stats_header_row + 1, DESCRIPTION_COLUMN),
+        worksheet.Cells(stats_end_row, ROW_LABEL_COLUMN),
+    )
+    stats_label_range.Interior.Color = rgb(*COLOR_STATS_LABEL)
+    set_range_border(stats_label_range)
+
+    stats_value_range = worksheet.Range(
+        worksheet.Cells(stats_header_row + 1, FIRST_DATA_COLUMN),
+        worksheet.Cells(stats_end_row, last_data_column),
+    )
+    stats_value_range.NumberFormat = "0.00"
+    stats_value_range.HorizontalAlignment = XL_CENTER
+    set_range_border(stats_value_range)
+
+    worksheet.Range(
+        worksheet.Cells(stats_rows["Count"], FIRST_DATA_COLUMN),
+        worksheet.Cells(stats_rows["Outliers"], last_data_column),
+    ).NumberFormat = "0"
+
+    worksheet.Columns(DESCRIPTION_COLUMN).ColumnWidth = DESCRIPTION_COLUMN_WIDTH
+    worksheet.Columns(ROW_LABEL_COLUMN).ColumnWidth = ROW_LABEL_COLUMN_WIDTH
+    worksheet.Range(
+        worksheet.Columns(FIRST_DATA_COLUMN),
+        worksheet.Columns(last_data_column),
+    ).ColumnWidth = DATA_COLUMN_WIDTH
+
+    worksheet.Range(
+        worksheet.Cells(TITLE_ROW, DESCRIPTION_COLUMN),
+        worksheet.Cells(stats_end_row, last_data_column),
+    ).Rows.AutoFit()
+
+
+def add_box_whisker_chart(worksheet, temperature_count, positions):
+    """以線圖、漲跌柱與高低線建立可隨輸入資料更新的盒鬚圖。"""
+
+    last_data_column = positions["last_data_column"]
+    stats_header_row = positions["stats_header_row"]
+    stats_rows = positions["stats_rows"]
+    chart_left_column = last_data_column + CHART_COLUMN_GAP
+    chart_anchor = worksheet.Cells(stats_header_row + 1, chart_left_column)
+    chart_width = max(
+        CHART_MIN_WIDTH,
+        min(
+            CHART_MAX_WIDTH,
+            CHART_BASE_WIDTH + temperature_count * CHART_WIDTH_PER_TEMPERATURE,
+        ),
+    )
+
+    chart_object = worksheet.ChartObjects().Add(
+        chart_anchor.Left,
+        chart_anchor.Top,
+        chart_width,
+        CHART_HEIGHT,
+    )
+    chart_object.Name = "BoxWhiskerChart"
+    chart = chart_object.Chart
+    chart.ChartType = XL_LINE_MARKERS
+    while chart.SeriesCollection().Count:
+        chart.SeriesCollection(1).Delete()
+    chart.HasTitle = True
+    chart.ChartTitle.Text = CHART_TITLE_TEXT
+    chart.ChartTitle.Font.Size = CHART_TITLE_FONT_SIZE
+    chart.HasLegend = True
+    chart.Legend.Position = XL_LEGEND_POSITION_RIGHT
+    chart.Legend.Font.Size = LEGEND_FONT_SIZE
+
+    category_range = worksheet.Range(
+        worksheet.Cells(TEMPERATURE_ROW, FIRST_DATA_COLUMN),
+        worksheet.Cells(TEMPERATURE_ROW, last_data_column),
+    )
+    x_value_range = worksheet.Range(
+        worksheet.Cells(GROUP_INDEX_ROW, FIRST_DATA_COLUMN),
+        worksheet.Cells(GROUP_INDEX_ROW, last_data_column),
+    )
+
+    series_specs = (
+        ("Q1", XL_MARKER_STYLE_NONE, COLOR_BLACK, 0),
+        ("Lower Whisker", XL_MARKER_STYLE_NONE, COLOR_BLACK, 0),
+        ("Upper Whisker", XL_MARKER_STYLE_NONE, COLOR_BLACK, 0),
+        ("Q3", XL_MARKER_STYLE_NONE, COLOR_BLACK, 0),
+    )
+
+    sheet_reference = quoted_sheet_name(SHEET_NAME)
+    for key, marker_style, marker_color, marker_size in series_specs:
+        series = chart.SeriesCollection().NewSeries()
+        series.ChartType = XL_LINE_MARKERS
+        series.AxisGroup = XL_PRIMARY
+        series.Name = "={}!{}".format(
+            sheet_reference,
+            absolute_cell(ROW_LABEL_COLUMN, stats_rows[key]),
+        )
+        series.XValues = category_range
+        series.Values = worksheet.Range(
+            worksheet.Cells(stats_rows[key], FIRST_DATA_COLUMN),
+            worksheet.Cells(stats_rows[key], last_data_column),
+        )
+        series.Format.Line.Visible = MSO_FALSE
+        series.MarkerStyle = marker_style
+        if marker_style != XL_MARKER_STYLE_NONE:
+            series.MarkerSize = marker_size
+            series.MarkerForegroundColor = rgb(*marker_color)
+            series.MarkerBackgroundColor = rgb(*marker_color)
+
+    line_group = chart.ChartGroups(1)
+    line_group.HasHiLoLines = True
+    line_group.HasUpDownBars = True
+    line_group.GapWidth = BOX_GAP_WIDTH
+
+    # 部分 Excel 版本對組合圖的裝飾屬性支援不同；這些只影響外觀。
+    try:
+        set_office_theme_color(
+            line_group.HiLoLines.Format.Line.ForeColor,
+            WHISKER_TINT_AND_SHADE,
+            COLOR_WHISKER_FALLBACK,
+        )
+        line_group.HiLoLines.Format.Line.Weight = 1.0
+        for box_bars in (line_group.UpBars, line_group.DownBars):
+            box_bars.Format.Fill.Visible = MSO_TRUE
+            box_bars.Format.Fill.Solid()
+            set_office_theme_color(
+                box_bars.Format.Fill.ForeColor,
+                BOX_FILL_TINT_AND_SHADE,
+                COLOR_BOX_FILL_FALLBACK,
+            )
+            box_bars.Format.Line.Visible = MSO_FALSE
+    except Exception:
+        pass
+
+    box_half_width = 0.5 / (1.0 + BOX_GAP_WIDTH / 100.0)
+    median_series = chart.SeriesCollection().NewSeries()
+    median_series.ChartType = XL_XY_SCATTER
+    median_series.AxisGroup = XL_PRIMARY
+    median_series.Name = "={}!{}".format(
+        sheet_reference,
+        absolute_cell(ROW_LABEL_COLUMN, stats_rows["Median"]),
+    )
+    median_series.XValues = x_value_range
+    median_series.Values = worksheet.Range(
+        worksheet.Cells(stats_rows["Median"], FIRST_DATA_COLUMN),
+        worksheet.Cells(stats_rows["Median"], last_data_column),
+    )
+    median_series.Format.Line.Visible = MSO_FALSE
+    median_series.MarkerStyle = XL_MARKER_STYLE_DASH
+    median_series.MarkerSize = MEDIAN_LEGEND_MARKER_SIZE
+    median_series.MarkerForegroundColor = rgb(*COLOR_MEDIAN)
+    median_series.MarkerBackgroundColor = rgb(*COLOR_MEDIAN)
+    median_series.ErrorBar(
+        XL_X,
+        XL_ERROR_BAR_INCLUDE_BOTH,
+        XL_ERROR_BAR_TYPE_FIXED_VALUE,
+        box_half_width,
+    )
+    median_series.ErrorBars.EndStyle = XL_NO_CAP
+    median_series.ErrorBars.Format.Line.ForeColor.RGB = rgb(*COLOR_MEDIAN)
+    median_series.ErrorBars.Format.Line.Weight = MEDIAN_LINE_WEIGHT
+
+    average_series = chart.SeriesCollection().NewSeries()
+    average_series.ChartType = XL_XY_SCATTER_LINES
+    average_series.AxisGroup = XL_PRIMARY
+    average_series.Name = "={}!{}".format(
+        sheet_reference,
+        absolute_cell(ROW_LABEL_COLUMN, stats_rows["Average"]),
+    )
+    average_series.XValues = x_value_range
+    average_series.Values = worksheet.Range(
+        worksheet.Cells(stats_rows["Average"], FIRST_DATA_COLUMN),
+        worksheet.Cells(stats_rows["Average"], last_data_column),
+    )
+    average_series.MarkerStyle = XL_MARKER_STYLE_DIAMOND
+    average_series.MarkerSize = 7
+    average_series.MarkerForegroundColor = rgb(*COLOR_AVERAGE)
+    average_series.MarkerBackgroundColor = rgb(*COLOR_AVERAGE)
+    average_series.Format.Line.Visible = MSO_TRUE
+    average_series.Format.Line.ForeColor.RGB = rgb(*COLOR_AVERAGE)
+    average_series.Format.Line.DashStyle = MSO_LINE_DASH
+
+    for whisker_key in ("Lower Whisker", "Upper Whisker"):
+        whisker_cap_series = chart.SeriesCollection().NewSeries()
+        whisker_cap_series.ChartType = XL_XY_SCATTER
+        whisker_cap_series.AxisGroup = XL_PRIMARY
+        whisker_cap_series.Name = "={}!{}".format(
+            sheet_reference,
+            absolute_cell(ROW_LABEL_COLUMN, stats_rows[whisker_key]),
+        )
+        whisker_cap_series.XValues = x_value_range
+        whisker_cap_series.Values = worksheet.Range(
+            worksheet.Cells(stats_rows[whisker_key], FIRST_DATA_COLUMN),
+            worksheet.Cells(stats_rows[whisker_key], last_data_column),
+        )
+        whisker_cap_series.Format.Line.Visible = MSO_FALSE
+        whisker_cap_series.MarkerStyle = XL_MARKER_STYLE_NONE
+        whisker_cap_series.ErrorBar(
+            XL_X,
+            XL_ERROR_BAR_INCLUDE_BOTH,
+            XL_ERROR_BAR_TYPE_FIXED_VALUE,
+            box_half_width,
+        )
+        whisker_cap_series.ErrorBars.EndStyle = XL_NO_CAP
+        set_office_theme_color(
+            whisker_cap_series.ErrorBars.Format.Line.ForeColor,
+            WHISKER_TINT_AND_SHADE,
+            COLOR_WHISKER_FALLBACK,
+        )
+        whisker_cap_series.ErrorBars.Format.Line.Weight = WHISKER_CAP_LINE_WEIGHT
+
+    for extreme_key in ("Max", "Min"):
+        extreme_series = chart.SeriesCollection().NewSeries()
+        extreme_series.ChartType = XL_XY_SCATTER_LINES_NO_MARKERS
+        extreme_series.AxisGroup = XL_PRIMARY
+        extreme_series.Name = "={}!{}".format(
+            sheet_reference,
+            absolute_cell(ROW_LABEL_COLUMN, stats_rows[extreme_key]),
+        )
+        extreme_series.Values = worksheet.Range(
+            worksheet.Cells(stats_rows[extreme_key], FIRST_DATA_COLUMN),
+            worksheet.Cells(stats_rows[extreme_key], last_data_column),
+        )
+        extreme_series.MarkerStyle = XL_MARKER_STYLE_NONE
+        extreme_series.Format.Line.Visible = MSO_TRUE
+        set_office_theme_color(
+            extreme_series.Format.Line.ForeColor,
+            WHISKER_TINT_AND_SHADE,
+            COLOR_WHISKER_FALLBACK,
+        )
+        extreme_series.Format.Line.Weight = MAX_MIN_LINE_WEIGHT
+
+    category_axis = chart.Axes(XL_CATEGORY, XL_PRIMARY)
+    category_axis.HasTitle = True
+    category_axis.AxisTitle.Text = X_AXIS_TITLE_TEXT
+    category_axis.AxisTitle.Font.Size = AXIS_TITLE_FONT_SIZE
+    category_axis.TickLabels.Font.Size = AXIS_TICK_LABEL_FONT_SIZE
+    category_axis.TickLabelPosition = XL_TICK_LABEL_POSITION_LOW
+
+    value_axis = chart.Axes(XL_VALUE, XL_PRIMARY)
+    value_axis.HasTitle = True
+    value_axis.AxisTitle.Text = Y_AXIS_TITLE_TEXT
+    value_axis.AxisTitle.Font.Size = AXIS_TITLE_FONT_SIZE
+    value_axis.MinimumScaleIsAuto = True
+    value_axis.MaximumScaleIsAuto = True
+    value_axis.MajorUnitIsAuto = True
+    value_axis.HasMajorGridlines = False
+    value_axis.HasMinorGridlines = False
+    value_axis.TickLabels.Font.Size = AXIS_TICK_LABEL_FONT_SIZE
+    value_axis.TickLabels.NumberFormat = "0.00"
+
+    # 圖例保留 Median、Average、Max、Min，由後往前刪除其餘項目。
+    try:
+        for legend_index in (8, 7, 4, 3, 2, 1):
+            chart.Legend.LegendEntries(legend_index).Delete()
+    except Exception:
+        pass
+
+    return chart_object
+
+
+def build_nt_t_labels(pair_count):
+    """依配對組數建立 Baseline 與連號 Leg 的 NT/T 標籤。"""
+
+    pair_names = ("Baseline",) + tuple(
+        "Leg_{}".format(index) for index in range(1, pair_count)
+    )
+    return (
+        tuple("{}_NT".format(name) for name in pair_names),
+        tuple("{}_T".format(name) for name in pair_names),
+    )
+
+
+def build_positions(temperature_count, sample_count, nt_t_pair_count=None):
+    if nt_t_pair_count is None:
+        nt_t_pair_count = NT_T_PAIR_COUNT
+
+    data_end_row = DATA_START_ROW + sample_count - 1
+    summary_rows = {
+        key: data_end_row + offset
+        for offset, key in enumerate(SUMMARY_KEYS, start=1)
+    }
+    summary_end_row = summary_rows[SUMMARY_KEYS[-1]]
+    nt_labels, t_labels = build_nt_t_labels(nt_t_pair_count)
+    nt_start_row = summary_end_row + SUMMARY_TO_NT_GAP_ROWS + 1
+    nt_end_row = nt_start_row + len(nt_labels) - 1
+    t_start_row = nt_end_row + NT_TO_T_GAP_ROWS + 1
+    t_end_row = t_start_row + len(t_labels) - 1
+    nt_t_blocks = (
+        {
+            "name": "NT",
+            "labels": nt_labels,
+            "start_row": nt_start_row,
+            "end_row": nt_end_row,
+        },
+        {
+            "name": "T",
+            "labels": t_labels,
+            "start_row": t_start_row,
+            "end_row": t_end_row,
+        },
+    )
+    stats_header_row = t_end_row + STATS_TABLE_GAP_ROWS + 1
+    stats_keys = (
+        "StdDev",
+        "Max",
+        "Min",
+        "Average",
+        "Median",
+        "Q3",
+        "Q1",
+        "IQR",
+        "Lower Fence",
+        "Upper Fence",
+        "Lower Whisker",
+        "Upper Whisker",
+        "Count",
+        "Outliers",
+    )
+    stats_rows = {
+        key: stats_header_row + offset
+        for offset, key in enumerate(stats_keys, start=1)
+    }
+    return {
+        "last_data_column": FIRST_DATA_COLUMN + temperature_count - 1,
+        "data_end_row": data_end_row,
+        "summary_rows": summary_rows,
+        "nt_t_blocks": nt_t_blocks,
+        "stats_header_row": stats_header_row,
+        "stats_rows": stats_rows,
+        "stats_end_row": stats_rows["Outliers"],
+    }
+
+
+def validate_counts(temperature_count, sample_count, nt_t_pair_count=None):
+    if nt_t_pair_count is None:
+        nt_t_pair_count = NT_T_PAIR_COUNT
+
+    if isinstance(temperature_count, bool) or not isinstance(temperature_count, int):
+        raise ValueError("TEMPERATURE_COUNT 必須是整數。")
+    if isinstance(sample_count, bool) or not isinstance(sample_count, int):
+        raise ValueError("SAMPLE_COUNT 必須是整數。")
+    if isinstance(nt_t_pair_count, bool) or not isinstance(nt_t_pair_count, int):
+        raise ValueError("NT_T_PAIR_COUNT 必須是整數。")
+    if nt_t_pair_count < MIN_NT_T_PAIR_COUNT:
+        raise ValueError(
+            "NT/T 配對組數不得小於 {}。".format(MIN_NT_T_PAIR_COUNT)
+        )
+
+    max_temperature_count = EXCEL_MAX_COLUMNS - FIRST_DATA_COLUMN + 1
+    stats_row_overhead = (
+        build_positions(1, 1, nt_t_pair_count)["stats_end_row"] - 1
+    )
+    max_sample_count = EXCEL_MAX_ROWS - stats_row_overhead
+
+    if not MIN_TEMPERATURE_COUNT <= temperature_count <= max_temperature_count:
+        raise ValueError(
+            "溫度數量必須介於 {} 到 {}。".format(
+                MIN_TEMPERATURE_COUNT, max_temperature_count
+            )
+        )
+    if max_sample_count < MIN_SAMPLE_COUNT:
+        raise ValueError("NT_T_PAIR_COUNT 太大，已超出 Excel 列數上限。")
+    if not MIN_SAMPLE_COUNT <= sample_count <= max_sample_count:
+        raise ValueError(
+            "樣本數量必須介於 {} 到 {}。".format(
+                MIN_SAMPLE_COUNT, max_sample_count
+            )
+        )
+
+
+def create_box_whisker_workbook(
+    output_path,
+    temperature_count,
+    sample_count,
+    overwrite=False,
+    nt_t_pair_count=None,
+):
+    """從空白活頁簿建立盒鬚圖範本並回傳輸入範圍字串。"""
+
+    if nt_t_pair_count is None:
+        nt_t_pair_count = NT_T_PAIR_COUNT
+    validate_counts(temperature_count, sample_count, nt_t_pair_count)
+    output_path = Path(output_path).resolve()
+    if output_path.suffix.lower() != ".xlsx":
+        raise ValueError("輸出檔案必須使用 .xlsx 副檔名。")
+    if not output_path.parent.is_dir():
+        raise ValueError("輸出資料夾不存在：{}".format(output_path.parent))
+    if output_path.exists() and not overwrite:
+        raise FileExistsError("檔案已存在：{}".format(output_path))
+
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError as exc:
+        raise RuntimeError(
+            "指定的 Python 缺少 pywin32，無法控制 Excel：{}".format(exc)
+        )
+
+    positions = build_positions(
+        temperature_count, sample_count, nt_t_pair_count
+    )
+    last_data_column = positions["last_data_column"]
+    input_range_address = "{}{}:{}{}".format(
+        excel_column_name(FIRST_DATA_COLUMN),
+        DATA_START_ROW,
+        excel_column_name(last_data_column),
+        positions["data_end_row"],
+    )
+    temporary_path = output_path.with_name(
+        ".{}.{}.tmp.xlsx".format(output_path.stem, uuid.uuid4().hex)
+    )
+
+    excel = None
+    workbook = None
+    pythoncom.CoInitialize()
+    try:
+        excel = win32com.client.DispatchEx("Excel.Application")
+        excel.Visible = False
+        excel.DisplayAlerts = False
+        excel.ScreenUpdating = False
+        excel.EnableEvents = False
+
+        workbook = excel.Workbooks.Add()
+        excel.Calculation = XL_CALCULATION_AUTOMATIC
+        while workbook.Worksheets.Count > 1:
+            workbook.Worksheets(workbook.Worksheets.Count).Delete()
+
+        worksheet = workbook.Worksheets(1)
+        worksheet.Name = SHEET_NAME
+        write_layout(worksheet, temperature_count, sample_count, positions)
+        format_worksheet(worksheet, temperature_count, positions)
+        add_box_whisker_chart(worksheet, temperature_count, positions)
+
+        worksheet.Activate()
+        excel.ActiveWindow.SplitRow = TEMPERATURE_ROW
+        excel.ActiveWindow.SplitColumn = ROW_LABEL_COLUMN
+        excel.ActiveWindow.FreezePanes = True
+        excel.ActiveWindow.DisplayGridlines = False
+
+        worksheet.Range(input_range_address).Select()
+        excel.CalculateFullRebuild()
+        workbook.SaveAs(str(temporary_path), FileFormat=XL_OPEN_XML_WORKBOOK)
+        workbook.Close(SaveChanges=False)
+        workbook = None
+        excel.Quit()
+        excel = None
+
+        os.replace(str(temporary_path), str(output_path))
+    finally:
+        if workbook is not None:
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+        pythoncom.CoUninitialize()
+        if temporary_path.exists():
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
+
+    return input_range_address
+
+
+def next_available_output_path():
+    """在腳本旁建立不覆寫既有檔案的輸出路徑。"""
+
+    prefix = str(OUTPUT_FILE_PREFIX).strip().rstrip(". ")
+    if not prefix:
+        raise ValueError("OUTPUT_FILE_PREFIX 不可為空白。")
+    invalid_characters = '<>:"/\\|?*'
+    if any(character in prefix for character in invalid_characters):
+        raise ValueError("OUTPUT_FILE_PREFIX 含有 Windows 檔名不允許的字元。")
+
+    base_stem = "{}_{}T_{}S".format(prefix, TEMPERATURE_COUNT, SAMPLE_COUNT)
+    output_path = SCRIPT_PATH.parent / "{}.xlsx".format(base_stem)
+    if not output_path.exists():
+        return output_path
+
+    sequence = 1
+    while True:
+        output_path = SCRIPT_PATH.parent / "{}_{:03d}.xlsx".format(
+            base_stem, sequence
+        )
+        if not output_path.exists():
+            return output_path
+        sequence += 1
+
+
+def generate_from_settings():
+    """依腳本頂端設定直接建立範本，不顯示設定視窗。"""
+
+    validate_counts(TEMPERATURE_COUNT, SAMPLE_COUNT, NT_T_PAIR_COUNT)
+    output_path = next_available_output_path()
+    input_range = create_box_whisker_workbook(
+        output_path,
+        TEMPERATURE_COUNT,
+        SAMPLE_COUNT,
+        overwrite=False,
+        nt_t_pair_count=NT_T_PAIR_COUNT,
+    )
+
+    if OPEN_OUTPUT_AFTER_CREATE:
+        try:
+            os.startfile(str(output_path))
+        except OSError as exc:
+            _show_native_error(
+                "範本已建立，但無法自動開啟",
+                "檔案位置：{}\n\n{}".format(output_path, exc),
+            )
+
+    return output_path, input_range
+
+
+def main():
+    relaunch_with_configured_pythonw()
+    try:
+        generate_from_settings()
+    except Exception as exc:
+        _show_native_error(
+            "盒鬚圖範本建立失敗",
+            "請檢查腳本頂端設定與 Excel 狀態。\n\n{}".format(exc),
+        )
+
+
+if __name__ == "__main__":
+    main()
