@@ -10,10 +10,10 @@ import uuid
 
 # ========================= 使用者設定 =========================
 # 只需要修改這一區；雙擊腳本後會直接建立 Excel 範本。
-TEMPERATURE_COUNT = 7
-SAMPLE_COUNT = 12
+TEMPERATURE_COUNT = 12
+SAMPLE_COUNT = 10
 # NT/T 配對組數：1 = Baseline；4 = Baseline + Leg_1～Leg_3。
-NT_T_PAIR_COUNT = 4
+NT_T_PAIR_COUNT = 1
 OUTPUT_FILE_PREFIX = "TSM_Warpage_Box_Plot"
 OPEN_OUTPUT_AFTER_CREATE = False  # 改成 True 才會在建立後自動開啟 Excel
 AXIS_TICK_LABEL_FONT_SIZE = 12
@@ -21,7 +21,7 @@ LEGEND_FONT_SIZE = 12
 
 # 換到其他電腦時，只需修改這個命名常數。
 PYTHONW_EXE = Path(
-    r"C:\Users\\python3.8\win64\pythonw.exe"
+    r"C:\Users\python3.8\win64\pythonw.exe"
 )
 # ==============================================================
 
@@ -40,8 +40,20 @@ ROW_LABEL_COLUMN = 2
 FIRST_DATA_COLUMN = 3
 SUMMARY_KEYS = ("StdDev", "Max", "Min", "Average")
 SUMMARY_TO_NT_GAP_ROWS = 1
-NT_TO_T_GAP_ROWS = 1
+NT_TO_TARGET_GAP_ROWS = 1
+TARGET_LABEL = "Target"
 STATS_TABLE_GAP_ROWS = 1
+CAL_TARGET_TABLE_GAP_ROWS = 1
+CAL_TARGET_STRICT_LEVEL_COUNT = 5
+CAL_TARGET_CONSERVATIVE_KEY = "Cal Target (Cons.)"
+CAL_TARGET_KEYS = (CAL_TARGET_CONSERVATIVE_KEY,) + tuple(
+    "Cal Target (Str.{})".format(level)
+    for level in range(1, CAL_TARGET_STRICT_LEVEL_COUNT + 1)
+)
+CAL_TARGET_DESCRIPTIONS = ("校正目標（保守）",) + tuple(
+    "校正目標（嚴謹{}）".format(level)
+    for level in range(1, CAL_TARGET_STRICT_LEVEL_COUNT + 1)
+)
 CHART_COLUMN_GAP = 2
 
 # Excel 工作表本身的容量限制
@@ -222,8 +234,10 @@ def write_layout(worksheet, temperature_count, sample_count, positions):
     data_end_row = positions["data_end_row"]
     summary_rows = positions["summary_rows"]
     nt_t_blocks = positions["nt_t_blocks"]
+    target_row = positions["target_row"]
     stats_header_row = positions["stats_header_row"]
     stats_rows = positions["stats_rows"]
+    cal_target_rows = positions["cal_target_rows"]
 
     worksheet.Cells(TITLE_ROW, ROW_LABEL_COLUMN).Value = "TSM Data"
     worksheet.Cells(GROUP_INDEX_ROW, ROW_LABEL_COLUMN).Value = "數量"
@@ -261,6 +275,8 @@ def write_layout(worksheet, temperature_count, sample_count, positions):
             worksheet.Cells(block["end_row"], ROW_LABEL_COLUMN),
         ).Value = tuple((label,) for label in block["labels"])
 
+    worksheet.Cells(target_row, ROW_LABEL_COLUMN).Value = TARGET_LABEL
+
     stats_definitions = (
         ("標準差", "StdDev"),
         ("最大值", "Max"),
@@ -284,6 +300,15 @@ def write_layout(worksheet, temperature_count, sample_count, positions):
         worksheet.Cells(stats_header_row + 1, DESCRIPTION_COLUMN),
         worksheet.Cells(stats_header_row + len(stats_definitions), ROW_LABEL_COLUMN),
     ).Value = tuple(stats_definitions)
+
+    worksheet.Range(
+        worksheet.Cells(
+            cal_target_rows[CAL_TARGET_KEYS[0]], DESCRIPTION_COLUMN
+        ),
+        worksheet.Cells(
+            cal_target_rows[CAL_TARGET_KEYS[-1]], ROW_LABEL_COLUMN
+        ),
+    ).Value = tuple(zip(CAL_TARGET_DESCRIPTIONS, CAL_TARGET_KEYS))
 
     for data_column in range(FIRST_DATA_COLUMN, last_data_column + 1):
         data_range = absolute_range(data_column, DATA_START_ROW, data_end_row)
@@ -332,6 +357,42 @@ def write_layout(worksheet, temperature_count, sample_count, positions):
                 absolute_cell(data_column, stats_rows[key])
             )
 
+        average_ref = absolute_cell(data_column, stats_rows["Average"])
+        absolute_average = "SUMPRODUCT(ABS({0}))/COUNT({0})".format(
+            data_range
+        )
+        worksheet.Cells(target_row, data_column).Formula = (
+            "=IF(COUNT({0})=0,NA(),"
+            "IF({1}>0,{2},IF({1}<0,-({2}),0)))"
+        ).format(data_range, average_ref, absolute_average)
+
+        lower_whisker_ref = absolute_cell(
+            data_column, stats_rows["Lower Whisker"]
+        )
+        upper_whisker_ref = absolute_cell(
+            data_column, stats_rows["Upper Whisker"]
+        )
+        worksheet.Cells(
+            cal_target_rows[CAL_TARGET_CONSERVATIVE_KEY], data_column
+        ).Formula = (
+            "=IF({0}>0,ABS({0}),IF({0}<0,-ABS({0}),0))".format(
+                average_ref
+            )
+        )
+
+        for level in range(1, CAL_TARGET_STRICT_LEVEL_COUNT + 1):
+            key = "Cal Target (Str.{})".format(level)
+            worksheet.Cells(cal_target_rows[key], data_column).Formula = (
+                "=IF({0}>0,{0}+({1}-{0})*{2}/{3},"
+                "IF({0}<0,{0}+({4}-{0})*{2}/{3},0))"
+            ).format(
+                average_ref,
+                upper_whisker_ref,
+                level,
+                CAL_TARGET_STRICT_LEVEL_COUNT,
+                lower_whisker_ref,
+            )
+
 
 def format_worksheet(worksheet, temperature_count, positions):
     """套用版面與清楚區分可輸入儲存格。"""
@@ -340,13 +401,17 @@ def format_worksheet(worksheet, temperature_count, positions):
     data_end_row = positions["data_end_row"]
     summary_rows = positions["summary_rows"]
     nt_t_blocks = positions["nt_t_blocks"]
+    target_row = positions["target_row"]
     stats_header_row = positions["stats_header_row"]
     stats_end_row = positions["stats_end_row"]
     stats_rows = positions["stats_rows"]
+    cal_target_rows = positions["cal_target_rows"]
+    cal_target_end_row = positions["cal_target_end_row"]
+    layout_end_row = positions["layout_end_row"]
 
     used_range = worksheet.Range(
         worksheet.Cells(TITLE_ROW, DESCRIPTION_COLUMN),
-        worksheet.Cells(stats_end_row, last_data_column),
+        worksheet.Cells(layout_end_row, last_data_column),
     )
     used_range.Font.Name = DEFAULT_FONT_NAME
     used_range.Font.Size = BODY_FONT_SIZE
@@ -427,6 +492,24 @@ def format_worksheet(worksheet, temperature_count, positions):
         )
         set_range_border(block_full_range)
 
+    target_label_cell = worksheet.Cells(target_row, ROW_LABEL_COLUMN)
+    target_label_cell.Interior.Color = rgb(*COLOR_STATS_LABEL)
+    target_label_cell.Font.Bold = True
+    target_label_cell.HorizontalAlignment = XL_CENTER
+
+    target_value_range = worksheet.Range(
+        worksheet.Cells(target_row, FIRST_DATA_COLUMN),
+        worksheet.Cells(target_row, last_data_column),
+    )
+    target_value_range.NumberFormat = "0.00"
+    target_value_range.HorizontalAlignment = XL_CENTER
+
+    target_full_range = worksheet.Range(
+        worksheet.Cells(target_row, ROW_LABEL_COLUMN),
+        worksheet.Cells(target_row, last_data_column),
+    )
+    set_range_border(target_full_range)
+
     stats_header_range = worksheet.Range(
         worksheet.Cells(stats_header_row, DESCRIPTION_COLUMN),
         worksheet.Cells(stats_header_row, last_data_column),
@@ -457,6 +540,33 @@ def format_worksheet(worksheet, temperature_count, positions):
         worksheet.Cells(stats_rows["Outliers"], last_data_column),
     ).NumberFormat = "0"
 
+    cal_target_label_range = worksheet.Range(
+        worksheet.Cells(
+            cal_target_rows[CAL_TARGET_KEYS[0]], DESCRIPTION_COLUMN
+        ),
+        worksheet.Cells(cal_target_end_row, ROW_LABEL_COLUMN),
+    )
+    cal_target_label_range.Interior.Color = rgb(*COLOR_STATS_LABEL)
+    cal_target_label_range.Font.Bold = True
+    cal_target_label_range.HorizontalAlignment = XL_CENTER
+
+    cal_target_value_range = worksheet.Range(
+        worksheet.Cells(
+            cal_target_rows[CAL_TARGET_KEYS[0]], FIRST_DATA_COLUMN
+        ),
+        worksheet.Cells(cal_target_end_row, last_data_column),
+    )
+    cal_target_value_range.NumberFormat = "0.00"
+    cal_target_value_range.HorizontalAlignment = XL_CENTER
+
+    cal_target_full_range = worksheet.Range(
+        worksheet.Cells(
+            cal_target_rows[CAL_TARGET_KEYS[0]], DESCRIPTION_COLUMN
+        ),
+        worksheet.Cells(cal_target_end_row, last_data_column),
+    )
+    set_range_border(cal_target_full_range)
+
     worksheet.Columns(DESCRIPTION_COLUMN).ColumnWidth = DESCRIPTION_COLUMN_WIDTH
     worksheet.Columns(ROW_LABEL_COLUMN).ColumnWidth = ROW_LABEL_COLUMN_WIDTH
     worksheet.Range(
@@ -466,7 +576,7 @@ def format_worksheet(worksheet, temperature_count, positions):
 
     worksheet.Range(
         worksheet.Cells(TITLE_ROW, DESCRIPTION_COLUMN),
-        worksheet.Cells(stats_end_row, last_data_column),
+        worksheet.Cells(layout_end_row, last_data_column),
     ).Rows.AutoFit()
 
 
@@ -718,7 +828,8 @@ def build_positions(temperature_count, sample_count, nt_t_pair_count=None):
     nt_labels, t_labels = build_nt_t_labels(nt_t_pair_count)
     nt_start_row = summary_end_row + SUMMARY_TO_NT_GAP_ROWS + 1
     nt_end_row = nt_start_row + len(nt_labels) - 1
-    t_start_row = nt_end_row + NT_TO_T_GAP_ROWS + 1
+    target_row = nt_end_row + NT_TO_TARGET_GAP_ROWS + 1
+    t_start_row = target_row + 1
     t_end_row = t_start_row + len(t_labels) - 1
     nt_t_blocks = (
         {
@@ -755,14 +866,25 @@ def build_positions(temperature_count, sample_count, nt_t_pair_count=None):
         key: stats_header_row + offset
         for offset, key in enumerate(stats_keys, start=1)
     }
+    stats_end_row = stats_rows["Outliers"]
+    cal_target_start_row = stats_end_row + CAL_TARGET_TABLE_GAP_ROWS + 1
+    cal_target_rows = {
+        key: cal_target_start_row + offset
+        for offset, key in enumerate(CAL_TARGET_KEYS)
+    }
+    cal_target_end_row = cal_target_rows[CAL_TARGET_KEYS[-1]]
     return {
         "last_data_column": FIRST_DATA_COLUMN + temperature_count - 1,
         "data_end_row": data_end_row,
         "summary_rows": summary_rows,
         "nt_t_blocks": nt_t_blocks,
+        "target_row": target_row,
         "stats_header_row": stats_header_row,
         "stats_rows": stats_rows,
-        "stats_end_row": stats_rows["Outliers"],
+        "stats_end_row": stats_end_row,
+        "cal_target_rows": cal_target_rows,
+        "cal_target_end_row": cal_target_end_row,
+        "layout_end_row": cal_target_end_row,
     }
 
 
@@ -782,10 +904,10 @@ def validate_counts(temperature_count, sample_count, nt_t_pair_count=None):
         )
 
     max_temperature_count = EXCEL_MAX_COLUMNS - FIRST_DATA_COLUMN + 1
-    stats_row_overhead = (
-        build_positions(1, 1, nt_t_pair_count)["stats_end_row"] - 1
+    layout_row_overhead = (
+        build_positions(1, 1, nt_t_pair_count)["layout_end_row"] - 1
     )
-    max_sample_count = EXCEL_MAX_ROWS - stats_row_overhead
+    max_sample_count = EXCEL_MAX_ROWS - layout_row_overhead
 
     if not MIN_TEMPERATURE_COUNT <= temperature_count <= max_temperature_count:
         raise ValueError(
