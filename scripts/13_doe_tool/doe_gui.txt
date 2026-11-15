@@ -78,6 +78,12 @@ VALUE_TYPE_STRING = "string"
 
 MODE_RANGE = "Range"
 MODE_MANUAL = "Manual"
+# 「變數設定表」Manual Values 後面新增的「複製份數」欄位：不展開排列組合，
+# 只是把 Nominal 值原樣複製成使用者指定的份數，當這個變數的水準清單（水準
+# 全部相同），方便使用者先開出幾個空格、之後直接在組合對照表逐一填入實際
+# 數值。跟 Range/Manual 一樣，是點進哪組欄位就自動切換的其中一種模式
+# （見 VariableRowState._switch_mode），resolve_variable_levels 依此分派。
+MODE_DUPLICATE = "Duplicate"
 
 RANGE_FLOAT_TOLERANCE = 1e-9
 COMBINATION_COUNT_WARNING_THRESHOLD = 200
@@ -329,13 +335,16 @@ def parse_bound_text(text: str, field_label: str, varname: str) -> float:
 
 
 def variable_has_blank_level_input(config: "VariableConfig") -> bool:
-    """判斷這個變數目前是否還沒有填入任何 Range/Manual 的水準輸入。
+    """判斷這個變數目前是否還沒有填入任何 Range/Manual/複製份數 的水準輸入。
 
-    字串類型與 Manual 模式只看 Manual Values 是否空白；Range 模式要三個欄位
-    （Lower/Upper/Spacing）都填了才算非空白，缺任何一個都視為「還沒填」。
-    用於「預覽組合數」判斷哪些變數要先用 Nominal 墊檔（見 resolve_variable_
-    levels 的 allow_blank），以及預覽後提醒使用者哪些變數還沒真正填值。
+    Duplicate 模式只看「複製份數」欄位是否空白；字串類型與 Manual 模式只看
+    Manual Values 是否空白；Range 模式要三個欄位（Lower/Upper/Spacing）都
+    填了才算非空白，缺任何一個都視為「還沒填」。用於「預覽組合數」判斷哪些
+    變數要先用 Nominal 墊檔（見 resolve_variable_levels 的 allow_blank），
+    以及預覽後提醒使用者哪些變數還沒真正填值。
     """
+    if config.mode == MODE_DUPLICATE:
+        return not config.duplicate_count_text.strip()
     if config.value_type == VALUE_TYPE_STRING or config.mode == MODE_MANUAL:
         return not config.manual_values_text.strip()
     return not (
@@ -396,7 +405,13 @@ def resolve_variable_levels(
     nominal_text: str = "",
     allow_blank: bool = False,
 ) -> list[float] | list[str]:
-    """依模式（Range / Manual）解析出該變數的水準清單。
+    """依模式（Range / Manual）解析出該變數的水準清單，供全因子交叉使用。
+
+    mode == MODE_DUPLICATE 的變數不會呼叫到這裡——「複製份數」模式彼此是用
+    「相加」而不是交叉全因子（例如 varA 複製 2 份、varB 複製 3 份，總共是
+    2+3=5 列，不是 2*3=6 列），由 build_full_factorial_combinations 另外
+    呼叫 _resolve_duplicate_mode_value_and_count 處理，不走這裡也不走
+    pyDOE2.fullfact。
 
     value_type == "string" 時只能用 Manual 模式（字串沒有「上下限+間距」這種
     數值概念），用 Range 會 fail loud 並提示改用 Manual Values。
@@ -442,16 +457,23 @@ class VariableConfig:
         （start_offset, end_offset, original_text）來定位替換範圍，
         不依賴變數名稱語法，可以標記 MP 指令欄位、運算式裡的數字等。
 
-    value_type == "numeric"（預設）：水準是數字，支援 Range / Manual。
-    value_type == "string"：水準是文字候選清單（如材料名稱），只能 Manual，
-        目前只有點擊標記（kind == "position"）會產生字串類型的列。
+    value_type == "numeric"（預設）：水準是數字，支援 Range / Manual / Duplicate。
+    value_type == "string"：水準是文字候選清單（如材料名稱），只能 Manual 或
+        Duplicate，目前只有點擊標記（kind == "position"）會產生字串類型的列。
 
     decimal_places：輸出數字時要保留的小數位數（見 count_decimal_places /
         format_value），由 VariableRowState.to_config() 依使用者實際輸入的
         數字文字算出，避免浮點運算誤差尾數被完整印出。
 
     nominal_text：Nominal 欄位目前顯示的文字，供 resolve_variable_levels 在
-        allow_blank=True（預覽組合數）時，對還沒填 Range/Manual 的變數墊檔用。
+        allow_blank=True（預覽組合數）時，對還沒填 Range/Manual 的變數墊檔用；
+        mode == MODE_DUPLICATE 時也是實際拿來複製的水準值來源（見
+        _resolve_duplicate_mode_value_and_count）。
+
+    duplicate_count_text：「複製份數」欄位目前顯示的文字，只有 mode ==
+        MODE_DUPLICATE 時才會被 _resolve_duplicate_mode_value_and_count 讀取
+        （build_full_factorial_combinations 呼叫，不經過 resolve_variable_
+        levels／pyDOE2.fullfact 的交叉邏輯）。
     """
 
     label: str
@@ -468,6 +490,7 @@ class VariableConfig:
     value_type: str = VALUE_TYPE_NUMERIC
     decimal_places: int = 0
     nominal_text: str = ""
+    duplicate_count_text: str = ""
 
     @property
     def display_name(self) -> str:
@@ -509,26 +532,91 @@ def collect_active_variable_configs(
     return active_configs
 
 
+def _resolve_duplicate_mode_value_and_count(
+    config: "VariableConfig", allow_blank: bool
+) -> tuple[float | str, int]:
+    """解析「複製份數」（mode == MODE_DUPLICATE）變數的 (水準值, 份數)：水準值
+    固定是目前的 Nominal，份數來自「複製份數」欄位。
+
+    缺份數時：allow_blank=True（預覽組合數）墊檔成 1 份，跟其他模式的
+    allow_blank 行為一致；allow_blank=False（正式產生）fail loud。Nominal
+    本身空白或不是合法數字（數值類型）一律 fail loud、不受 allow_blank
+    影響——沒有合法 Nominal 就沒有東西可複製，不是「漏填份數」那種可以墊檔
+    的情境。
+    """
+    if not config.duplicate_count_text.strip():
+        if allow_blank:
+            count = 1
+        else:
+            raise ValueError(
+                f"變數「{config.display_name}」的「複製份數」欄位是空的，請輸入要複製的份數"
+            )
+    else:
+        count = resolve_duplicate_count(config.duplicate_count_text)
+
+    if config.value_type == VALUE_TYPE_STRING:
+        if not config.nominal_text.strip():
+            raise ValueError(
+                f"變數「{config.display_name}」沒有 Nominal 值，"
+                "無法用「複製份數」建立水準，請先填入 Nominal"
+            )
+        return config.nominal_text, count
+
+    try:
+        nominal_value = float(config.nominal_text)
+    except ValueError:
+        raise ValueError(
+            f"變數「{config.display_name}」的 Nominal「{config.nominal_text}」"
+            "不是合法數字，無法用「複製份數」建立水準"
+        )
+    return nominal_value, count
+
+
 def build_full_factorial_combinations(
     active_configs: list[VariableConfig],
     allow_blank: bool = False,
 ) -> list[list]:
-    """用全因子組合（pyDOE2.fullfact）展開所有 Active 變數的水準組合。
+    """展開所有 Active 變數的組合。
 
-    每個變數先各自解析出水準清單（數字或字串，依 value_type），再用
-    pyDOE2.fullfact 對「水準數量」取得索引矩陣——fullfact 只處理水準數量的
-    索引、不管水準本身是什麼型別，所以數字跟字串變數可以混在同一次組合裡。
-    最後把索引映射回每個變數自己的實際水準值。回傳
-    [[各變數在這組合裡的值, ...], ...]，每筆長度與順序對應 active_configs。
-    組合總數超過 COMBINATION_COUNT_HARD_LIMIT 時，在呼叫 fullfact 之前就
-    丟出 ValueError（避免配置超大陣列）。
+    Range／Manual 模式的變數彼此照常用全因子交叉（pyDOE2.fullfact：水準數量
+    相乘）。mode == MODE_DUPLICATE（「複製份數」）的變數則彼此用「相加」而
+    不是交叉：每個 Duplicate 變數各自開出 duplicate_count 份「空格」，加總成
+    一個共用的重複區塊——區塊內每一列、每個 Duplicate 變數都顯示自己的
+    Nominal（因為還沒有人決定要在哪一列填哪個值，純粹是先開出一共這麼多空格
+    方便之後在組合對照表手動編輯）。例如 varA 複製 2 份、varB 複製 3 份：
+    總共是 2+3=5 列，不是 2*3=6 列。
 
-    allow_blank 原樣轉給 resolve_variable_levels：「預覽組合數」傳 True，
-    讓還沒填 Range/Manual 的變數先用 Nominal 墊檔；「產生所有資料夾與
-    input file」維持預設 False，缺漏一律 fail loud。
+    若同時存在 Range/Manual 變數與 Duplicate 變數，Duplicate 區塊會被視為
+    一個整體因子，跟 Range/Manual 的全因子結果交叉（總列數 = 因子組合數
+    * Duplicate 區塊份數）；只有其中一種時，行為就是各自單獨的展開方式。
+
+    回傳 [[各變數在這組合裡的值, ...], ...]，每筆長度與順序對應 active_configs。
+    組合總數超過 COMBINATION_COUNT_HARD_LIMIT 時，在實際展開之前就丟出
+    ValueError（避免配置超大陣列）。
+
+    allow_blank 原樣轉給 resolve_variable_levels／_resolve_duplicate_mode_
+    value_and_count：「預覽組合數」傳 True，讓還沒填的變數先用 Nominal／1 份
+    墊檔；「產生所有資料夾與 input file」維持預設 False，缺漏一律 fail loud。
     """
     from pyDOE2 import fullfact
 
+    duplicate_positions = [
+        index for index, config in enumerate(active_configs) if config.mode == MODE_DUPLICATE
+    ]
+    factorial_positions = [
+        index for index, config in enumerate(active_configs) if config.mode != MODE_DUPLICATE
+    ]
+
+    duplicate_value_by_position: dict[int, float | str] = {}
+    duplicate_block_size = 0
+    for position in duplicate_positions:
+        value, count = _resolve_duplicate_mode_value_and_count(
+            active_configs[position], allow_blank
+        )
+        duplicate_value_by_position[position] = value
+        duplicate_block_size += count
+
+    factorial_configs = [active_configs[position] for position in factorial_positions]
     levels_by_var: list[list] = [
         resolve_variable_levels(
             config.display_name,
@@ -541,28 +629,43 @@ def build_full_factorial_combinations(
             nominal_text=config.nominal_text,
             allow_blank=allow_blank,
         )
-        for config in active_configs
+        for config in factorial_configs
     ]
     level_counts = [len(levels) for levels in levels_by_var]
 
-    total_combinations = 1
+    factorial_combination_count = 1
     for count in level_counts:
-        total_combinations *= count
+        factorial_combination_count *= count
+
+    total_combinations = factorial_combination_count * max(duplicate_block_size, 1)
     if total_combinations > COMBINATION_COUNT_HARD_LIMIT:
         raise ValueError(
             f"組合總數 {total_combinations} 超過上限 {COMBINATION_COUNT_HARD_LIMIT}，"
             "請減少變數數量或水準數量"
         )
 
-    coded_indices = fullfact(level_counts)
+    factorial_combinations: list[list] = []
+    if factorial_positions:
+        coded_indices = fullfact(level_counts)
+        for row in coded_indices:
+            combo = [
+                levels_by_var[var_idx][int(round(row[var_idx]))]
+                for var_idx in range(len(factorial_positions))
+            ]
+            factorial_combinations.append(combo)
+    else:
+        factorial_combinations = [[]]  # 沒有 Range/Manual 變數：視為一個空的因子組合
 
+    repeat_count = duplicate_block_size if duplicate_positions else 1
     combinations: list[list] = []
-    for row in coded_indices:
-        combo = [
-            levels_by_var[var_idx][int(round(row[var_idx]))]
-            for var_idx in range(len(active_configs))
-        ]
-        combinations.append(combo)
+    for factorial_combo in factorial_combinations:
+        for _ in range(repeat_count):
+            combo: list = [None] * len(active_configs)
+            for position, value in duplicate_value_by_position.items():
+                combo[position] = value
+            for factorial_position, value in zip(factorial_positions, factorial_combo):
+                combo[factorial_position] = value
+            combinations.append(combo)
     return combinations
 
 
@@ -604,6 +707,22 @@ def validate_combination_table_folder_names(folder_names: list[str]) -> list[str
             reported_duplicates.add(name)
             errors.append(f"有多列使用同一個資料夾名稱「{name}」，請確認名稱都不重複")
     return errors
+
+
+def resolve_duplicate_count(raw_text: str) -> int:
+    """解析「變數設定表」裡某個變數「複製份數」欄位的文字（由 resolve_variable_
+    levels 在 mode == MODE_DUPLICATE 時呼叫）：留白視為 1，非正整數 fail loud。
+    """
+    text = raw_text.strip()
+    if not text:
+        return 1
+    try:
+        value = int(text)
+    except ValueError:
+        raise ValueError(f"份數「{text}」不是合法整數")
+    if value < 1:
+        raise ValueError(f"份數「{text}」必須至少是 1")
+    return value
 
 
 # ── 變數替換範圍解析（統一處理 named 與 position 兩種標記方式）──────────────
@@ -1048,6 +1167,22 @@ def write_combinations_summary(path: Path, header: list[str], rows: list[list[st
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_clipboard_grid(text: str) -> list[list[str]]:
+    """把從 Excel 複製來的多儲存格內容（Tab 分欄、換行分列）解析成二維字串
+    陣列，供組合對照表「從剪貼簿貼上」使用。
+
+    先把 \\r\\n／\\r 統一成 \\n 再切割；結尾多餘的空白列（Excel 複製時常見
+    帶一個尾端換行）會被忽略。內容原樣保留文字，不做任何數值轉換或驗證，
+    轉型留給貼上目的地（CombinationRowState 的 StringVar）之後的下游解析，
+    跟使用者手動在 Entry 打字走同一套驗證路徑。
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = normalized.split("\n")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return [line.split("\t") for line in lines]
+
+
 # ── APDL 語法上色（規則內嵌自 apdl syntax.xml，不再於執行期讀取該檔案）─────────
 SYNTAX_KEYWORD_STYLE_NAMES = [f"KEYWORDS{i}" for i in range(1, 9)]
 SYNTAX_LINE_COMMENT_STYLE = "LINE COMMENTS"
@@ -1325,6 +1460,173 @@ def backup_original_file_once(path: Path) -> Path | None:
     return backup_path
 
 
+# ── 後處理：批次擷取 DOE 求解結果數值 ──────────────────────────────────────────
+def _parses_as_float(token: str) -> bool:
+    try:
+        float(token)
+        return True
+    except ValueError:
+        return False
+
+
+def is_numeric_data_line(line: str) -> bool:
+    """一行是不是「純數值資料行」：用空白切開後，每個 token 都能解析成
+    float，且至少有一個 token（空字串/空白行回傳 False，不算數值行，也
+    不算標籤行，交給呼叫端自行決定要跳過還是視為邊界）。
+
+    支援一行一個數字（例如 `4_Warpage_data.txt` 每行單一翹曲量數值）或
+    一行多個數字（例如 `result.txt` 的 `Strip_max`/`Strip_min`/... 數值列，
+    一行三個以空白分隔的數值）兩種格式；標籤行就算裡面混了數字也不會誤判
+    （例如 `Strip_max-Strip_min` 這種帶連字號的 token 本來就解析不成 float，
+    只要同一行有任何一個 token 不是數字，整行就判定為標籤行）。
+    """
+    tokens = line.split()
+    if not tokens:
+        return False
+    return all(_parses_as_float(token) for token in tokens)
+
+
+def find_preceding_label_line(lines: list[str], clicked_line_index: int) -> tuple[str, int]:
+    """從 clicked_line_index（0-based）往上找，回傳 (anchor_label, offset)：
+    anchor_label 是往上第一個「不是空白、也不是純數值資料行」（見
+    is_numeric_data_line）的行文字（去頭尾空白），offset 是 clicked_line_index
+    距離該行的行數差（含中間跳過的空白行/數值行，批次擷取時用同一套規則
+    重新定位才會對得上）；從檔案開頭都找不到這種行時，anchor_label 回傳
+    空字串、offset 直接是 clicked_line_index（代表從檔案開頭算起）。
+
+    用於「後處理」分頁 Ctrl+點擊範例檔案數字時，自動偵測這個數字所屬的區塊
+    標籤（例如 `JFFSW (um)` 標籤後面接好幾筆翹曲量數值），之後批次擷取時
+    靠這個標籤文字重新定位，不依賴固定行號——同一支 APDL 巨集在不同 DOE run
+    資料夾裡重新求解出來的結果檔，標籤文字應該都相同，但數值前後可能因為
+    格式或筆數不同而不會剛好對在同一行。
+    """
+    for index in range(clicked_line_index, -1, -1):
+        text = lines[index].strip()
+        if not text or is_numeric_data_line(lines[index]):
+            continue
+        return text, clicked_line_index - index
+    return "", clicked_line_index
+
+
+def resolve_extraction_values(
+    file_text: str, anchor_label: str, offset: int, count: int, token_index: int = 0
+) -> list[str]:
+    """在 file_text 裡重新搜尋等於 anchor_label 的那一行（去頭尾空白後完全比對，
+    取第一個符合的），從它算起第 offset 行開始，連續取 count 行，每行取
+    第 token_index 個（0-based，用空白切開）數值文字。token_index=0（預設）
+    對一行只有一個數字的格式（如 `4_Warpage_data.txt`）等同取整行文字；
+    一行有多個數字的格式（如 `result.txt`）則依點擊當下偵測到的欄位取值
+    （見 find_number_token_at_column）。anchor_label 是空字串時從檔案開頭
+    （index -1 + offset）算。
+
+    找不到 anchor_label、offset/count 超出檔案實際行數、或某一行的數值
+    個數不夠 token_index 取，都 fail loud——供 batch_extract_values 在每個
+    資料夾、每條規則各自 try/except 這個函式，單一資料夾或規則出錯不會讓
+    整批擷取中斷。
+    """
+    lines = file_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if anchor_label:
+        anchor_index = next(
+            (index for index, line in enumerate(lines) if line.strip() == anchor_label), None
+        )
+        if anchor_index is None:
+            raise ValueError(f"找不到錨點標籤「{anchor_label}」")
+    else:
+        anchor_index = -1
+    start = anchor_index + offset
+    end = start + count
+    if start < 0 or end > len(lines):
+        raise ValueError(
+            f"檔案行數不足，無法從第 {start + 1} 行開始擷取 {count} 筆"
+            f"（檔案總行數 {len(lines)}）"
+        )
+    values: list[str] = []
+    for index in range(start, end):
+        tokens = lines[index].split()
+        if token_index >= len(tokens):
+            raise ValueError(
+                f"第 {index + 1} 行只有 {len(tokens)} 個數值，抓不到第 {token_index + 1} 個"
+            )
+        values.append(tokens[token_index])
+    return values
+
+
+def find_number_token_at_column(line_text: str, col: int) -> tuple[re.Match, int] | None:
+    """用 NUMBER_TOKEN_PATTERN（範本編輯器標記變數已經在用的同一份數字判斷
+    規則）找出 line_text 裡所有數字 token，依序編號（0-based），回傳 col
+    落在哪個 token 範圍內的 (match, token_index)；col 不在任何數字 token
+    裡回傳 None。
+
+    供「後處理」分頁 Ctrl+點擊時定位使用者點的是「這一行第幾個數字」，
+    不要求整行只能有一個數字——取代舊版「整行必須剛好是單一 float」的
+    限制，藉此支援 result.txt 那種一行多個數值（空白分隔）的格式。
+    """
+    for token_index, match in enumerate(NUMBER_TOKEN_PATTERN.finditer(line_text)):
+        if match.start() <= col < match.end():
+            return match, token_index
+    return None
+
+
+@dataclass
+class ExtractionRule:
+    """後處理分頁的一條擷取規則：label 是使用者自訂（或自動產生）的規則名稱，
+    filename 是這條規則要在每個 DOE run 資料夾裡尋找的檔名，anchor_label／
+    offset／count 是 Ctrl+點擊範例檔案時偵測出來的擷取位置（見
+    find_preceding_label_line），count > 1 時結果表會展開成
+    f"{label}_1".."{label}_{count}" 多欄。token_index（0-based）是點擊當下
+    偵測到的「這一行第幾個數字」（見 find_number_token_at_column），預設 0
+    對一行一個數字的格式等同取整行唯一的數值。
+    """
+
+    label: str
+    filename: str
+    anchor_label: str
+    offset: int
+    count: int = 1
+    token_index: int = 0
+
+
+def batch_extract_values(
+    output_dir: Path, folder_names: list[str], rules: list[ExtractionRule]
+) -> tuple[list[str], list[list[str]], list[str]]:
+    """對 folder_names 裡每個資料夾、依序套用每一條規則擷取數值，回傳
+    (header, rows, errors)：
+
+    header = ["序號", "資料夾"] + 依規則**建立順序**展開的欄名（count == 1
+    直接用 rule.label，count > 1 展成 rule.label_1..rule.label_N）——欄位
+    順序完全對應使用者定義規則的先後順序，不做任何矩陣式重排。
+
+    rows 每一列對應 folder_names 裡一個資料夾；單一資料夾／規則讀檔失敗、
+    找不到錨點、或行數不足，都只讓該規則對應的儲存格留空字串並記一筆錯誤
+    訊息到 errors，不會讓整批擷取中斷（資料夾一多，逐一 fail loud 體驗會
+    很差，錯誤留給呼叫端在批次結束後一次顯示）。
+    """
+    header = ["序號", "資料夾"]
+    for rule in rules:
+        if rule.count == 1:
+            header.append(rule.label)
+        else:
+            header.extend(f"{rule.label}_{i}" for i in range(1, rule.count + 1))
+
+    rows: list[list[str]] = []
+    errors: list[str] = []
+    for row_index, folder_name in enumerate(folder_names, start=1):
+        row = [str(row_index), folder_name]
+        for rule in rules:
+            file_path = output_dir / folder_name / rule.filename
+            try:
+                file_text, _stamp = read_apdl_text(file_path)
+                values = resolve_extraction_values(
+                    file_text, rule.anchor_label, rule.offset, rule.count, rule.token_index
+                )
+            except (ValueError, OSError) as exc:
+                errors.append(f"資料夾「{folder_name}」規則「{rule.label}」擷取失敗：{exc}")
+                values = [""] * rule.count
+            row.extend(values)
+        rows.append(row)
+    return header, rows, errors
+
+
 # ── GUI ───────────────────────────────────────────────────────────────────
 # 變數設定表欄位對齊：表頭跟每一列各自是獨立的 Frame，欄寬如果各自依文字
 # 字元數換算（舊作法），Label/Entry/Checkbutton 預設的 bd/highlightthickness
@@ -1352,12 +1654,13 @@ AUTOFIT_EXTRA_PADDING_PX = 16
 
 COLUMN_SPECS: tuple[ColumnSpec, ...] = (
     ColumnSpec("active", "Active", 56),
-    ColumnSpec("label", "Label", 90, weight=1),
+    ColumnSpec("label", "Label", 80),
     ColumnSpec("low", "low", 80),
     ColumnSpec("nominal", "Nominal", 80),
     ColumnSpec("upper", "Upper", 80),
     ColumnSpec("spacing", "Spacing", 80),
     ColumnSpec("manual", "Manual Values", 170, weight=2),
+    ColumnSpec("duplicate_count", "複製份數", 80),
     ColumnSpec("tolerance", "容差(數值/%)", 110),
     ColumnSpec("decimal_places", "小數位數", 70),
     ColumnSpec("status", "狀態", 64),
@@ -1366,8 +1669,9 @@ COLUMN_SPECS: tuple[ColumnSpec, ...] = (
 
 # 自動 fit 時不依內容量測寬度的欄位：Active 只是個勾選框、Action 只是固定
 # 文字的「移除」按鈕，兩者都沒有會隨資料變動的顯示內容，維持 COLUMN_SPECS
-# 原本定義的最小寬度即可。
-AUTOFIT_STATIC_COLUMN_KEYS = frozenset({"active", "action"})
+# 原本定義的最小寬度即可；Label 則是刻意固定寬度跟 Low 看齊，不隨使用者打的
+# 標籤文字長短變寬（label 文字可能很長，不希望把整張表撐開）。
+AUTOFIT_STATIC_COLUMN_KEYS = frozenset({"active", "action", "label"})
 
 COLUMN_INDEX_BY_KEY: dict[str, int] = {
     spec.key: index for index, spec in enumerate(COLUMN_SPECS)
@@ -1378,7 +1682,7 @@ COLUMN_INDEX_BY_KEY: dict[str, int] = {
 # 上下鍵增減數值，若也綁成跨列導覽會蓋掉這個既有功能，所以上下鍵導覽特意排除它
 # （左右鍵導覽仍包含，游標在文字端點時一樣能跳進/跳出這一欄）。
 VARIABLE_ROW_NAV_KEYS: tuple[str, ...] = (
-    "label", "low", "upper", "spacing", "manual", "tolerance", "decimal_places"
+    "label", "low", "upper", "spacing", "manual", "duplicate_count", "tolerance", "decimal_places"
 )
 VARIABLE_ROW_VERTICAL_NAV_KEYS: tuple[str, ...] = VARIABLE_ROW_NAV_KEYS[:-1]
 
@@ -1449,6 +1753,7 @@ class VariableRowState:
         self.upper_var = tk.StringVar(value="")
         self.spacing_var = tk.StringVar(value="")
         self.manual_values_var = tk.StringVar(value="")
+        self.duplicate_count_var = tk.StringVar(value="")
 
         if nominal_value is None:
             nominal_text = ""
@@ -1519,6 +1824,14 @@ class VariableRowState:
         )
         add("manual", self.manual_entry)
 
+        # 複製份數：點進這欄並輸入數字，等同選了第三種模式（MODE_DUPLICATE）——
+        # 不展開排列組合，只是把 Nominal 值原樣複製這個份數，當這個變數的水準
+        # 清單，方便先開出幾個空格、之後直接在組合對照表逐一填入實際數值。
+        self.duplicate_count_entry = tk.Entry(
+            self.frame, textvariable=self.duplicate_count_var, width=1, bd=1, highlightthickness=0
+        )
+        add("duplicate_count", self.duplicate_count_entry)
+
         # 容差欄位：輸入一個數值（絕對差）或百分比（結尾加 %），按 Enter 或移開焦點
         # 時依 Nominal 換算出 low/upper，同時寫進 Manual Values（見 _apply_tolerance）——
         # 不會自動切換 Range/Manual 模式，使用者仍照原來的方式點進其中一組欄位決定要用哪個。
@@ -1554,11 +1867,18 @@ class VariableRowState:
         for range_entry in (self.lower_entry, self.upper_entry, self.spacing_entry):
             range_entry.bind("<FocusIn>", lambda _event: self._switch_mode(MODE_RANGE))
         self.manual_entry.bind("<FocusIn>", lambda _event: self._switch_mode(MODE_MANUAL))
+        self.duplicate_count_entry.bind("<FocusIn>", lambda _event: self._switch_mode(MODE_DUPLICATE))
         # Active 勾選或任一水準欄位文字變動時，即時重新判斷要不要套用
         # BLANK_FIELD_BG 提醒色（見 _sync_mode_state），不用等使用者切欄位
         # 或按預覽才看得出哪裡還沒填。
         self.active_var.trace_add("write", self._sync_mode_state)
-        for level_var in (self.lower_var, self.upper_var, self.spacing_var, self.manual_values_var):
+        for level_var in (
+            self.lower_var,
+            self.upper_var,
+            self.spacing_var,
+            self.manual_values_var,
+            self.duplicate_count_var,
+        ):
             level_var.trace_add("write", self._sync_mode_state)
         self._sync_mode_state()
         self._bind_navigation()
@@ -1669,18 +1989,22 @@ class VariableRowState:
         self._sync_mode_state()
 
     def _sync_mode_state(self, *_trace_args) -> None:
-        """依目前模式用背景色標示 Range / Manual 哪一組欄位目前有效，並對
-        Active 變數裡「目前有效那組、但還是空白」的欄位改用 BLANK_FIELD_BG
-        提醒使用者「產生」前記得補上——判斷邏輯跟 variable_has_blank_level_
-        input／resolve_variable_levels 的 allow_blank 一致，只是這裡即時依
-        畫面文字判斷，不用等收集成 VariableConfig 之後才知道。非目前模式的
-        欄位（不會被拿去解析）或 Active 未勾選的列，一律不套用提醒色。
+        """依目前模式（Range／Manual／Duplicate 三選一）用背景色標示哪一組
+        欄位目前有效，並對 Active 變數裡「目前有效那組、但還是空白」的欄位
+        改用 BLANK_FIELD_BG 提醒使用者「產生」前記得補上——判斷邏輯跟
+        variable_has_blank_level_input／resolve_variable_levels 的 allow_blank
+        一致，只是這裡即時依畫面文字判斷，不用等收集成 VariableConfig 之後
+        才知道。非目前模式的欄位（不會被拿去解析）或 Active 未勾選的列，
+        一律不套用提醒色。
 
-        掛在 active_var／lower_var／upper_var／spacing_var／manual_values_var
-        的 trace 上，使用者打字或勾/取消 Active 時都會即時重新上色，*_trace_args
-        吃掉 Tk trace 回呼固定會帶的 (name, index, mode) 三個參數。
+        掛在 active_var／lower_var／upper_var／spacing_var／manual_values_var／
+        duplicate_count_var 的 trace 上，使用者打字或勾/取消 Active 時都會
+        即時重新上色，*_trace_args 吃掉 Tk trace 回呼固定會帶的
+        (name, index, mode) 三個參數。
         """
         is_range = self.mode == MODE_RANGE
+        is_manual = self.mode == MODE_MANUAL
+        is_duplicate = self.mode == MODE_DUPLICATE
         is_active = self.active_var.get()
 
         def field_bg(is_current_mode: bool, text: str) -> str:
@@ -1693,7 +2017,10 @@ class VariableRowState:
         self.lower_entry.configure(bg=field_bg(is_range, self.lower_var.get()))
         self.upper_entry.configure(bg=field_bg(is_range, self.upper_var.get()))
         self.spacing_entry.configure(bg=field_bg(is_range, self.spacing_var.get()))
-        self.manual_entry.configure(bg=field_bg(not is_range, self.manual_values_var.get()))
+        self.manual_entry.configure(bg=field_bg(is_manual, self.manual_values_var.get()))
+        self.duplicate_count_entry.configure(
+            bg=field_bg(is_duplicate, self.duplicate_count_var.get())
+        )
 
     def set_invalid(self, invalid: bool) -> None:
         """更新「狀態」欄位的失效提示（marks 指到的文字跟 original_text 對不上，
@@ -1743,16 +2070,19 @@ class VariableRowState:
             value_type=self.value_type,
             decimal_places=self._read_decimal_places(),
             nominal_text=self.nominal_var.get(),
+            duplicate_count_text=self.duplicate_count_var.get(),
         )
 
 
 def build_combination_column_specs(header: list[str]) -> tuple[ColumnSpec, ...]:
     """依 header（["資料夾"] + 每個變數的 display_name）動態組出組合對照表的
-    欄位規格：資料夾欄固定寬度、不伸縮；每個數值欄用 index 當 key（不是
+    欄位規格：最前面固定加一欄「序號」（純顯示目前第幾組，方便查看總筆數，
+    不是資料本身的一部分，不會出現在複製到剪貼簿／combinations_summary.txt
+    裡）；接著是資料夾欄，固定寬度、不伸縮；每個數值欄用 index 當 key（不是
     display_name，避免 position-kind 標記萬一同名時互相混淆），weight=1
     平均分配剩餘空間。
     """
-    specs = [ColumnSpec("folder", header[0], 110)]
+    specs = [ColumnSpec("seq", "序號", 50), ColumnSpec("folder", header[0], 110)]
     for index, title in enumerate(header[1:]):
         specs.append(ColumnSpec(f"value_{index}", title, 100, weight=1))
     return tuple(specs)
@@ -1778,9 +2108,9 @@ def parse_edited_value_text(text: str, config: VariableConfig) -> float | str:
 
 
 class CombinationRowState:
-    """組合對照表的一列：資料夾名稱 + 每個 active 變數的數值，皆為可編輯的
-    Entry。用 index（不是變數的 display_name）對應每個數值欄，避免 position
-    -kind 標記萬一同名時互相混淆。
+    """組合對照表的一列：序號（純顯示） + 資料夾名稱 + 每個 active 變數的數值
+    （資料夾／數值皆為可編輯的 Entry）。用 index（不是變數的 display_name）
+    對應每個數值欄，避免 position-kind 標記萬一同名時互相混淆。
 
     original_folder_name／original_value_texts 是「上次成功套用／產生時」的
     快照，供 on_apply_combination_table_changes 比對目前 Entry 文字跟這份
@@ -1790,12 +2120,19 @@ class CombinationRowState:
     「變數設定表」裡還沒填 Range/Manual、這次只是用 Nominal 墊檔（見
     DoeApp.on_preview_combinations 的 allow_blank 預覽），該欄的 Entry 用
     BLANK_FIELD_BG 上色提醒，不是使用者真的已經決定要用的值。
+
+    序號欄（sequence_number）刻意不放進 self.widgets：它是唯讀、純顯示用的
+    欄位（跟 VariableRowState 的 Nominal 欄位同樣手法，用 state="readonly"
+    的 Entry 而不是 Label，讓使用者仍可選取/複製），不參與方向鍵導覽，也
+    不計入 current_value_texts()／current_folder_name() 之類的資料存取，
+    避免影響既有以 self.widgets 索引為準的導覽、貼上、欄位比對邏輯。
     """
 
     def __init__(
         self,
         parent: tk.Widget,
         column_specs: tuple[ColumnSpec, ...],
+        sequence_number: int,
         folder_name: str,
         value_texts: list[str],
         on_navigate: Callable[["CombinationRowState", int, str], None],
@@ -1809,13 +2146,29 @@ class CombinationRowState:
         self.frame.pack(fill="x", expand=True)
         configure_table_columns(self.frame, column_specs=column_specs)
 
+        self.seq_var = tk.StringVar(value=str(sequence_number))
+        self.seq_entry = tk.Entry(
+            self.frame,
+            textvariable=self.seq_var,
+            width=1,
+            state="readonly",
+            readonlybackground=BG2,
+            fg=FG,
+            bd=1,
+            highlightthickness=0,
+            justify="center",
+        )
+        self.seq_entry.grid(
+            row=0, column=0, sticky="nsew", padx=TABLE_CELL_PAD_X, pady=TABLE_CELL_PAD_Y
+        )
+
         self.widgets: list[tk.Widget] = []
 
         self.folder_var = tk.StringVar(value=folder_name)
         self.folder_entry = tk.Entry(
             self.frame, textvariable=self.folder_var, width=1, bd=1, highlightthickness=0
         )
-        self._place_widget(self.folder_entry, 0)
+        self._place_widget(self.folder_entry, 1)
 
         blank_column_flags = blank_column_flags or [False] * len(value_texts)
         self.value_vars: list[tk.StringVar] = []
@@ -1829,7 +2182,7 @@ class CombinationRowState:
                 highlightthickness=0,
                 bg=BLANK_FIELD_BG if blank_column_flags[index] else BG2,
             )
-            self._place_widget(entry, index + 1)
+            self._place_widget(entry, index + 2)
             self.value_vars.append(value_var)
 
         self._bind_navigation()
@@ -1872,6 +2225,17 @@ class CombinationRowState:
     def current_value_texts(self) -> list[str]:
         return [value_var.get() for value_var in self.value_vars]
 
+    def set_cell_text(self, widget_index: int, text: str) -> None:
+        """依 self.widgets 的索引寫回對應的 StringVar：0 是資料夾欄
+        （folder_var），1..N 對應 value_vars[widget_index-1]——跟
+        current_folder_name()/current_value_texts() 用同一份索引規則。
+        供「從剪貼簿貼上」整塊覆寫儲存格使用。
+        """
+        if widget_index == 0:
+            self.folder_var.set(text)
+        else:
+            self.value_vars[widget_index - 1].set(text)
+
     def folder_changed(self) -> bool:
         return self.current_folder_name() != self.original_folder_name
 
@@ -1883,6 +2247,177 @@ class CombinationRowState:
         畫面上的文字，因為畫面文字本身就是剛寫入磁碟的那份資料。"""
         self.original_folder_name = folder_name
         self.original_value_texts = list(value_texts)
+
+    def destroy(self) -> None:
+        self.frame.destroy()
+
+
+POSTPROCESS_RULE_COLUMN_SPECS: tuple[ColumnSpec, ...] = (
+    ColumnSpec("active", "Active", 56),
+    ColumnSpec("label", "規則名稱", 120, weight=1),
+    ColumnSpec("filename", "目標檔名", 160, weight=1),
+    ColumnSpec("anchor", "錨點標籤", 140),
+    ColumnSpec("offset", "偏移", 50),
+    ColumnSpec("token", "第幾個數值", 80),
+    ColumnSpec("count", "擷取筆數", 70),
+    ColumnSpec("status", "狀態", 64),
+    ColumnSpec("action", "", 64),
+)
+POSTPROCESS_RULE_COLUMN_INDEX_BY_KEY: dict[str, int] = {
+    spec.key: index for index, spec in enumerate(POSTPROCESS_RULE_COLUMN_SPECS)
+}
+
+
+class ExtractionRuleRowState:
+    """「後處理」分頁「擷取規則設定表」的一列：由 DoeApp._on_postprocess_
+    preview_click（Ctrl+點擊範例檔案的數字）建立，之後使用者可以調整規則
+    名稱、目標檔名、擷取筆數，或取消 Active 讓這條規則這次批次不要用到。
+
+    anchor_label／offset／token_index 是點擊當下自動偵測出來的擷取起點
+    （唯讀顯示，不能手動改——要改請移除重新點擊）：anchor_label/offset 決定
+    「從哪一行開始」，token_index 決定「那一行裡的第幾個數字」（支援一行
+    多個數值的格式，例如 result.txt 的 Strip_max/Strip_min/... 數值列）。
+    count（擷取筆數）才是使用者會主動調整的欄位：預設 1（只要點到的那一
+    筆），改大就能一次連續抓多筆（例如改成 7，批次時就會從點擊位置往下
+    連續取 7 行，每行一樣取第 token_index 個數字）。
+    """
+
+    def __init__(
+        self,
+        parent: tk.Widget,
+        on_remove: Callable[["ExtractionRuleRowState"], None],
+        label: str,
+        filename: str,
+        anchor_label: str,
+        offset: int,
+        count: int = 1,
+        token_index: int = 0,
+    ) -> None:
+        self.on_remove = on_remove
+
+        self.frame = tk.Frame(parent, bg=BG2)
+        self.frame.pack(fill="x", expand=True)
+        configure_table_columns(self.frame, column_specs=POSTPROCESS_RULE_COLUMN_SPECS)
+
+        self.widgets: list[tk.Widget] = []
+
+        def add(key: str, widget: tk.Widget) -> None:
+            widget.grid(
+                row=0,
+                column=POSTPROCESS_RULE_COLUMN_INDEX_BY_KEY[key],
+                sticky="nsew",
+                padx=TABLE_CELL_PAD_X,
+                pady=TABLE_CELL_PAD_Y,
+            )
+            self.widgets.append(widget)
+
+        self.active_var = tk.BooleanVar(value=True)
+        add(
+            "active",
+            tk.Checkbutton(self.frame, variable=self.active_var, bg=BG2, bd=1, highlightthickness=0),
+        )
+
+        self.label_var = tk.StringVar(value=label)
+        add("label", tk.Entry(self.frame, textvariable=self.label_var, width=1, bd=1, highlightthickness=0))
+
+        self.filename_var = tk.StringVar(value=filename)
+        add(
+            "filename",
+            tk.Entry(self.frame, textvariable=self.filename_var, width=1, bd=1, highlightthickness=0),
+        )
+
+        # 錨點標籤／偏移用唯讀 Entry（而不是 Label）：道理跟變數設定表的
+        # Nominal 欄位一樣，文字仍可選取/複製，但不能被使用者誤改。
+        self.anchor_label_var = tk.StringVar(value=anchor_label)
+        add(
+            "anchor",
+            tk.Entry(
+                self.frame,
+                textvariable=self.anchor_label_var,
+                width=1,
+                state="readonly",
+                readonlybackground=BG2,
+                fg=FG,
+                bd=1,
+                highlightthickness=0,
+            ),
+        )
+
+        self.offset_var = tk.StringVar(value=str(offset))
+        add(
+            "offset",
+            tk.Entry(
+                self.frame,
+                textvariable=self.offset_var,
+                width=1,
+                state="readonly",
+                readonlybackground=BG2,
+                fg=FG,
+                bd=1,
+                highlightthickness=0,
+                justify="center",
+            ),
+        )
+
+        # 畫面顯示 1-based（給使用者看比較直覺：「第 1 個數值」而不是「第 0 個」），
+        # 內部 token_index 仍是 0-based，轉換集中在這一欄跟 to_rule()。
+        self.token_index_var = tk.StringVar(value=str(token_index + 1))
+        add(
+            "token",
+            tk.Entry(
+                self.frame,
+                textvariable=self.token_index_var,
+                width=1,
+                state="readonly",
+                readonlybackground=BG2,
+                fg=FG,
+                bd=1,
+                highlightthickness=0,
+                justify="center",
+            ),
+        )
+
+        self.count_var = tk.IntVar(value=count)
+        add(
+            "count",
+            ttk.Spinbox(
+                self.frame, from_=1, to=9999, width=1, textvariable=self.count_var, justify="center"
+            ),
+        )
+
+        self.status_label = tk.Label(
+            self.frame, text="", bg=BG2, fg=FG, width=1, anchor="w", bd=1, highlightthickness=0
+        )
+        add("status", self.status_label)
+
+        remove_button = ttk.Button(
+            self.frame, text="移除", width=1, command=lambda: self.on_remove(self)
+        )
+        add("action", remove_button)
+
+    def to_rule(self) -> ExtractionRule:
+        """轉成批次擷取用的純資料快照；筆數／規則名稱／目標檔名若不合法
+        （非正整數、空白）一律 fail loud，點名是哪條規則。"""
+        label = self.label_var.get().strip()
+        try:
+            count = self.count_var.get()
+        except tk.TclError:
+            raise ValueError(f"規則「{label}」的擷取筆數不是合法整數")
+        if count < 1:
+            raise ValueError(f"規則「{label}」的擷取筆數必須至少是 1")
+        filename = self.filename_var.get().strip()
+        if not filename:
+            raise ValueError(f"規則「{label}」的目標檔名是空的，請填寫")
+        if not label:
+            raise ValueError("有擷取規則的「規則名稱」是空白，請填寫")
+        return ExtractionRule(
+            label=label,
+            filename=filename,
+            anchor_label=self.anchor_label_var.get(),
+            offset=int(self.offset_var.get()),
+            count=count,
+            token_index=int(self.token_index_var.get()) - 1,
+        )
 
     def destroy(self) -> None:
         self.frame.destroy()
@@ -1919,6 +2454,15 @@ class DoeApp:
         self._next_position_var_number = 1  # 點擊標記變數的流水編號，整個 session 持續累加不重置
         self._last_table_header: list[str] = []
         self.combination_rows: list[CombinationRowState] = []
+        # 「從剪貼簿貼上」按鈕被按下時，焦點已經在按鈕上、不在原本選取的儲存格，
+        # 靠這個狀態記住使用者上次點進組合對照表哪一格（row_index, widget_index），
+        # 當作貼上的起點；由 _on_combination_cell_focus 隨 FocusIn 即時更新。
+        self._last_focused_combination_cell: tuple[int, int] | None = None
+        # 「新增到組合對照表」旁邊的「跟隨起始序號」勾選框：預設不勾（新列接在
+        # 既有列數之後編號，不受「起始序號」欄位影響，見 on_append_combinations_
+        # to_table）；勾選後改用「起始序號」欄位的值當新列的起點，交由使用者
+        # 自己決定、並承擔撞名風險（撞名時 fail loud 擋下，不會悄悄覆蓋）。
+        self.append_follow_start_index_var = tk.BooleanVar(value=False)
 
         # 「這一批 run 是不是真的產生在磁碟上」的狀態：on_generate 成功後才會
         # 設置這三個，on_preview_combinations 只是預覽、沒有實際資料夾，必須
@@ -1944,6 +2488,21 @@ class DoeApp:
         self._search_signature: tuple[str, bool, bool] | None = None
         self._find_replace_dialog: tk.Toplevel | None = None
 
+        # 「後處理」分頁狀態：範例檔案路徑、擷取規則列、結果表目前的
+        # (header, rows)（rows 直接存文字資料，供「複製到剪貼簿」直接取用，
+        # 不用從唯讀 Entry 畫面逐格讀回來）、資料夾來源（預設用組合對照表
+        # 目前列出的資料夾，見 _resolve_postprocess_batch_source）。
+        # postprocess_custom_folder_var：「指定資料夾路徑」來源用的獨立路徑，
+        # 跟「工作目錄」（self.output_dir_var）分開——使用者可能把求解完的
+        # 結果搬到跟 DOE 產生時不同的路徑，或根本不是用這個工具產生的資料夾。
+        self.postprocess_sample_path_var = tk.StringVar(value="")
+        self.postprocess_rows: list[ExtractionRuleRowState] = []
+        self._postprocess_next_rule_number = 1
+        self.postprocess_folder_source_var = tk.StringVar(value="combination_table")
+        self.postprocess_custom_folder_var = tk.StringVar(value="")
+        self._postprocess_result_header: list[str] = []
+        self._postprocess_result_rows: list[list[str]] = []
+
         self._build_layout()
 
     def _build_layout(self) -> None:
@@ -1963,6 +2522,10 @@ class DoeApp:
         workflow_tab = tk.Frame(main_notebook, bg=BG)
         main_notebook.add(workflow_tab, text="常用工作流程")
         self._build_workflow_tab(workflow_tab)
+
+        postprocess_tab = tk.Frame(main_notebook, bg=BG)
+        main_notebook.add(postprocess_tab, text="後處理")
+        self._build_postprocess_tab(postprocess_tab)
 
         file_frame = tk.LabelFrame(edit_tab, text="檔案與輸出設定", bg=BG2, fg=FG)
         file_frame.pack(fill="x", **pad)
@@ -2059,6 +2622,12 @@ class DoeApp:
         ttk.Button(
             table_title_row, text="預覽組合數", command=self.on_preview_combinations
         ).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            table_title_row, text="新增到組合對照表", command=self.on_append_combinations_to_table
+        ).pack(side="right", padx=(0, 8))
+        ttk.Checkbutton(
+            table_title_row, text="跟隨起始序號", variable=self.append_follow_start_index_var
+        ).pack(side="right", padx=(0, 4))
 
         # table_container 改用 grid（而不是 pack）佈局表頭／Canvas／捲軸：表頭與
         # Canvas 都固定在欄 0，捲軸獨立佔欄 1，兩者的可用寬度才會一致，不會像
@@ -2274,6 +2843,9 @@ class DoeApp:
             table_toolbar, text="複製到剪貼簿", command=self.on_copy_combination_table
         ).pack(side="left")
         ttk.Button(
+            table_toolbar, text="從剪貼簿貼上", command=self.on_paste_combination_table
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
             table_toolbar,
             text="依對照表產生資料夾與 input file",
             command=self.on_generate_from_combination_table,
@@ -2399,6 +2971,415 @@ class DoeApp:
             return
 
         self.log(f"已啟動 ANSYS（工作目錄：{workdir}，Job Name：{jobname}）。")
+
+    def _build_postprocess_tab(self, parent: tk.Widget) -> None:
+        """「後處理」分頁：批次擷取所有 DOE run 資料夾裡同名結果檔的指定數值。
+
+        操作方式刻意呼應「範本內容」標記變數的手感：瀏覽一份範例結果檔案
+        （通常直接挑任一個已經求解完成的 run 資料夾裡的檔案）當預覽，
+        Ctrl+點擊裡面的數字就新增一條擷取規則（見 _on_postprocess_preview_
+        click），不用手動打錨點文字/行號。
+        """
+        sample_frame = tk.LabelFrame(parent, text="範例檔案預覽", bg=BG2, fg=FG)
+        sample_frame.pack(fill="x", padx=10, pady=6)
+
+        self._path_row(
+            sample_frame, "範例檔案：", self.postprocess_sample_path_var, self._browse_postprocess_sample
+        )
+        tk.Label(
+            sample_frame,
+            text="Ctrl+單擊下方預覽裡的數字，可新增一條擷取規則（錨點標籤/偏移會自動偵測）。",
+            bg=BG2,
+            fg=FG,
+            anchor="w",
+        ).pack(fill="x", padx=8, pady=(0, 4))
+
+        preview_frame = tk.Frame(sample_frame, bg=BG2)
+        preview_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.postprocess_preview_line_numbers = tk.Text(
+            preview_frame,
+            height=10,
+            width=4,
+            bg="#eef0f3",
+            fg="#6b7280",
+            wrap="none",
+            state="disabled",
+            takefocus=0,
+        )
+        self.postprocess_preview_text = tk.Text(
+            preview_frame, height=10, bg="#f8fafc", fg=FG, wrap="none", state="disabled"
+        )
+        preview_scroll_y = ttk.Scrollbar(
+            preview_frame, orient="vertical", command=self._on_postprocess_preview_yview
+        )
+        self.postprocess_preview_text.configure(yscrollcommand=preview_scroll_y.set)
+        self.postprocess_preview_line_numbers.grid(row=0, column=0, sticky="ns")
+        self.postprocess_preview_text.grid(row=0, column=1, sticky="nsew")
+        preview_scroll_y.grid(row=0, column=2, sticky="ns")
+        preview_frame.grid_rowconfigure(0, weight=1)
+        preview_frame.grid_columnconfigure(1, weight=1)
+        self.postprocess_preview_text.bind("<Control-Button-1>", self._on_postprocess_preview_click)
+
+        rule_frame = tk.LabelFrame(parent, text="擷取規則設定表", bg=BG2, fg=FG)
+        rule_frame.pack(fill="both", padx=10, pady=6)
+
+        rule_header = tk.Frame(rule_frame, bg=BG2)
+        rule_header.pack(fill="x", padx=8, pady=(8, 0))
+        configure_table_columns(rule_header, column_specs=POSTPROCESS_RULE_COLUMN_SPECS)
+        for column_index, spec in enumerate(POSTPROCESS_RULE_COLUMN_SPECS):
+            tk.Label(
+                rule_header,
+                text=spec.title,
+                bg=BG2,
+                fg=FG,
+                width=1,
+                anchor="w",
+                font=("TkDefaultFont", 9, "bold"),
+                bd=1,
+                highlightthickness=0,
+            ).grid(row=0, column=column_index, sticky="nsew", padx=TABLE_CELL_PAD_X, pady=TABLE_CELL_PAD_Y)
+
+        self.postprocess_rule_body = tk.Frame(rule_frame, bg=BG2)
+        self.postprocess_rule_body.pack(fill="x", expand=True, padx=8, pady=(0, 8))
+
+        batch_frame = tk.LabelFrame(parent, text="批次設定", bg=BG2, fg=FG)
+        batch_frame.pack(fill="x", padx=10, pady=6)
+
+        source_row = tk.Frame(batch_frame, bg=BG2)
+        source_row.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Radiobutton(
+            source_row,
+            text="使用組合對照表列出的資料夾",
+            variable=self.postprocess_folder_source_var,
+            value="combination_table",
+        ).pack(side="left")
+        ttk.Radiobutton(
+            source_row,
+            text="重新掃描工作目錄",
+            variable=self.postprocess_folder_source_var,
+            value="scan_output_dir",
+        ).pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(
+            source_row,
+            text="指定資料夾路徑",
+            variable=self.postprocess_folder_source_var,
+            value="custom_folder",
+        ).pack(side="left", padx=(16, 0))
+
+        self._path_row(
+            batch_frame,
+            "指定資料夾：",
+            self.postprocess_custom_folder_var,
+            self._browse_postprocess_custom_folder,
+        )
+
+        result_toolbar = tk.Frame(parent, bg=BG)
+        result_toolbar.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Button(result_toolbar, text="批次擷取", command=self.on_run_batch_extraction).pack(
+            side="left"
+        )
+        ttk.Button(
+            result_toolbar, text="複製到剪貼簿", command=self.on_copy_postprocess_result
+        ).pack(side="left", padx=(8, 0))
+
+        result_container = tk.Frame(parent, bg=BG2)
+        result_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        result_container.grid_rowconfigure(1, weight=1)
+        result_container.grid_columnconfigure(0, weight=1)
+
+        self._postprocess_result_header_frame = tk.Frame(result_container, bg=BG2)
+        self._postprocess_result_header_frame.grid(row=0, column=0, sticky="ew")
+        self._postprocess_result_header_frame.bind(
+            "<MouseWheel>", self._on_postprocess_result_mousewheel
+        )
+
+        result_canvas = tk.Canvas(result_container, bg=BG2, highlightthickness=0)
+        result_scroll_y = ttk.Scrollbar(
+            result_container, orient="vertical", command=result_canvas.yview
+        )
+        self.postprocess_result_body = tk.Frame(result_canvas, bg=BG2)
+        self.postprocess_result_body.bind(
+            "<Configure>",
+            lambda event: result_canvas.configure(scrollregion=result_canvas.bbox("all")),
+        )
+        self._postprocess_result_body_window_id = result_canvas.create_window(
+            (0, 0), window=self.postprocess_result_body, anchor="nw"
+        )
+        result_canvas.configure(yscrollcommand=result_scroll_y.set)
+        result_canvas.grid(row=1, column=0, sticky="nsew")
+        result_scroll_y.grid(row=1, column=1, sticky="ns")
+
+        self._postprocess_result_canvas = result_canvas
+        result_canvas.bind("<Configure>", self._on_postprocess_result_canvas_configure)
+        result_canvas.bind("<MouseWheel>", self._on_postprocess_result_mousewheel)
+        self.postprocess_result_body.bind(
+            "<MouseWheel>", self._on_postprocess_result_mousewheel, add="+"
+        )
+
+    def _on_postprocess_preview_yview(self, *args: str) -> None:
+        """預覽區捲軸：同步內容與行號側欄的捲動位置（跟 _on_template_text_scroll
+        同樣的道理，只是這裡是唯讀預覽，不需要顧慮編輯/dirty 狀態）。"""
+        self.postprocess_preview_text.yview(*args)
+        self.postprocess_preview_line_numbers.yview(*args)
+
+    def _browse_postprocess_sample(self) -> None:
+        path = filedialog.askopenfilename(title="選擇後處理範例檔案")
+        if not path:
+            return
+        self.postprocess_sample_path_var.set(path)
+        self._load_postprocess_sample(Path(path))
+
+    def _load_postprocess_sample(self, path: Path) -> None:
+        try:
+            text, _stamp = read_apdl_text(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("後處理", f"讀取範例檔案失敗：\n{exc}")
+            return
+
+        self.postprocess_preview_text.configure(state="normal")
+        self.postprocess_preview_text.delete("1.0", "end")
+        self.postprocess_preview_text.insert("1.0", text)
+        self.postprocess_preview_text.configure(state="disabled")
+
+        tk_line_count = int(self.postprocess_preview_text.index("end-1c").split(".")[0])
+        line_number_text = "\n".join(str(i) for i in range(1, tk_line_count + 1))
+        self.postprocess_preview_line_numbers.configure(state="normal")
+        self.postprocess_preview_line_numbers.delete("1.0", "end")
+        self.postprocess_preview_line_numbers.insert("1.0", line_number_text)
+        self.postprocess_preview_line_numbers.configure(state="disabled")
+
+        self.log(f"後處理：已載入範例檔案「{path}」。")
+
+    def _on_postprocess_preview_click(self, event: tk.Event) -> str:
+        """Ctrl+單擊預覽裡的數字：自動偵測這個數字所屬區塊的標籤文字、偏移、
+        以及「這一行第幾個數字」，新增一條擷取規則（預設筆數 1，使用者之後
+        可以自己把筆數調大，一次連續抓多筆）。不要求整行只能有一個數字——
+        用 find_number_token_at_column 定位點擊的是行內哪一個數字 token，
+        支援 result.txt 那種一行多個數值（空白分隔）的格式。一定要回傳
+        "break"，理由跟 _on_template_text_click 一樣：避免 Ctrl+Button-1
+        被 Text 預設綁定接著處理成游標移動/選取拖曳。
+        """
+        if not self.postprocess_sample_path_var.get():
+            messagebox.showinfo("後處理", "請先瀏覽選擇一份範例檔案。")
+            return "break"
+
+        click_index = self.postprocess_preview_text.index(f"@{event.x},{event.y}")
+        line_str, col_str = click_index.split(".")
+        line_num, col = int(line_str), int(col_str)
+        lines = self.postprocess_preview_text.get("1.0", "end-1c").split("\n")
+        clicked_line_index = line_num - 1
+        if clicked_line_index >= len(lines):
+            return "break"
+
+        line_text = lines[clicked_line_index]
+        found = find_number_token_at_column(line_text, col)
+        if found is None:
+            messagebox.showerror("後處理", f"第 {line_num} 行游標位置不是數值，請點擊數值本身。")
+            return "break"
+        _match, token_index = found
+
+        anchor_label, offset = find_preceding_label_line(lines, clicked_line_index)
+        default_filename = Path(self.postprocess_sample_path_var.get()).name
+        default_label = f"rule{self._postprocess_next_rule_number:02d}_L{line_num}"
+        self._postprocess_next_rule_number += 1
+
+        self._add_extraction_rule_row(
+            label=default_label,
+            filename=default_filename,
+            anchor_label=anchor_label,
+            offset=offset,
+            token_index=token_index,
+        )
+        self.log(
+            f"後處理：已新增擷取規則「{default_label}」"
+            f"（錨點標籤「{anchor_label}」、偏移 {offset}、第 {token_index + 1} 個數值）。"
+        )
+        return "break"
+
+    def _add_extraction_rule_row(
+        self,
+        label: str,
+        filename: str,
+        anchor_label: str,
+        offset: int,
+        count: int = 1,
+        token_index: int = 0,
+    ) -> ExtractionRuleRowState:
+        row = ExtractionRuleRowState(
+            self.postprocess_rule_body,
+            self._remove_extraction_rule_row,
+            label,
+            filename,
+            anchor_label,
+            offset,
+            count,
+            token_index,
+        )
+        self.postprocess_rows.append(row)
+        return row
+
+    def _remove_extraction_rule_row(self, row: ExtractionRuleRowState) -> None:
+        row.destroy()
+        self.postprocess_rows.remove(row)
+
+    def _browse_postprocess_custom_folder(self) -> None:
+        path = filedialog.askdirectory(title="選擇要批次擷取的資料夾")
+        if path:
+            self.postprocess_custom_folder_var.set(path)
+
+    def _resolve_postprocess_batch_source(self) -> tuple[Path, list[str]]:
+        """依「批次設定」目前選的資料夾來源，回傳 (base_dir, folder_names)：
+        batch_extract_values 會用 base_dir / folder_name / rule.filename 組出
+        每個資料夾裡要讀的檔案路徑，三種來源各自的 base_dir 不同，不能共用
+        self.output_dir_var 硬套。
+
+        - combination_table（預設）：base_dir 是「工作目錄」，folder_names
+          取自目前「組合對照表」列出的資料夾（這批資料夾本來就是相對這個
+          工作目錄產生的）。
+        - scan_output_dir：base_dir 一樣是「工作目錄」，但 folder_names 改成
+          重新掃描磁碟上符合目前資料夾名稱前綴的資料夾，不管組合對照表目前
+          顯示什麼。
+        - custom_folder：base_dir 是使用者在「指定資料夾」欄位自己選的路徑，
+          folder_names 是該路徑底下**所有**子資料夾（不篩選前綴）——用於
+          求解結果被搬到跟 DOE 產生時不同的路徑，或根本不是這個工具產生的
+          資料夾。路徑不存在時回傳空清單，不 fail loud（讓呼叫端用統一的
+          「沒有可批次擷取的資料夾」訊息處理）。
+        """
+        source = self.postprocess_folder_source_var.get()
+        if source == "scan_output_dir":
+            output_dir = Path(self.output_dir_var.get())
+            run_prefix = resolve_run_folder_prefix(self.run_folder_prefix_var.get())
+            folder_names = sorted(
+                (path.name for path in find_existing_run_folders(output_dir, run_prefix)),
+                key=lambda name: name.lower(),
+            )
+            return output_dir, folder_names
+        if source == "custom_folder":
+            custom_dir = Path(self.postprocess_custom_folder_var.get())
+            if not custom_dir.is_dir():
+                return custom_dir, []
+            folder_names = sorted(
+                (path.name for path in custom_dir.iterdir() if path.is_dir()),
+                key=lambda name: name.lower(),
+            )
+            return custom_dir, folder_names
+        output_dir = Path(self.output_dir_var.get())
+        return output_dir, [row.current_folder_name() for row in self.combination_rows]
+
+    def on_run_batch_extraction(self) -> None:
+        base_dir, folder_names = self._resolve_postprocess_batch_source()
+        if not folder_names:
+            messagebox.showinfo(
+                "後處理",
+                "目前沒有可批次擷取的資料夾：請確認「組合對照表」已經有資料夾清單、"
+                "「工作目錄」底下有符合前綴的資料夾，或「指定資料夾」路徑存在且底下有子資料夾"
+                "（依目前選取的資料夾來源而定）。",
+            )
+            return
+
+        active_rows = [row for row in self.postprocess_rows if row.active_var.get()]
+        if not active_rows:
+            messagebox.showinfo(
+                "後處理", "目前沒有勾選任何 Active 擷取規則，請先在範例檔案預覽裡 Ctrl+單擊新增規則。"
+            )
+            return
+
+        try:
+            rules = [row.to_rule() for row in active_rows]
+        except ValueError as exc:
+            messagebox.showerror("後處理", str(exc))
+            return
+
+        header, rows, errors = batch_extract_values(base_dir, folder_names, rules)
+        self._refresh_postprocess_result_table(header, rows)
+
+        self.log(f"後處理：已批次擷取 {len(folder_names)} 個資料夾、{len(rules)} 條規則。")
+        if errors:
+            self.log(f"後處理：{len(errors)} 個儲存格擷取失敗：")
+            for error in errors:
+                self.log(f"　- {error}")
+            messagebox.showwarning(
+                "後處理",
+                f"批次擷取完成，但有 {len(errors)} 個儲存格失敗（已留空，詳見「紀錄」分頁）。",
+            )
+        else:
+            messagebox.showinfo("後處理", f"批次擷取完成，共 {len(folder_names)} 個資料夾。")
+
+    def _refresh_postprocess_result_table(self, header: list[str], rows: list[list[str]]) -> None:
+        """重建後處理結果表格：欄位數隨目前規則數量變動，所以每次都整個重設
+        表頭跟所有列（做法比照 _refresh_combination_table，但結果是唯讀的，
+        不需要 on_navigate／blank_column_flags 這些可編輯表格才要的機制）。
+        """
+        self._postprocess_result_header = header
+        self._postprocess_result_rows = rows
+
+        for widget in self._postprocess_result_header_frame.winfo_children():
+            widget.destroy()
+        for widget in self.postprocess_result_body.winfo_children():
+            widget.destroy()
+
+        column_specs = tuple(
+            ColumnSpec(f"col_{index}", title, 90, weight=(1 if index >= 2 else 0))
+            for index, title in enumerate(header)
+        )
+        configure_table_columns(self._postprocess_result_header_frame, column_specs=column_specs)
+        for column_index, spec in enumerate(column_specs):
+            header_label = tk.Label(
+                self._postprocess_result_header_frame,
+                text=spec.title,
+                bg=BG2,
+                fg=FG,
+                width=1,
+                anchor="w",
+                font=("TkDefaultFont", 9, "bold"),
+                bd=1,
+                highlightthickness=0,
+            )
+            header_label.grid(
+                row=0, column=column_index, sticky="nsew", padx=TABLE_CELL_PAD_X, pady=TABLE_CELL_PAD_Y
+            )
+            header_label.bind("<MouseWheel>", self._on_postprocess_result_mousewheel)
+
+        for row_values in rows:
+            row_frame = tk.Frame(self.postprocess_result_body, bg=BG2)
+            row_frame.pack(fill="x", expand=True)
+            configure_table_columns(row_frame, column_specs=column_specs)
+            for column_index, text in enumerate(row_values):
+                entry = tk.Entry(
+                    row_frame,
+                    textvariable=tk.StringVar(value=text),
+                    width=1,
+                    state="readonly",
+                    readonlybackground=BG2,
+                    fg=FG,
+                    bd=1,
+                    highlightthickness=0,
+                )
+                entry.grid(
+                    row=0, column=column_index, sticky="nsew", padx=TABLE_CELL_PAD_X, pady=TABLE_CELL_PAD_Y
+                )
+                entry.bind("<MouseWheel>", self._on_postprocess_result_mousewheel)
+            row_frame.bind("<MouseWheel>", self._on_postprocess_result_mousewheel, add="+")
+
+    def on_copy_postprocess_result(self) -> None:
+        if not self._postprocess_result_header:
+            messagebox.showinfo("複製到剪貼簿", "目前沒有後處理結果可複製，請先「批次擷取」。")
+            return
+        lines = ["\t".join(self._postprocess_result_header)] + [
+            "\t".join(row) for row in self._postprocess_result_rows
+        ]
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self.log(f"後處理：已複製結果表（{len(self._postprocess_result_rows)} 列）到剪貼簿。")
+
+    def _on_postprocess_result_mousewheel(self, event: tk.Event) -> str:
+        self._postprocess_result_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_postprocess_result_canvas_configure(self, event: tk.Event) -> None:
+        self._postprocess_result_canvas.itemconfigure(
+            self._postprocess_result_body_window_id, width=event.width
+        )
 
     def _path_row(
         self, parent: tk.Widget, label: str, var: tk.StringVar, browse_cmd
@@ -2554,7 +3535,16 @@ class DoeApp:
         column_specs = build_combination_column_specs(header)
         configure_table_columns(self._combination_header_frame, column_specs=column_specs)
         for column_index, spec in enumerate(column_specs):
-            is_blank_column = column_index > 0 and blank_column_flags[column_index - 1]
+            # column_specs 比 header 多一欄「序號」（最前面固定加的，見
+            # build_combination_column_specs），所以欄位索引要往後位移 1 才
+            # 對得上 header／blank_column_flags：column_index 0 是序號、1 是
+            # 資料夾，兩者都不是任何變數的值欄，一律不上色提醒；
+            # column_index >= 2 才對應 blank_column_flags[column_index - 2]。
+            is_blank_column = (
+                column_index >= 2
+                and column_index - 2 < len(blank_column_flags)
+                and blank_column_flags[column_index - 2]
+            )
             header_label = tk.Label(
                 self._combination_header_frame,
                 text=spec.title,
@@ -2575,11 +3565,12 @@ class DoeApp:
             )
             header_label.bind("<MouseWheel>", self._on_combination_table_mousewheel)
 
-        for row_values in rows:
+        for sequence_number, row_values in enumerate(rows, start=1):
             folder_name, value_texts = row_values[0], row_values[1:]
             row_state = CombinationRowState(
                 self.combination_body,
                 column_specs,
+                sequence_number,
                 folder_name,
                 value_texts,
                 on_navigate=self._on_combination_row_navigate,
@@ -2588,8 +3579,15 @@ class DoeApp:
             row_state.frame.bind(
                 "<MouseWheel>", self._on_combination_table_mousewheel, add="+"
             )
+            row_state.seq_entry.bind("<MouseWheel>", self._on_combination_table_mousewheel)
             for widget in row_state.widgets:
                 widget.bind("<MouseWheel>", self._on_combination_table_mousewheel)
+                widget.bind(
+                    "<FocusIn>",
+                    lambda event, r=row_state: self._on_combination_cell_focus(r, event.widget),
+                    add="+",
+                )
+                widget.bind("<Control-v>", self._on_combination_table_keyboard_paste)
             self.combination_rows.append(row_state)
 
         self._bottom_notebook.select(self._table_tab)
@@ -2610,6 +3608,83 @@ class DoeApp:
         self.root.clipboard_clear()
         self.root.clipboard_append("\n".join(lines))
         self.log(f"已複製組合對照表（{len(self.combination_rows)} 列）到剪貼簿。")
+
+    def _on_combination_cell_focus(self, row: CombinationRowState, widget: tk.Widget) -> None:
+        """組合對照表任一儲存格取得焦點時，記住 (row_index, widget_index)，
+        供「從剪貼簿貼上」按鈕知道要從哪一格開始貼（按鈕被按下的當下，焦點
+        已經在按鈕上，不在使用者原本點選的儲存格）。"""
+        self._last_focused_combination_cell = (
+            self.combination_rows.index(row),
+            row.widgets.index(widget),
+        )
+
+    def _locate_combination_cell(self, widget: tk.Widget) -> tuple[int, int] | None:
+        """找出 widget 在組合對照表裡的 (row_index, widget_index)，供 Ctrl+V
+        鍵盤貼上使用——事件只帶 event.widget，沒有現成的 row 參照可用。"""
+        for row_index, row in enumerate(self.combination_rows):
+            if widget in row.widgets:
+                return row_index, row.widgets.index(widget)
+        return None
+
+    def _paste_clipboard_into_combination_table(
+        self, anchor_row_index: int, anchor_widget_index: int
+    ) -> None:
+        """以 (anchor_row_index, anchor_widget_index) 為起點，把剪貼簿的多列多欄
+        內容（parse_clipboard_grid）往右下貼進組合對照表，模擬 Excel 的區塊貼上。
+        超出目前表格列數/欄數的部分直接裁掉（不自動新增列/欄——新增列涉及
+        資料夾命名規則，超出「貼上」這個動作該做的事），裁掉時另外提醒使用者。
+        """
+        try:
+            clipboard_text = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showerror("從剪貼簿貼上", "剪貼簿目前沒有文字內容可以貼上。")
+            return
+
+        grid = parse_clipboard_grid(clipboard_text)
+        if not grid:
+            messagebox.showinfo("從剪貼簿貼上", "剪貼簿目前沒有內容可以貼上。")
+            return
+
+        available_rows = len(self.combination_rows) - anchor_row_index
+        available_cols = len(self.combination_rows[anchor_row_index].widgets) - anchor_widget_index
+        pasted_rows = min(len(grid), available_rows)
+        pasted_cols = min(max((len(line) for line in grid), default=0), available_cols)
+
+        for row_offset in range(pasted_rows):
+            target_row = self.combination_rows[anchor_row_index + row_offset]
+            line = grid[row_offset]
+            for col_offset in range(min(len(line), pasted_cols)):
+                target_row.set_cell_text(anchor_widget_index + col_offset, line[col_offset])
+
+        self.log(f"已從剪貼簿貼上 {pasted_rows}x{pasted_cols} 個儲存格到組合對照表。")
+        if len(grid) > pasted_rows or any(len(line) > pasted_cols for line in grid):
+            self.log(
+                "注意：剪貼簿內容超出組合對照表目前的範圍，超出的列/欄已略過"
+                "（不會自動新增列或欄）。"
+            )
+
+    def on_paste_combination_table(self) -> None:
+        """工具列「從剪貼簿貼上」按鈕：以使用者上次點進組合對照表的那一格
+        當貼上起點（見 _on_combination_cell_focus），模擬 Excel 的區塊貼上。
+        """
+        if not self.combination_rows:
+            messagebox.showinfo("從剪貼簿貼上", "目前沒有組合對照表內容可貼上，請先「預覽組合數」或「產生」。")
+            return
+        if self._last_focused_combination_cell is None:
+            messagebox.showerror("從剪貼簿貼上", "請先點選組合對照表裡要開始貼上的儲存格。")
+            return
+        anchor_row_index, anchor_widget_index = self._last_focused_combination_cell
+        self._paste_clipboard_into_combination_table(anchor_row_index, anchor_widget_index)
+
+    def _on_combination_table_keyboard_paste(self, event: tk.Event) -> str:
+        """組合對照表儲存格上的 Ctrl+V：直接用目前有焦點的儲存格當貼上起點。
+        回傳 "break" 蓋掉 Tk Entry 內建的單欄位貼上，避免寫回 StringVar 之後
+        又被內建行為在游標處插入一次剪貼簿文字，造成內容重複。
+        """
+        anchor = self._locate_combination_cell(event.widget)
+        if anchor is not None:
+            self._paste_clipboard_into_combination_table(*anchor)
+        return "break"
 
     def on_apply_combination_table_changes(self) -> None:
         """把組合對照表裡使用者編輯過的「資料夾」與數值欄位，一次性套用到磁碟：
@@ -2772,19 +3847,19 @@ class DoeApp:
         )
 
     def _row_autofit_display_texts(self, row: VariableRowState) -> dict[str, str]:
-        """回傳這一列會被拿去量測欄寬的欄位目前顯示文字（Active／移除按鈕沒有
-        會變動的內容，見 AUTOFIT_STATIC_COLUMN_KEYS，不需要在這裡回傳）。"""
+        """回傳這一列會被拿去量測欄寬的欄位目前顯示文字（Active／Label／移除
+        按鈕是固定寬度，見 AUTOFIT_STATIC_COLUMN_KEYS，不需要在這裡回傳）。"""
         try:
             decimal_places_text = str(row.decimal_places_var.get())
         except tk.TclError:
             decimal_places_text = ""
         return {
-            "label": row.label_var.get(),
             "low": row.lower_var.get(),
             "nominal": row.nominal_var.get(),
             "upper": row.upper_var.get(),
             "spacing": row.spacing_var.get(),
             "manual": row.manual_values_var.get(),
+            "duplicate_count": row.duplicate_count_var.get(),
             "tolerance": row.tolerance_var.get(),
             "decimal_places": decimal_places_text,
             "status": row.status_label.cget("text"),
@@ -3570,6 +4645,59 @@ class DoeApp:
                 config.end_offset = self._char_offset(row.end_mark)
         return collect_active_variable_configs(active_configs)
 
+    def _build_configs_for_table_header(self) -> list[VariableConfig]:
+        """依組合對照表目前的表頭（self._last_table_header），從變數設定表
+        （self.rows，不限 Active 勾選）逐一找出對應的變數列並轉成
+        VariableConfig，順序跟表頭欄位順序一致。
+
+        供「依對照表產生資料夾與 input file」使用：那顆按鈕的本意就是「直接
+        採用對照表目前顯示的內容」，不應該要求表頭跟「目前」畫面上的 Active
+        勾選狀態完全一致——組合對照表可能是透過「新增到組合對照表」分批累加
+        出來的，每一批累加當下的 Active 組合本來就可能彼此不同（例如先
+        active 變數 A 產生一批、取消 A、再 active 變數 B 累加一批），累加完
+        的表頭是這些變數的聯集，跟「目前」勾選哪些 Active 無關。只要該欄
+        對應的變數列還存在於變數設定表裡，就能用它目前的設定重建替換範圍，
+        不管它現在是否還勾著 Active。
+
+        表頭裡的欄位名稱如果對應不到任何變數列（該變數已經被整列移除），
+        或是 position-kind 的標記已經失效，都 fail loud，因為那一欄的數值
+        已經無法定位要替換 input file 裡的哪個位置。
+        """
+        row_by_display_name: dict[str, VariableRowState] = {}
+        for row in self.rows:
+            name = row.label_var.get().strip() or row.varname_var.get().strip()
+            row_by_display_name.setdefault(name, row)
+
+        configs: list[VariableConfig] = []
+        missing_names: list[str] = []
+        invalid_names: list[str] = []
+        for name in self._last_table_header[1:]:
+            row = row_by_display_name.get(name)
+            if row is None:
+                missing_names.append(name)
+                continue
+            if row.kind == VARIABLE_KIND_POSITION and (row.start_mark is None or row.invalid):
+                invalid_names.append(name)
+                continue
+            config = row.to_config()
+            if row.kind == VARIABLE_KIND_POSITION:
+                config.start_offset = self._char_offset(row.start_mark)
+                config.end_offset = self._char_offset(row.end_mark)
+            configs.append(config)
+
+        if missing_names or invalid_names:
+            error_parts = []
+            if missing_names:
+                error_parts.append("已從變數設定表移除：" + "、".join(missing_names))
+            if invalid_names:
+                error_parts.append("點擊標記已失效：" + "、".join(invalid_names))
+            raise ValueError(
+                "組合對照表裡以下欄位對應的變數有問題，無法依對照表產生（"
+                + "；".join(error_parts)
+                + "），請確認變數設定表後重新「預覽組合數」或「新增到組合對照表」。"
+            )
+        return configs
+
     def _ensure_template_saved_before_run(self) -> bool:
         """預覽/產生前確保範本已存檔：這兩個流程本來就是重新讀磁碟文字，必須
         先保證磁碟內容等於畫面內容，之後的邏輯才不用改。"""
@@ -3583,6 +4711,13 @@ class DoeApp:
         return self._save_template()
 
     def on_preview_combinations(self) -> None:
+        """「預覽組合數」按鈕：收集 Active 變數設定（含三種模式 Range/Manual/
+        Duplicate 混用）、用全因子展開算出所有組合，刷新組合對照表。
+
+        allow_blank=True：還沒填 Range/Manual/複製份數 的 Active 變數先用
+        Nominal 墊檔，讓預覽不會卡在「全部變數都填完才看得到表格」，缺漏留到按
+        「產生所有資料夾與 input file」時才嚴格檢查（見 on_generate）。
+        """
         if not self._ensure_template_saved_before_run():
             return
 
@@ -3597,9 +4732,6 @@ class DoeApp:
             active_configs = self._collect_active_configs()
             template_text, _stamp = read_apdl_text(template_path)
             resolve_all_spans(template_text, active_configs)
-            # allow_blank=True：還沒填 Range/Manual 的 Active 變數先用 Nominal
-            # 墊檔，讓預覽不會卡在「全部變數都填完才看得到表格」，缺漏留到按
-            # 「產生所有資料夾與 input file」時才嚴格檢查（見 on_generate）。
             combinations = build_full_factorial_combinations(active_configs, allow_blank=True)
         except ValueError as exc:
             messagebox.showerror("錯誤", str(exc))
@@ -3612,9 +4744,9 @@ class DoeApp:
             active_configs, combinations, run_prefix, start_index
         )
         # 跟 header[1:]（每個 active 變數各一欄）順序對應：True 表示這個變數
-        # 還沒填 Range/Manual、組合對照表裡那一欄是用 Nominal 墊檔算出來的，
-        # 不是使用者真的已經決定的值，交給 _refresh_combination_table 把該欄
-        # 上色提醒。
+        # 還沒填 Range/Manual/複製份數、組合對照表裡那一欄是用 Nominal 墊檔
+        # 算出來的，不是使用者真的已經決定的值，交給 _refresh_combination_table
+        # 把該欄上色提醒。
         blank_column_flags = [variable_has_blank_level_input(config) for config in active_configs]
         self._refresh_combination_table(header, rows, blank_column_flags)
         # 純預覽，磁碟上沒有實際資料夾；清掉「上一輪產生」的狀態，避免使用者
@@ -3631,7 +4763,7 @@ class DoeApp:
         ]
         if blank_names:
             self.log(
-                "注意：以下變數尚未填入 Range/Manual，預覽暫以 Nominal 值代入，"
+                "注意：以下變數尚未填入 Range/Manual/複製份數，預覽暫以 Nominal 值代入，"
                 "產生前請記得補上：" + "、".join(blank_names)
             )
 
@@ -3641,6 +4773,113 @@ class DoeApp:
         # _sync_mode_state），避免兩邊顯示不同步。
         for row in self.rows:
             row._sync_mode_state()
+
+    def on_append_combinations_to_table(self) -> None:
+        """「新增到組合對照表」按鈕：依目前 Active 變數算出這次的新組合，
+        接在組合對照表現有列的後面，不重建、不動既有列。
+
+        跟「預覽組合數」（整張表重算重建）不同，這顆鈕是設計給「先針對變數 A
+        預覽一批、再勾選變數 B 累加一批」這種分批操作用：
+        - 既有列的資料夾名稱與目前畫面上的數值原封不動保留（讀 current_
+          folder_name()/current_value_texts()，包含使用者按過這顆鈕之後手動
+          改過的內容，不是用上次算出來的舊快照）。
+        - 新列的編號起點由旁邊的「跟隨起始序號」勾選框決定：不勾（預設）時
+          接在「目前既有列數 + 1」之後編號，不理會「起始序號」欄位；勾選時
+          改用「起始序號」欄位目前的值當起點，由使用者自己決定、自己承擔
+          撞名風險——撞到既有列名稱時 fail loud 擋下，不會悄悄覆蓋或產生
+          重複資料夾名稱。
+        - 欄位採聯集：這次新出現、既有列沒有的變數欄，既有列用該變數目前的
+          Nominal 墊檔；既有欄位這次沒 active（因此新列沒有該欄的組合值）的
+          變數，新列一樣用該變數目前的 Nominal 墊檔（Nominal 從 self.rows
+          現查，不管該列現在是否還 Active）。
+        """
+        if not self._ensure_template_saved_before_run():
+            return
+
+        template_path = Path(self.template_path_var.get())
+        if not template_path.is_file():
+            messagebox.showerror("錯誤", f"找不到 input file：\n{template_path}")
+            return
+
+        try:
+            run_prefix = resolve_run_folder_prefix(self.run_folder_prefix_var.get())
+            active_configs = self._collect_active_configs()
+            template_text, _stamp = read_apdl_text(template_path)
+            resolve_all_spans(template_text, active_configs)
+            combinations = build_full_factorial_combinations(active_configs, allow_blank=True)
+            if self.append_follow_start_index_var.get():
+                append_start_index = resolve_run_start_index(self.run_start_index_var.get())
+            else:
+                append_start_index = len(self.combination_rows) + 1
+        except ValueError as exc:
+            messagebox.showerror("錯誤", str(exc))
+            return
+
+        if not self.combination_rows:
+            # 表格目前是空的，新增等同第一次預覽，直接沿用既有流程即可。
+            self.on_preview_combinations()
+            return
+
+        new_folder_names = [
+            format_run_id(offset + 1, len(combinations), run_prefix, start_index=append_start_index)
+            for offset in range(len(combinations))
+        ]
+        existing_folder_names = {row.current_folder_name() for row in self.combination_rows}
+        colliding_names = sorted(set(new_folder_names) & existing_folder_names)
+        if colliding_names:
+            messagebox.showerror(
+                "新增到組合對照表",
+                "這次要新增的資料夾名稱跟既有列撞名（可能是「跟隨起始序號」算出來的"
+                "範圍跟既有列重疊），請調整起始序號、改用不跟隨起始序號，或清掉重疊的"
+                "既有列後再試：\n- " + "\n- ".join(colliding_names),
+            )
+            return
+
+        new_names = [config.display_name for config in active_configs]
+        existing_names = self._last_table_header[1:]
+        combined_names = existing_names + [
+            name for name in new_names if name not in existing_names
+        ]
+        nominal_by_name: dict[str, str] = {
+            row.label_var.get().strip() or row.varname_var.get().strip(): row.nominal_var.get()
+            for row in self.rows
+        }
+
+        combined_rows: list[list[str]] = []
+        for row in self.combination_rows:
+            value_by_name = dict(zip(existing_names, row.current_value_texts()))
+            combined_rows.append(
+                [row.current_folder_name()]
+                + [
+                    value_by_name.get(name, nominal_by_name.get(name, ""))
+                    for name in combined_names
+                ]
+            )
+
+        for offset, combo in enumerate(combinations):
+            value_by_name = {
+                config.display_name: format_value_for_config(value, config)
+                for value, config in zip(combo, active_configs)
+            }
+            combined_rows.append(
+                [new_folder_names[offset]]
+                + [
+                    value_by_name.get(name, nominal_by_name.get(name, ""))
+                    for name in combined_names
+                ]
+            )
+
+        combined_header = ["資料夾"] + combined_names
+        previous_row_count = len(self.combination_rows)
+        self._refresh_combination_table(combined_header, combined_rows)
+        self._last_generated_output_dir = None
+        self._last_generated_template_path = None
+        self._last_generated_active_configs = None
+        self.preview_text_var.set(f"組合對照表目前共 {len(self.combination_rows)} 組")
+        self.log(
+            f"已新增 {len(combinations)} 組到組合對照表（原有 {previous_row_count} 列維持不變），"
+            f"目前共 {len(self.combination_rows)} 列。"
+        )
 
     def _apply_combination_column_to_row(
         self, row: VariableRowState, column_index: int
@@ -3704,6 +4943,11 @@ class DoeApp:
         在對照表裡排好的自訂安排（例如把兩個變數的值配成一一對應）完全不是
         一回事。這裡改成逐列原樣採用對照表目前的值（build_combinations_
         from_table_rows），不重新展開，也完全不碰任何變數的 Manual Values。
+
+        依表頭（_build_configs_for_table_header）而不是「目前 Active 勾選」
+        反查對應的變數設定：組合對照表可能是透過「新增到組合對照表」分批
+        累加出來的，表頭是各批累加當下 Active 變數的聯集，不會也不需要
+        對應「目前」畫面上勾選的 Active 狀態。
         """
         if not self.combination_rows:
             messagebox.showinfo(
@@ -3720,19 +4964,9 @@ class DoeApp:
             return
 
         try:
-            active_configs = self._collect_active_configs()
+            active_configs = self._build_configs_for_table_header()
         except ValueError as exc:
             messagebox.showerror("錯誤", str(exc))
-            return
-
-        expected_header = ["資料夾"] + [config.display_name for config in active_configs]
-        if self._last_table_header != expected_header:
-            messagebox.showerror(
-                "產生資料夾與 input file",
-                "組合對照表目前的欄位組成跟變數設定表的 Active 變數對不上"
-                "（可能是預覽/產生之後又改過 Active 勾選、或增刪過變數列），"
-                "請重新「預覽組合數」後再試一次。",
-            )
             return
 
         output_dir = Path(self.output_dir_var.get())
