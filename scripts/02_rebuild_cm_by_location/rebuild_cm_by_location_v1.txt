@@ -1,0 +1,179 @@
+! ==========================================================================
+! 用「座標」(而非面編號) 重新選取 import_shapes.txt 建立的四種形狀，
+! 重新定義 CIRCLE_AREA / RECT_AREA / SLOT_AREA / ELLIPSE_AREA 四個元件。
+!
+! 使用時機：import_shapes.txt 執行完之後，若自己又對這些面做了布林運算
+! (切割、聯集等)，面編號會被打散、重新編號，import_shapes.txt 當時用面
+! 編號範圍建立的 CIRCLE_AREA 等元件就不再對應正確的面了。本檔改用每個
+! 形狀「原始座標」(在各自的局部座標系下) 重新選取，不依賴面編號，即使
+! 布林運算把原本一個面拆成好幾塊，只要這些子面的位置還落在原始形狀的
+! 座標範圍內，一樣能被選到、重新歸入對應元件。
+!
+! 本檔刻意不寫 /CLEAR，且會自行重新讀取四個 shape_export_*.txt (不依賴
+! import_shapes.txt 執行期間留在記憶體的 CIRC/RECT/SLOT/ELLIP 陣列)，
+! 可以在任何時間點、對任何後續修改過的模型單獨執行 /INPUT。
+!
+! [效能提醒] 這裡沿用 9_for_interposer_model/model.txt 既有的「逐列
+! CMSEL,A 累加進元件」寫法（S/R 篩選一列 -> CMSEL,A 併入前面累積的結
+! 果 -> CM 存回）。import_shapes.txt 的「建立」階段已改成算術位移 +
+! 一次性選取來解決 O(N^2) 問題，但那個做法要求「每列恰好新建幾個編號
+! 連續的實體」；這裡是「事後座標重選」，本質是要 OR 起 N 組各自獨立的
+! AND 條件(而且做過布林後每組可能對應 0~多個面，數量不可預期)，沒有
+! 同樣的算術捷徑可套用。若列數非常多且這裡也出現明顯變慢，屆時再回頭
+! 討論如何優化這段。
+! ==========================================================================
+
+! ==========================================================================
+! 1. CIRCLE：以圓心為原點的局部圓柱座標系(KCS=1)，用 LOC,X=半徑 做精確
+!    圓盤選取(對照 010_vendor_refs ANSYS 範例 EX5-8.dat / EX5-19.dat 的
+!    LOCAL,n,1,... 圓柱座標系寫法)。改用圓柱系前是用全域直角座標box選取
+!    (圓的外接正方形)，正方形比圓盤多出約0.86R²的四角區域，若有其他形狀
+!    的碎片面質心剛好落在角落內、圓外，會被誤選進CIRCLE_AREA；圓柱座標
+!    系下LOC,X直接對應半徑R，選0~R_C即為精確圓盤，無此風險。
+! ==========================================================================
+/INQUIRE,EXIST_CIRCLE,EXIST,shape_export_circle,txt
+*IF,EXIST_CIRCLE,EQ,1,THEN
+    /INQUIRE,N_CIRCLE,LINES,shape_export_circle,txt
+    *DIM,CIRC,ARRAY,N_CIRCLE,4
+    *VREAD,CIRC(1,1),shape_export_circle,txt,,JIK,4,N_CIRCLE
+(F9.0,3E21.13E3)
+
+    *DO,I_C,1,N_CIRCLE
+        CX_C = CIRC(I_C,2)
+        CY_C = CIRC(I_C,3)
+        R_C  = CIRC(I_C,4)
+
+        TOL_C = R_C*1E-6         ! 微小容差，吸收布林切割邊界的浮點誤差(隨半徑等比例縮放)
+
+        LOCAL,15,1,CX_C,CY_C,0   ! 以圓心為原點的局部圓柱座標系(KCS=1)，X=半徑R
+        ASEL,S,LOC,X,-TOL_C,R_C+TOL_C   ! 精確選取半徑≤R_C的圓盤(含邊界容差)
+        CSYS,0
+
+        *IF,I_C,GT,1,THEN
+            CMSEL,A,CIRCLE_AREA
+        *ENDIF
+        CM,CIRCLE_AREA,AREA
+    *ENDDO
+*ELSE
+    /COM,[座標重建CM] 找不到 shape_export_circle.txt，略過 CIRCLE 類別
+*ENDIF
+
+! ==========================================================================
+! 2. RECT：對齊長邊方向的局部座標系內，用長寬做box選取
+! ==========================================================================
+/INQUIRE,EXIST_RECT,EXIST,shape_export_rect,txt
+*IF,EXIST_RECT,EQ,1,THEN
+    /INQUIRE,N_RECT,LINES,shape_export_rect,txt
+    *DIM,RECT,ARRAY,N_RECT,6
+    *VREAD,RECT(1,1),shape_export_rect,txt,,JIK,6,N_RECT
+(F9.0,5E21.13E3)
+
+    *DO,I_R,1,N_RECT
+        CX_R  = RECT(I_R,2)
+        CY_R  = RECT(I_R,3)
+        ANG_R = RECT(I_R,4)
+        LEN_R = RECT(I_R,5)
+        WID_R = RECT(I_R,6)
+
+        TOL_R = LEN_R*1E-6   ! 微小容差，吸收布林切割邊界的浮點誤差(隨長邊等比例縮放)
+
+        WPCSYS,-1,0          ! 重設工作平面到全域直角座標系
+        WPOFFS,CX_R,CY_R     ! 平移工作平面原點到矩形中心
+        WPROTA,ANG_R         ! 繞工作平面Z軸旋轉，使WP的X軸沿長邊方向(與建立時相同)
+        CSYS,4               ! 作用座標系跟隨工作平面
+
+        ASEL,S,LOC,X,-LEN_R/2-TOL_R,LEN_R/2+TOL_R
+        ASEL,R,LOC,Y,-WID_R/2-TOL_R,WID_R/2+TOL_R
+
+        CSYS,0
+        WPCSYS,-1,0
+
+        *IF,I_R,GT,1,THEN
+            CMSEL,A,RECT_AREA
+        *ENDIF
+        CM,RECT_AREA,AREA
+    *ENDDO
+*ELSE
+    /COM,[座標重建CM] 找不到 shape_export_rect.txt，略過 RECT 類別
+*ENDIF
+
+! ==========================================================================
+! 3. SLOT：對齊長軸方向的局部座標系內，用長圓外接矩形做box選取
+! ==========================================================================
+/INQUIRE,EXIST_SLOT,EXIST,shape_export_slot,txt
+*IF,EXIST_SLOT,EQ,1,THEN
+    /INQUIRE,N_SLOT,LINES,shape_export_slot,txt
+    *DIM,SLOT,ARRAY,N_SLOT,6
+    *VREAD,SLOT(1,1),shape_export_slot,txt,,JIK,6,N_SLOT
+(F9.0,5E21.13E3)
+
+    *DO,I_S,1,N_SLOT
+        CX_S    = SLOT(I_S,2)
+        CY_S    = SLOT(I_S,3)
+        ANG_S   = SLOT(I_S,4)
+        PITCH_S = SLOT(I_S,5)
+        R_S     = SLOT(I_S,6)
+
+        TOL_S = (PITCH_S/2+R_S)*1E-6   ! 微小容差，吸收布林切割邊界的浮點誤差(隨長圓半長等比例縮放)
+
+        WPCSYS,-1,0          ! 重設工作平面到全域直角座標系
+        WPOFFS,CX_S,CY_S     ! 平移工作平面原點到兩端圓心中點
+        WPROTA,ANG_S         ! 繞工作平面Z軸旋轉，使WP的X軸沿長軸方向(與建立時相同)
+        CSYS,4               ! 作用座標系跟隨工作平面
+
+        ASEL,S,LOC,X,-(PITCH_S/2+R_S)-TOL_S,(PITCH_S/2+R_S)+TOL_S
+        ASEL,R,LOC,Y,-R_S-TOL_S,R_S+TOL_S
+
+        CSYS,0
+        WPCSYS,-1,0
+
+        *IF,I_S,GT,1,THEN
+            CMSEL,A,SLOT_AREA
+        *ENDIF
+        CM,SLOT_AREA,AREA
+    *ENDDO
+*ELSE
+    /COM,[座標重建CM] 找不到 shape_export_slot.txt，略過 SLOT 類別
+*ENDIF
+
+! ==========================================================================
+! 4. ELLIPSE：對齊長軸方向的局部直角座標系內，用長短軸做box選取
+!    (沿用與 import_shapes.txt 建立橢圓時完全相同的 LOCAL,KCS=0 座標系
+!    設定，不使用橢圓局部座標系(KCS=1)的R方向選取——K/L在那種座標系下
+!    曾出現不如預期的行為(見 import_shapes.txt 第4節註解)，這裡選取用
+!    的是同一套已驗證過的直角座標系，求穩妥不求box更貼合橢圓邊界)
+! ==========================================================================
+/INQUIRE,EXIST_ELLIPSE,EXIST,shape_export_ellipse,txt
+*IF,EXIST_ELLIPSE,EQ,1,THEN
+    /INQUIRE,N_ELLIPSE,LINES,shape_export_ellipse,txt
+    *DIM,ELLIP,ARRAY,N_ELLIPSE,6
+    *VREAD,ELLIP(1,1),shape_export_ellipse,txt,,JIK,6,N_ELLIPSE
+(F9.0,5E21.13E3)
+
+    *DO,I_E,1,N_ELLIPSE
+        CX_E   = ELLIP(I_E,2)
+        CY_E   = ELLIP(I_E,3)
+        ANG_E  = ELLIP(I_E,4)
+        MAJ_E  = ELLIP(I_E,5)
+        MIN_E  = ELLIP(I_E,6)
+
+        TOL_E = MAJ_E*1E-6   ! 微小容差，吸收布林切割邊界的浮點誤差(隨長軸等比例縮放)
+
+        LOCAL,12,0,CX_E,CY_E,0,ANG_E   ! 局部直角座標系，X軸沿長軸方向(與建立時相同)
+        CSYS,12
+
+        ASEL,S,LOC,X,-MAJ_E/2-TOL_E,MAJ_E/2+TOL_E
+        ASEL,R,LOC,Y,-MIN_E/2-TOL_E,MIN_E/2+TOL_E
+
+        CSYS,0
+
+        *IF,I_E,GT,1,THEN
+            CMSEL,A,ELLIPSE_AREA
+        *ENDIF
+        CM,ELLIPSE_AREA,AREA
+    *ENDDO
+*ELSE
+    /COM,[座標重建CM] 找不到 shape_export_ellipse.txt，略過 ELLIPSE 類別
+*ENDIF
+
+ALLSEL,ALL
