@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import codecs
 import io
-import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
 import tkinter as tk
+import tkinter.font as tkfont
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,7 +54,9 @@ def _ensure_configured_python() -> None:
     if not configured_pythonw.is_file():
         _show_bootstrap_error(
             "找不到指定的 Python 執行檔：\n{}\n\n"
-            "請用文字編輯器開啟 select.pyw，修改檔案最上方的 PYTHONW_EXE。".format(configured_pythonw)
+            "請用文字編輯器開啟 select_merged_prototype.pyw，修改檔案最上方的 PYTHONW_EXE。".format(
+                configured_pythonw
+            )
         )
         raise SystemExit(1)
 
@@ -77,7 +77,314 @@ def _ensure_configured_python() -> None:
     raise SystemExit(0)
 
 
-# ── ANSYS LOG 轉 APDL：轉換核心（內嵌自 ansys_log_converter.py）────────────────
+# ── 共用純邏輯函式（原樣複製自 select.pyw / 各分頁原型，行為不變，去除重複定義）──────
+
+BoxBound = Union[float, str]
+
+ENTITY_INFO = {
+    "AREA": {"sel": "ASEL", "id_item": "AREA", "cm_item": "AREA"},
+    "LINE": {"sel": "LSEL", "id_item": "LINE", "cm_item": "LINE"},
+    "VOLU": {"sel": "VSEL", "id_item": "VOLU", "cm_item": "VOLU"},
+    "NODE": {"sel": "NSEL", "id_item": "NODE", "cm_item": "NODE"},
+    "ELEM": {"sel": "ESEL", "id_item": "ELEM", "cm_item": "ELEM"},
+    "KP":   {"sel": "KSEL", "id_item": "KP",   "cm_item": "KP"},
+}
+
+NEXT_TYPE_OPTIONS = [
+    ("再加入 (A)", "A"),
+    ("取交集 (R)", "R"),
+    ("排除這些 IDs (U)", "U"),
+]
+
+BOX_SELECTION_OPTIONS = [
+    ("重新選擇 (S)", "S"),
+    ("再加入 (A)", "A"),
+    ("取交集 (R)", "R"),
+    ("排除這些 IDs (U)", "U"),
+]
+BOX_REFINE_OPTIONS = [option for option in BOX_SELECTION_OPTIONS if option[1] != "S"]
+
+COMP_POST_OPTIONS = ["無", "NSLE, S", "ESLN, S, 0"]
+
+DEFAULT_SELTOL = "1e-6"
+SELTOL_COMMAND = f"SELTOL, {DEFAULT_SELTOL}"
+
+# 所有分頁共用一個輸出工具列，按鈕寬度統一放在這裡管理。
+OUTPUT_ACTION_BUTTON_WIDTHS = {
+    "複製結果": 8,
+    "清空輸出": 8,
+    "插入分隔線": 10,
+    "產生 ID 選取": 12,
+    "產生 Box 選取": 12,
+    "產生 CMDELE 刪除": 14,
+    "產生 CMSEL 合併": 14,
+    "產生拓樸鏈": 12,
+    "產生 CMSEL": 12,
+}
+
+_ANSYS_ATTR_RE = re.compile(r'\b[A-Za-z][A-Za-z0-9_ ]*=\s*[\d.eE+\-]+')
+
+_FIRST_COL_HEADERS = (
+    "LIST ALL SELECTED ELEMENTS",
+    "LIST ALL SELECTED AREAS",
+    "LIST ALL SELECTED LINES",
+    "LIST ALL SELECTED KEYPOINTS",
+    "LIST ALL SELECTED VOLUMES",
+)
+
+
+def normalize_tokens(text: str) -> list[str]:
+    raw = text.strip()
+    if not raw:
+        return []
+    raw = re.sub(r"[,，;；]+", " ", raw)
+    return [tok for tok in re.split(r"\s+", raw) if tok]
+
+
+def expand_range_token(token: str) -> list[int]:
+    if re.fullmatch(r"\d+", token):
+        return [int(token)]
+    m = re.fullmatch(r"(\d+)\s*[-:~]\s*(\d+)(?:\s*:\s*(\d+))?", token)
+    if not m:
+        raise ValueError(f"格式錯誤: {token}，支援 12、1-10、1:10:2")
+    start, end = int(m.group(1)), int(m.group(2))
+    step = int(m.group(3)) if m.group(3) else 1
+    if step == 0:
+        raise ValueError("步長不能是 0。")
+    if start > end and step > 0:
+        step = -step
+    if start < end and step < 0:
+        step = -step
+    out, val = [], start
+    if step > 0:
+        while val <= end:
+            out.append(val); val += step
+    else:
+        while val >= end:
+            out.append(val); val += step
+    return out
+
+
+def parse_numbers(text: str) -> list[int]:
+    """解析 ID 輸入，支援手動輸入（含範圍）與貼上 ANSYS LIST 輸出自動萃取 ID。"""
+    if not text.strip():
+        return []
+
+    upper = text.upper()
+
+    if any(kw in upper for kw in _FIRST_COL_HEADERS):
+        numbers = []
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if not stripped:
+                continue
+            if len(line) - len(stripped) > 15:
+                continue
+            m = re.match(r'(\d+)', stripped)
+            if m:
+                numbers.append(int(m.group(1)))
+        return numbers
+
+    cleaned = _ANSYS_ATTR_RE.sub('', text)
+    numbers = []
+    for token in normalize_tokens(cleaned):
+        if re.fullmatch(r"\d+", token):
+            numbers.append(int(token))
+        elif re.fullmatch(r"\d+\s*[-:~]\s*\d+(?:\s*:\s*\d+)?", token):
+            try:
+                numbers.extend(expand_range_token(token))
+            except ValueError:
+                pass
+    return numbers
+
+
+def compress_numbers_to_ranges(numbers: list[int]) -> list[tuple[int, int, int]]:
+    """Sort, dedupe, and merge numbers into minimal (start, end, step) runs."""
+    if not numbers:
+        return []
+    sorted_nums = sorted(set(numbers))
+    if len(sorted_nums) == 1:
+        n = sorted_nums[0]
+        return [(n, n, 1)]
+    ranges: list[tuple[int, int, int]] = []
+    start = prev = sorted_nums[0]
+    step: int | None = None
+    for cur in sorted_nums[1:]:
+        delta = cur - prev
+        if step is None:
+            step = delta
+            prev = cur
+            continue
+        if delta != step:
+            ranges.append((start, prev, step))
+            start = prev = cur
+            step = None
+        else:
+            prev = cur
+    ranges.append((start, prev, step if step is not None else 1))
+    return ranges
+
+
+def format_id_select_line(sel_cmd: str, sel_type: str, item: str,
+                           id1: int, id2: int | None = None, inc: int | None = None) -> str:
+    if id2 is None:
+        return f"{sel_cmd}, {sel_type}, {item}, , {id1}"
+    if inc is None or inc == 1:
+        return f"{sel_cmd}, {sel_type}, {item}, , {id1}, {id2}"
+    return f"{sel_cmd}, {sel_type}, {item}, , {id1}, {id2}, {inc}"
+
+
+def build_id_list_commands(entity: str, numbers: list[int],
+                            style: str, first_type: str, next_type: str) -> str:
+    if entity not in ENTITY_INFO:
+        raise ValueError(f"不支援的實體類型: {entity}")
+    if not numbers:
+        return ""
+    sel_cmd = ENTITY_INFO[entity]["sel"]
+    item = ENTITY_INFO[entity]["id_item"]
+    if style == "逐一加選":
+        lines = [format_id_select_line(sel_cmd, first_type, item, numbers[0])]
+        for num in numbers[1:]:
+            lines.append(format_id_select_line(sel_cmd, next_type, item, num))
+        return "\n".join(lines)
+    ranges = compress_numbers_to_ranges(numbers)
+    lines = []
+    for i, (start, end, inc) in enumerate(ranges):
+        sel_type = first_type if i == 0 else next_type
+        if start == end:
+            lines.append(format_id_select_line(sel_cmd, sel_type, item, start))
+        else:
+            lines.append(format_id_select_line(sel_cmd, sel_type, item, start, end, inc))
+    return "\n".join(lines)
+
+
+def append_cm_line(lines: list[str], cm_name: str, entity: str) -> None:
+    name = cm_name.strip()
+    if not name:
+        return
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", name):
+        raise ValueError("元件名稱不合法，需英文字母開頭，且只含英數底線。")
+    lines.append(f"CM, {name}, {entity}")
+
+
+def parse_box_bound_optional(text: str, field_name: str) -> BoxBound | None:
+    s = text.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", s):
+            return s
+        raise ValueError(
+            f"{field_name} 必須是數值或有效的 APDL 純量變數名稱"
+            "（英文字母開頭，僅限英數與底線，最多 32 字元）。"
+        )
+
+
+def build_box_commands(entity: str, first_type: str, refine_type: str,
+                        x_pair: tuple[BoxBound, BoxBound] | None,
+                        y_pair: tuple[BoxBound, BoxBound] | None,
+                        z_pair: tuple[BoxBound, BoxBound] | None) -> str:
+    if entity not in ENTITY_INFO:
+        raise ValueError(f"Box 模式不支援此實體類型: {entity}")
+    sel_cmd = ENTITY_INFO[entity]["sel"]
+    item = "CENT" if entity == "ELEM" else "LOC"
+    axes = []
+    if x_pair is not None: axes.append(("X", x_pair))
+    if y_pair is not None: axes.append(("Y", y_pair))
+    if z_pair is not None: axes.append(("Z", z_pair))
+    if not axes:
+        raise ValueError("X/Y/Z 至少要填一組範圍。")
+    lines = []
+    for i, (axis, (vmin, vmax)) in enumerate(axes):
+        stype = first_type if i == 0 else refine_type
+        lines.append(f"{sel_cmd}, {stype}, {item}, {axis}, {vmin}, {vmax}")
+    return "\n".join(lines)
+
+
+def parse_component_names(text: str) -> list[str]:
+    names = []
+    for token in normalize_tokens(text):
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", token):
+            raise ValueError(f"元件名稱格式不合法: {token}")
+        names.append(token)
+    return names
+
+
+def build_component_select_commands(names: list[str], first_type: str = "S",
+                                    next_type: str = "A") -> str:
+    if not names:
+        return ""
+    lines = [f"CMSEL, {first_type}, {names[0]}"]
+    lines.extend(f"CMSEL, {next_type}, {name}" for name in names[1:])
+    return "\n".join(lines)
+
+
+# ── 拓樸鏈：模式表（原樣複製），「從 XXX 得到 YYY」顯示標籤攤平表 ─────────────────
+
+TOPOLOGY_CMSEL_MODE = "COMPONENT 名稱 -> 選取元件/組合 (CMSEL,S/A)"
+
+TOPOLOGY_MODES = {
+    "AREA IDs -> ELEM (ESLA,S)":            {"source": "AREA", "steps": ["ESLA, S"],             "target": "ELEM"},
+    "AREA IDs -> NODE (NSLA,S,1)":          {"source": "AREA", "steps": ["NSLA, S, 1"],           "target": "NODE"},
+    "AREA IDs -> LINE (LSLA,S)":            {"source": "AREA", "steps": ["LSLA, S"],              "target": "LINE"},
+    "AREA IDs -> VOLU (VSLA,S)":            {"source": "AREA", "steps": ["VSLA, S"],              "target": "VOLU"},
+    "LINE IDs -> ELEM (ESLL,S)":            {"source": "LINE", "steps": ["ESLL, S"],              "target": "ELEM"},
+    "LINE IDs -> NODE (NSLL,S,1)":          {"source": "LINE", "steps": ["NSLL, S, 1"],           "target": "NODE"},
+    "LINE IDs -> KP (KSLL,S)":              {"source": "LINE", "steps": ["KSLL, S"],              "target": "KP"},
+    "LINE IDs -> AREA (ASLL,S,0)":          {"source": "LINE", "steps": ["ASLL, S, 0"],           "target": "AREA"},
+    "VOLU IDs -> ELEM (ESLV,S)":            {"source": "VOLU", "steps": ["ESLV, S"],              "target": "ELEM"},
+    "VOLU IDs -> NODE (NSLV,S,1)":          {"source": "VOLU", "steps": ["NSLV, S, 1"],           "target": "NODE"},
+    "VOLU IDs -> AREA (ASLV,S)":            {"source": "VOLU", "steps": ["ASLV, S"],              "target": "AREA"},
+    "NODE IDs -> ELEM (ESLN,S,0 任一節點)": {"source": "NODE", "steps": ["ESLN, S, 0"],           "target": "ELEM"},
+    "NODE IDs -> ELEM (ESLN,S,1 全部節點)": {"source": "NODE", "steps": ["ESLN, S, 1"],           "target": "ELEM"},
+    "NODE IDs -> KP (KSLN,S)":              {"source": "NODE", "steps": ["KSLN, S"],              "target": "KP"},
+    "ELEM IDs -> NODE (NSLE,S,ALL)":        {"source": "ELEM", "steps": ["NSLE, S, ALL"],         "target": "NODE"},
+    "ELEM IDs -> NODE (NSLE,S,CORNER)":     {"source": "ELEM", "steps": ["NSLE, S, CORNER"],      "target": "NODE"},
+    "ELEM IDs -> NODE (NSLE,S,MID)":        {"source": "ELEM", "steps": ["NSLE, S, MID"],         "target": "NODE"},
+    "KP IDs -> LINE (LSLK,S,0)":            {"source": "KP",   "steps": ["LSLK, S, 0"],           "target": "LINE"},
+    "KP IDs -> NODE (NSLK,S)":              {"source": "KP",   "steps": ["NSLK, S"],              "target": "NODE"},
+    "KP IDs -> AREA (LSLK + ASLL)":         {"source": "KP",   "steps": ["LSLK, S, 0", "ASLL, S, 0"], "target": "AREA"},
+    TOPOLOGY_CMSEL_MODE:                     {"kind": "component"},
+}
+
+VARIANT_LABELS = {
+    "NODE IDs -> ELEM (ESLN,S,0 任一節點)": "任一節點在元件內即可 (ESLN,S,0)",
+    "NODE IDs -> ELEM (ESLN,S,1 全部節點)": "節點需全部都在元件內 (ESLN,S,1)",
+    "ELEM IDs -> NODE (NSLE,S,ALL)":        "全部節點 (NSLE,S,ALL)",
+    "ELEM IDs -> NODE (NSLE,S,CORNER)":     "角節點 (NSLE,S,CORNER)",
+    "ELEM IDs -> NODE (NSLE,S,MID)":        "中間節點 (NSLE,S,MID)",
+}
+
+COMPONENT_SOURCE_LABEL = "元件／組合名稱"
+
+_TOPOLOGY_BY_PATH: dict[str, dict[str, list[tuple[str, str]]]] = {}
+for _mode_key, _mode in TOPOLOGY_MODES.items():
+    if _mode.get("kind") == "component":
+        continue
+    _variants = _TOPOLOGY_BY_PATH.setdefault(_mode["source"], {}).setdefault(_mode["target"], [])
+    _variants.append((VARIANT_LABELS.get(_mode_key, ""), _mode_key))
+
+# 攤平成單一下拉選單用的 (顯示標籤, mode_key) 清單：選項多達 20 幾種，
+# 這種量級才適合用下拉選單，和二三選項一律用圈圈點選的原則不衝突。
+TOPOLOGY_DISPLAY_OPTIONS: list[tuple[str, str]] = []
+for _source in sorted(_TOPOLOGY_BY_PATH.keys()):
+    for _target in sorted(_TOPOLOGY_BY_PATH[_source].keys()):
+        _variants = _TOPOLOGY_BY_PATH[_source][_target]
+        for _variant_label, _mode_key in _variants:
+            _label = f"從 {_source} 得到 {_target}"
+            if len(_variants) > 1:
+                _label += f" － {_variant_label}"
+            TOPOLOGY_DISPLAY_OPTIONS.append((_label, _mode_key))
+TOPOLOGY_DISPLAY_OPTIONS.append(
+    (f"從 {COMPONENT_SOURCE_LABEL} 得到 選取結果 － CMSEL,S/A", TOPOLOGY_CMSEL_MODE)
+)
+
+DISPLAY_TO_MODE_KEY = dict(TOPOLOGY_DISPLAY_OPTIONS)
+
+
+# ── ANSYS LOG 轉 APDL：轉換核心（原樣複製自 select.pyw，行為不變）────────────────
 
 ProgressCallback = Callable[[int, Optional[int]], None]
 CancelCheck = Callable[[], bool]
@@ -190,6 +497,14 @@ COMPONENT_COMMANDS = {
     # VOLU
     "VIMP", "VINP", "VINV", "VLIST", "VLSCALE", "VMESH", "VSYMM",
     "VTRAN", "BFV", "BFVDELE", "BFVLIST",
+    # 第二輪查證：文件寫「A component name may be substituted」（少了 also），
+    # 未被第一輪的 grep 措辭抓到，改用「graphical picking is enabled」重新比對後補上。
+    "APTN", "AINP", "AOFFST", "DAMORPH", "NORA", "SFA", "SFADELE", "SFALIST",
+    "LINP", "LPTN", "NORL", "SFLDELE", "SFLLIST",
+    "HPTDELETE", "KESIZE",
+    "SFBEAM", "SFE", "SFEDELE", "TIMP",
+    "CP", "IC", "ICLIST", "SF", "SFLIST", "TRANSFER",
+    "VSWEEP",
 }
 
 DIRECT_COMMAND_LIMITS = {
@@ -253,33 +568,6 @@ def _is_noise_line(line: str) -> bool:
 
 def _is_comment_line(line: str) -> bool:
     return line.lstrip().startswith("!")
-
-
-def compress_numbers_to_ranges(numbers: list[int]) -> list[tuple[int, int, int]]:
-    """Sort, dedupe, and merge numbers into minimal (start, end, step) runs."""
-    if not numbers:
-        return []
-    sorted_nums = sorted(set(numbers))
-    if len(sorted_nums) == 1:
-        n = sorted_nums[0]
-        return [(n, n, 1)]
-    ranges: list[tuple[int, int, int]] = []
-    start = prev = sorted_nums[0]
-    step: int | None = None
-    for cur in sorted_nums[1:]:
-        delta = cur - prev
-        if step is None:
-            step = delta
-            prev = cur
-            continue
-        if delta != step:
-            ranges.append((start, prev, step))
-            start = prev = cur
-            step = None
-        else:
-            prev = cur
-    ranges.append((start, prev, step if step is not None else 1))
-    return ranges
 
 
 def _expand_items(items: list[int]) -> list[int]:
@@ -352,8 +640,8 @@ def _direct_selection_lines(block: _PickBlock, *, compress: bool = False) -> lis
     _entity, select_command, item_label = ENTITY_BY_FLST_TYPE[block.entity_type]
     lines: list[str] = []
     if compress:
-        # 壓縮排序範圍：忽略 log 原本的排列順序，排序、去重後合併成
-        # 最少的等差範圍（與 select.pyw「ID 清單」分頁同一套演算法）。
+        # 壓縮排序範圍：忽略 log 原本的挑選順序，排序、去重後合併成
+        # 最少的等差範圍（與「ID 清單」分頁同一套演算法）。
         for position, (start, end, step) in enumerate(
             compress_numbers_to_ranges(_expand_items(block.items))
         ):
@@ -786,591 +1074,121 @@ def convert_lgw_stream(
     return report
 
 
-def _encoding_decodes(path: Path, encoding: str) -> bool:
-    decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
-    try:
-        with path.open("rb") as binary:
-            while chunk := binary.read(1024 * 1024):
-                decoder.decode(chunk)
-            decoder.decode(b"", final=True)
-        return True
-    except UnicodeDecodeError:
-        return False
+# ── 唯讀但可選取的 Text 元件（LOG 轉 APDL 結果欄用；人性化：可局部選取複製）─────────
 
-
-def detect_text_encoding(path: str | os.PathLike[str]) -> str:
-    source_path = Path(path)
-    with source_path.open("rb") as binary:
-        prefix = binary.read(3)
-    if prefix.startswith(codecs.BOM_UTF8):
-        return "utf-8-sig"
-    for encoding in ("utf-8", "cp950", "gb18030"):
-        if _encoding_decodes(source_path, encoding):
-            return encoding
-    raise UnicodeError("無法以 UTF-8、CP950 或 GB18030 解碼輸入檔。")
-
-
-def convert_lgw_file(
-    input_path: str | os.PathLike[str],
-    output_path: str | os.PathLike[str],
-    *,
-    cleanup: bool = True,
-    strip_comments: bool = False,
-    compress_ranges: bool = False,
-    cancel_event: object | None = None,
-    progress_callback: ProgressCallback | None = None,
-    overwrite: bool = False,
-) -> ConversionReport:
-    """Convert one file atomically to UTF-8 (without BOM) and LF endings."""
-    source_path = Path(input_path).expanduser().resolve()
-    destination_path = Path(output_path).expanduser().resolve()
-    if source_path == destination_path:
-        raise ValueError("輸入與輸出檔案不可相同。")
-    if not source_path.is_file():
-        raise FileNotFoundError(f"找不到輸入檔：{source_path}")
-    if destination_path.exists() and not overwrite:
-        raise FileExistsError(f"輸出檔已存在：{destination_path}")
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-
-    encoding = detect_text_encoding(source_path)
-    cancel_check: CancelCheck | None = None
-    if cancel_event is not None:
-        is_set = getattr(cancel_event, "is_set", None)
-        if not callable(is_set):
-            raise TypeError("cancel_event 必須提供 is_set() 方法。")
-        cancel_check = is_set
-
-    temporary_name: str | None = None
-    try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination_path.name}.",
-            suffix=".tmp",
-            dir=destination_path.parent,
-        )
-        os.close(descriptor)
-        with source_path.open("r", encoding=encoding, errors="strict", newline=None) as source:
-            names = _scan_identifiers(source)
-            prefix = _choose_temp_prefix_from_names(names)
-            with open(
-                temporary_name,
-                "w",
-                encoding="utf-8",
-                errors="strict",
-                newline="\n",
-            ) as sink:
-                report = convert_lgw_stream(
-                    source,
-                    sink,
-                    cleanup=cleanup,
-                    strip_comments=strip_comments,
-                    compress_ranges=compress_ranges,
-                    cancel_check=cancel_check,
-                    progress_callback=progress_callback,
-                    temp_prefix=prefix,
-                )
-        report.input_encoding = encoding
-        if cancel_check is not None and cancel_check():
-            raise ConversionCancelled("使用者已取消轉換。")
-        os.replace(temporary_name, destination_path)
-        temporary_name = None
-        return report
-    finally:
-        if temporary_name is not None:
-            try:
-                os.unlink(temporary_name)
-            except FileNotFoundError:
-                pass
-
-
-# ── 設定檔路徑 ─────────────────────────────────────────────────────────────────
-
-SETTINGS_FILE = Path(__file__).parent / "select_settings.json"
-
-# ── 常數 ───────────────────────────────────────────────────────────────────────
-
-ENTITY_INFO = {
-    "AREA": {"sel": "ASEL", "id_item": "AREA", "cm_item": "AREA"},
-    "LINE": {"sel": "LSEL", "id_item": "LINE", "cm_item": "LINE"},
-    "VOLU": {"sel": "VSEL", "id_item": "VOLU", "cm_item": "VOLU"},
-    "NODE": {"sel": "NSEL", "id_item": "NODE", "cm_item": "NODE"},
-    "ELEM": {"sel": "ESEL", "id_item": "ELEM", "cm_item": "ELEM"},
-    "KP":   {"sel": "KSEL", "id_item": "KP",   "cm_item": "KP"},
-}
-
-TOPOLOGY_CMSEL_MODE = "COMPONENT 名稱 -> 選取元件/組合 (CMSEL,S/A)"
-
-TOPOLOGY_MODES = {
-    "AREA IDs -> ELEM (ESLA,S)":            {"source": "AREA", "steps": ["ESLA, S"],             "target": "ELEM"},
-    "AREA IDs -> NODE (NSLA,S,1)":          {"source": "AREA", "steps": ["NSLA, S, 1"],           "target": "NODE"},
-    "AREA IDs -> LINE (LSLA,S)":            {"source": "AREA", "steps": ["LSLA, S"],              "target": "LINE"},
-    "AREA IDs -> VOLU (VSLA,S)":            {"source": "AREA", "steps": ["VSLA, S"],              "target": "VOLU"},
-    "LINE IDs -> ELEM (ESLL,S)":            {"source": "LINE", "steps": ["ESLL, S"],              "target": "ELEM"},
-    "LINE IDs -> NODE (NSLL,S,1)":          {"source": "LINE", "steps": ["NSLL, S, 1"],           "target": "NODE"},
-    "LINE IDs -> KP (KSLL,S)":              {"source": "LINE", "steps": ["KSLL, S"],              "target": "KP"},
-    "LINE IDs -> AREA (ASLL,S,0)":          {"source": "LINE", "steps": ["ASLL, S, 0"],           "target": "AREA"},
-    "VOLU IDs -> ELEM (ESLV,S)":            {"source": "VOLU", "steps": ["ESLV, S"],              "target": "ELEM"},
-    "VOLU IDs -> NODE (NSLV,S,1)":          {"source": "VOLU", "steps": ["NSLV, S, 1"],           "target": "NODE"},
-    "VOLU IDs -> AREA (ASLV,S)":            {"source": "VOLU", "steps": ["ASLV, S"],              "target": "AREA"},
-    "NODE IDs -> ELEM (ESLN,S,0 任一節點)": {"source": "NODE", "steps": ["ESLN, S, 0"],           "target": "ELEM"},
-    "NODE IDs -> ELEM (ESLN,S,1 全部節點)": {"source": "NODE", "steps": ["ESLN, S, 1"],           "target": "ELEM"},
-    "NODE IDs -> KP (KSLN,S)":              {"source": "NODE", "steps": ["KSLN, S"],              "target": "KP"},
-    "ELEM IDs -> NODE (NSLE,S,ALL)":        {"source": "ELEM", "steps": ["NSLE, S, ALL"],         "target": "NODE"},
-    "ELEM IDs -> NODE (NSLE,S,CORNER)":     {"source": "ELEM", "steps": ["NSLE, S, CORNER"],      "target": "NODE"},
-    "ELEM IDs -> NODE (NSLE,S,MID)":        {"source": "ELEM", "steps": ["NSLE, S, MID"],         "target": "NODE"},
-    "KP IDs -> LINE (LSLK,S,0)":            {"source": "KP",   "steps": ["LSLK, S, 0"],           "target": "LINE"},
-    "KP IDs -> NODE (NSLK,S)":              {"source": "KP",   "steps": ["NSLK, S"],              "target": "NODE"},
-    "KP IDs -> AREA (LSLK + ASLL)":         {"source": "KP",   "steps": ["LSLK, S, 0", "ASLL, S, 0"], "target": "AREA"},
-    TOPOLOGY_CMSEL_MODE:                     {"kind": "component"},
-}
-
-# 後續疊加模式選項（顯示標籤, 值）
-NEXT_TYPE_OPTIONS = [
-    ("再加入 (A)", "A"),
-    ("取交集 (R)", "R"),
-    ("排除這些 IDs (U)", "U"),
-]
-
-# Box／區域選取方式
-BOX_SELECTION_OPTIONS = [
-    ("重新選擇 (S)", "S"),
-    ("再加入 (A)", "A"),
-    ("取交集 (R)", "R"),
-    ("排除這些 IDs (U)", "U"),
-]
-BOX_REFINE_OPTIONS = [option for option in BOX_SELECTION_OPTIONS if option[1] != "S"]
-
-HEADER_HELP_GAP = 12
-ID_COMPONENT_ENTRY_WIDTH = 10
-DEFAULT_SELTOL = "1e-6"
-SELTOL_COMMAND = f"SELTOL, {DEFAULT_SELTOL}"
-OUTPUT_ACTION_BUTTON_WIDTHS = {
-    "複製結果": 8,
-    "清空輸出": 8,
-    "插入分隔線": 10,
-}
-
-LEGACY_TAB_ORDER = (
-    "ID 清單",
-    "ID 範圍",
-    "Box / 區域",
-    "拓樸鏈",
-    "元件操作",
-)
-
-REMOVED_RANGE_SETTING_KEYS = (
-    "range_entity",
-    "range_sel_type",
-    "range_start",
-    "range_end",
-    "range_inc",
-    "range_cm_name",
-)
-
-BoxBound = Union[float, str]
-
-DEFAULT_SETTINGS: dict = {
-    "geometry":       "980x760",
-    "active_tab":     "ID 清單",
-    # ID 清單
-    "id_entity":      "AREA",
-    "id_style":       "逐一加選",
-    "id_next_type":   "A",
-    "id_cm_name":     "",
-    "id_add_seltol":  False,
-    # Box
-    "box_entity":       "ELEM",
-    "box_first_type":   "S",
-    "box_refine_type":  "R",
-    "box_x1": "0", "box_x2": "10",
-    "box_y1": "",  "box_y2": "",
-    "box_z1": "",  "box_z2": "",
-    "box_cm_name":  "",
-    "box_add_seltol": False,
-    # 拓樸鏈
-    "topo_mode":      list(TOPOLOGY_MODES.keys())[0],
-    "topo_id_style":  "逐一加選",
-    "topo_cm_name":   "",
-    # 元件操作（位於 Box / 區域分頁）
-    "comp_next_type":   "A",
-    "comp_post":        "無",
-    "comp_save_name":   "",
-    "comp_save_entity": "ELEM",
-    "comp_with_none":   False,
-    # LOG 轉 APDL
-    "log_cleanup":         True,
-    "log_strip_comments":  False,
-    "log_compress_ranges": False,
-    # 全域
-    "append_mode":    False,
-    "add_allsel_end": False,
+_READONLY_ALLOWED_KEYSYMS = {
+    "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+    "Shift_L", "Shift_R", "Control_L", "Control_R", "Tab",
 }
 
 
-def load_settings() -> dict:
-    try:
-        if SETTINGS_FILE.exists():
-            with SETTINGS_FILE.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            return {**DEFAULT_SETTINGS, **data}
-    except Exception:
-        pass
-    return dict(DEFAULT_SETTINGS)
+def _make_readonly_but_selectable(text_widget: tk.Text) -> None:
+    """保留滑鼠拖曳選取／Ctrl+C 複製的能力，但擋掉所有會修改內容的按鍵。"""
+
+    def _on_key(event: tk.Event) -> str | None:
+        ctrl_pressed = bool(event.state & 0x4)
+        if ctrl_pressed and event.keysym.lower() in ("c", "a"):
+            return None
+        if event.keysym in _READONLY_ALLOWED_KEYSYMS:
+            return None
+        return "break"
+
+    text_widget.bind("<Key>", _on_key)
+    text_widget.bind("<<Paste>>", lambda _e: "break")
+    text_widget.bind("<<Cut>>", lambda _e: "break")
 
 
-def save_settings(data: dict) -> None:
-    try:
-        with SETTINGS_FILE.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+def _select_all(text_widget: tk.Text) -> None:
+    text_widget.tag_add("sel", "1.0", "end-1c")
+    text_widget.mark_set("insert", "end-1c")
+    text_widget.see("insert")
 
 
-# ── ANSYS 輸出智慧解析輔助 ────────────────────────────────────────────────────────
+def _bind_select_all_shortcut(text_widget: tk.Text) -> None:
+    """Tk 的 Text 預設 Ctrl+A 是「移到行首」（Emacs 習慣），改綁成真正的全選。"""
 
-# 屬性賦值雜訊的正規式：MAT= 1, DSYS= 0, LOAD STEP= 1, TIME= 1.000 ...
-# 使用 [A-Za-z][A-Za-z0-9_ ]* 允許含空格的多詞鍵值（如 LOAD STEP、LOAD CASE）
-_ANSYS_ATTR_RE = re.compile(r'\b[A-Za-z][A-Za-z0-9_ ]*=\s*[\d.eE+\-]+')
+    def _on_ctrl_a(_event: tk.Event) -> str:
+        _select_all(text_widget)
+        return "break"
 
-# 這些 LIST 指令的輸出，每列資料含多個整數欄位（MAT/TYP/KP1/KP2/NDIV…）
-# 只需取每列的「第一個整數」（= 實體 ID）
-_FIRST_COL_HEADERS = (
-    "LIST ALL SELECTED ELEMENTS",   # ELIST：ELEM + MAT/TYP/REL/ESY/SEC + NODES
-    "LIST ALL SELECTED AREAS",      # ALIST：AREA + MAT=/TYPE=/REAL= + L= 行號
-    "LIST ALL SELECTED LINES",      # LLIST：LINE + KP1/KP2/NDIV + XSYM
-    "LIST ALL SELECTED KEYPOINTS",  # KLIST：KP + KNODE/KANGLE/KCSK (X/Y/Z 為浮點)
-    "LIST ALL SELECTED VOLUMES",    # VLIST：VOLU + MAT=/TYPE=/REAL= + A= 面號
-)
-
-# ── 純邏輯函式 ─────────────────────────────────────────────────────────────────
-
-def normalize_tokens(text: str) -> list[str]:
-    raw = text.strip()
-    if not raw:
-        return []
-    raw = re.sub(r"[,\uFF0C;\uFF1B]+", " ", raw)
-    return [tok for tok in re.split(r"\s+", raw) if tok]
+    text_widget.bind("<Control-a>", _on_ctrl_a)
+    text_widget.bind("<Control-A>", _on_ctrl_a)
 
 
-def expand_range_token(token: str) -> list[int]:
-    if re.fullmatch(r"\d+", token):
-        return [int(token)]
-    m = re.fullmatch(r"(\d+)\s*[-:~]\s*(\d+)(?:\s*:\s*(\d+))?", token)
-    if not m:
-        raise ValueError(f"格式錯誤: {token}，支援 12、1-10、1:10:2")
-    start, end = int(m.group(1)), int(m.group(2))
-    step = int(m.group(3)) if m.group(3) else 1
-    if step == 0:
-        raise ValueError("步長不能是 0。")
-    if start > end and step > 0:
-        step = -step
-    if start < end and step < 0:
-        step = -step
-    out, val = [], start
-    if step > 0:
-        while val <= end:
-            out.append(val); val += step
-    else:
-        while val >= end:
-            out.append(val); val += step
-    return out
+DEFAULT_FONT_SIZE = 10
+MIN_FONT_SIZE = 8
+MAX_FONT_SIZE = 24
 
 
-def parse_numbers(text: str) -> list[int]:
-    """
-    解析 ID 輸入，支援以下所有格式：
+# ── GUI：五個分頁（ID 清單／Box／元件操作／拓樸鏈／LOG 轉 APDL）共用一個輸出結果視窗 ──
+# 分頁的下拉選單／圈圈點選統一原則：
+#   - 2~4 個選項（輸出模式、S/A/R/U 疊加模式、後處理…）一律用 Radiobutton，
+#     不需要多一次點擊展開，切換時也能一眼看到目前選的是哪個。
+#   - 選項多到十幾二十個以上（拓樸鏈的「從 X 得到 Y」）才用 Combobox，
+#     否則一排塞滿圈圈反而更難找。
 
-    手動輸入
-        整數（12）、減號/冒號/波浪號範圍（1-10、1:10:2、1~10）
-
-    ANSYS 任意 LIST 指令輸出（直接貼上即可）
-        CMLIST  → 子元件列表，子元件行縮排大，所有純整數皆為 ID
-        NLIST   → NODE 整數 + X/Y/Z 浮點，只有 NODE 是純整數 → 自動正確
-        ELIST   → ELEM/MAT/TYP/… 皆整數，採首欄模式只取 ELEM
-        ALIST   → AREA + MAT=N TYPE=N … L= 行號，採首欄模式只取 AREA
-        LLIST   → LINE + KP1/KP2/NDIV…，採首欄模式只取 LINE
-        KLIST   → KP + X/Y/Z(浮點) + KNODE…，採首欄模式只取 KP
-        VLIST   → VOLU + MAT=N … A= 面號，採首欄模式只取 VOLU
-        PRNSOL  → NODE 整數 + 結果科學記號（非純整數），自動只取 NODE
-        PRRSOL  → 同 PRNSOL
-        PRETAB  → ELEM 整數 + 浮點結果，自動只取 ELEM
-
-    其他雜訊（中文、英文標頭、WORD= value 賦值）一律靜默略過。
-    """
-    if not text.strip():
-        return []
-
-    upper = text.upper()
-
-    # ── 首欄模式：ELIST / ALIST / LLIST / KLIST / VLIST ──────────────────────
-    # 這幾個 list 的資料列含多個整數欄位，只取縮排 ≤ 15 的列之第一個整數（= 實體 ID）
-    # 縮排 > 15 的行視為 ELIST 多節點 continuation 行，直接跳過
-    if any(kw in upper for kw in _FIRST_COL_HEADERS):
-        numbers = []
-        for line in text.splitlines():
-            stripped = line.lstrip()
-            if not stripped:
-                continue
-            if len(line) - len(stripped) > 15:
-                continue                         # continuation 行，跳過
-            m = re.match(r'(\d+)', stripped)
-            if m:
-                numbers.append(int(m.group(1)))
-        return numbers
-
-    # ── 預設模式：先清除 WORD= value 屬性雜訊，再取所有純整數與 Range ─────────
-    # 適用：CMLIST / NLIST / PRNSOL / PRRSOL / PRETAB / 手動輸入
-    # 清除後：DSYS= 0, LOAD STEP= 1, MAT= 1 … 等雜訊不再干擾
-    cleaned = _ANSYS_ATTR_RE.sub('', text)
-    numbers = []
-    for token in normalize_tokens(cleaned):
-        if re.fullmatch(r"\d+", token):
-            numbers.append(int(token))
-        elif re.fullmatch(r"\d+\s*[-:~]\s*\d+(?:\s*:\s*\d+)?", token):
-            try:
-                numbers.extend(expand_range_token(token))
-            except ValueError:
-                pass
-        # else: 靜默略過（ANSYS 標頭、中文、元件名稱、科學記號結果值…）
-    return numbers
-
-
-def parse_component_names(text: str) -> list[str]:
-    names = []
-    for token in normalize_tokens(text):
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", token):
-            raise ValueError(f"元件名稱格式不合法: {token}")
-        names.append(token)
-    return names
-
-
-def build_component_select_commands(names: list[str], first_type: str = "S",
-                                    next_type: str = "A") -> str:
-    if not names:
-        return ""
-    lines = [f"CMSEL, {first_type}, {names[0]}"]
-    lines.extend(f"CMSEL, {next_type}, {name}" for name in names[1:])
-    return "\n".join(lines)
-
-
-def parse_box_bound_optional(text: str, field_name: str) -> BoxBound | None:
-    s = text.strip()
-    if not s:
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", s):
-            return s
-        raise ValueError(
-            f"{field_name} 必須是數值或有效的 APDL 純量變數名稱"
-            "（英文字母開頭，僅限英數與底線，最多 32 字元）。"
-        )
-
-
-def format_id_select_line(sel_cmd: str, sel_type: str, item: str,
-                           id1: int, id2: int | None = None, inc: int | None = None) -> str:
-    if id2 is None:
-        return f"{sel_cmd}, {sel_type}, {item}, , {id1}"
-    if inc is None or inc == 1:
-        return f"{sel_cmd}, {sel_type}, {item}, , {id1}, {id2}"
-    return f"{sel_cmd}, {sel_type}, {item}, , {id1}, {id2}, {inc}"
-
-
-def build_id_list_commands(entity: str, numbers: list[int],
-                            style: str, first_type: str, next_type: str) -> str:
-    if entity not in ENTITY_INFO:
-        raise ValueError(f"不支援的實體類型: {entity}")
-    if not numbers:
-        return ""
-    sel_cmd = ENTITY_INFO[entity]["sel"]
-    item = ENTITY_INFO[entity]["id_item"]
-    if style == "逐一加選":
-        lines = [format_id_select_line(sel_cmd, first_type, item, numbers[0])]
-        for num in numbers[1:]:
-            lines.append(format_id_select_line(sel_cmd, next_type, item, num))
-        return "\n".join(lines)
-    # 壓縮排序範圍
-    ranges = compress_numbers_to_ranges(numbers)
-    lines = []
-    for i, (start, end, inc) in enumerate(ranges):
-        sel_type = first_type if i == 0 else next_type
-        if start == end:
-            lines.append(format_id_select_line(sel_cmd, sel_type, item, start))
-        else:
-            lines.append(format_id_select_line(sel_cmd, sel_type, item, start, end, inc))
-    return "\n".join(lines)
-
-
-def build_box_commands(entity: str, first_type: str, refine_type: str,
-                        x_pair: tuple[BoxBound, BoxBound] | None,
-                        y_pair: tuple[BoxBound, BoxBound] | None,
-                        z_pair: tuple[BoxBound, BoxBound] | None) -> str:
-    if entity not in ENTITY_INFO:
-        raise ValueError(f"Box 模式不支援此實體類型: {entity}")
-    sel_cmd = ENTITY_INFO[entity]["sel"]
-    item = "CENT" if entity == "ELEM" else "LOC"
-    axes = []
-    if x_pair is not None: axes.append(("X", x_pair))
-    if y_pair is not None: axes.append(("Y", y_pair))
-    if z_pair is not None: axes.append(("Z", z_pair))
-    if not axes:
-        raise ValueError("X/Y/Z 至少要填一組範圍。")
-    lines = []
-    for i, (axis, (vmin, vmax)) in enumerate(axes):
-        stype = first_type if i == 0 else refine_type
-        lines.append(f"{sel_cmd}, {stype}, {item}, {axis}, {vmin}, {vmax}")
-    return "\n".join(lines)
-
-
-def append_cm_line(lines: list[str], cm_name: str, entity: str) -> None:
-    name = cm_name.strip()
-    if not name:
-        return
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", name):
-        raise ValueError("元件名稱不合法，需英文字母開頭，且只含英數底線。")
-    lines.append(f"CM, {name}, {entity}")
-
-
-# ── GUI ────────────────────────────────────────────────────────────────────────
-
-class APDLSelectorGUI:
+class MergedSelectToolGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self._closing = False
-        self._pane_minimum_job: str | None = None
-        self._id_pane_minimums: tuple[int, int] | None = None
-        self._main_top_minimum: int | None = None
         self.root.title("APDL 選取語法工具箱")
-        self.settings = load_settings()
-        self.root.geometry(self.settings.get("geometry", "980x760"))
-        self.root.minsize(560, 480)
+        self.root.geometry("1000x820")
+        self.root.minsize(760, 640)
+
+        self.log_text_font = tkfont.Font(family="Consolas", size=DEFAULT_FONT_SIZE)
+        self.log_gutter_font = tkfont.Font(family="Consolas", size=DEFAULT_FONT_SIZE)
+
+        action_style = ttk.Style(self.root)
+        action_style.configure("RedAction.TButton", foreground="red")
+        action_style.map("RedAction.TButton", foreground=[("!disabled", "red")])
+        option_style = ttk.Style(self.root)
+        option_style.configure("BlueOption.TCheckbutton", foreground="blue")
+        option_style.map("BlueOption.TCheckbutton", foreground=[("!disabled", "blue")])
+
         self.build_ui()
-        self._apply_settings()
-        self._schedule_pane_minimum_update()
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-    # ── 設定存取 ────────────────────────────────────────────────────────────────
-
-    def _on_close(self) -> None:
-        self._closing = True
-        self._collect_settings()
-        save_settings(self.settings)
-        self.root.destroy()
-
-    def _collect_settings(self) -> None:
-        s = self.settings
-        for key in REMOVED_RANGE_SETTING_KEYS:
-            s.pop(key, None)
-        s["geometry"]       = self.root.geometry()
-        s["active_tab"]     = self.notebook.tab(self.notebook.select(), "text")
-        s["id_entity"]      = self.id_entity.get()
-        s["id_style"]       = self.id_style.get()
-        s["id_next_type"]   = self.id_next_type.get()
-        s["id_cm_name"]     = self.id_cm_name.get()
-        s["id_add_seltol"]  = self.id_add_seltol.get()
-        s["box_entity"]     = self.box_entity.get()
-        s["box_first_type"] = self.box_first_type.get()
-        s["box_refine_type"]= self.box_refine_type.get()
-        s["box_x1"]         = self.box_x1.get()
-        s["box_x2"]         = self.box_x2.get()
-        s["box_y1"]         = self.box_y1.get()
-        s["box_y2"]         = self.box_y2.get()
-        s["box_z1"]         = self.box_z1.get()
-        s["box_z2"]         = self.box_z2.get()
-        s["box_cm_name"]    = self.box_cm_name.get()
-        s["box_add_seltol"] = self.box_add_seltol.get()
-        s["topo_mode"]      = self.topo_mode.get()
-        s["topo_id_style"]  = self.topo_id_style.get()
-        s["topo_cm_name"]   = self.topo_cm_name.get()
-        s["comp_next_type"] = self.comp_next_type.get()
-        s["comp_post"]      = self.comp_post.get()
-        s["comp_save_name"] = self.comp_save_name.get()
-        s["comp_save_entity"]= self.comp_save_entity.get()
-        s["comp_with_none"] = self.comp_with_none.get()
-        s["log_cleanup"] = self.log_cleanup.get()
-        s["log_strip_comments"] = self.log_strip_comments.get()
-        s["log_compress_ranges"] = self.log_compress_ranges.get()
-        s["append_mode"]    = self.append_mode.get()
-        s["add_allsel_end"] = self.add_allsel_end.get()
-
-    def _apply_settings(self) -> None:
-        s = self.settings
-        self.id_entity.set(s.get("id_entity", "AREA"))
-        self.id_style.set(s.get("id_style", "逐一加選"))
-        self.id_next_type.set(s.get("id_next_type", "A"))
-        self.id_cm_name.set(s.get("id_cm_name", ""))
-        self.id_add_seltol.set(s.get("id_add_seltol", False))
-        self.box_entity.set(s.get("box_entity", "ELEM"))
-        self.box_first_type.set(s.get("box_first_type", "S"))
-        self.box_refine_type.set(s.get("box_refine_type", "R"))
-        self.box_x1.set(s.get("box_x1", "0"))
-        self.box_x2.set(s.get("box_x2", "10"))
-        self.box_y1.set(s.get("box_y1", ""))
-        self.box_y2.set(s.get("box_y2", ""))
-        self.box_z1.set(s.get("box_z1", ""))
-        self.box_z2.set(s.get("box_z2", ""))
-        self.box_cm_name.set(s.get("box_cm_name", ""))
-        self.box_add_seltol.set(s.get("box_add_seltol", False))
-        topo = s.get("topo_mode", list(TOPOLOGY_MODES.keys())[0])
-        self.topo_mode.set(topo if topo in TOPOLOGY_MODES else list(TOPOLOGY_MODES.keys())[0])
-        self.topo_id_style.set(s.get("topo_id_style", "逐一加選"))
-        self.topo_cm_name.set(s.get("topo_cm_name", ""))
         self._update_topology_mode_ui()
-        self.comp_next_type.set(s.get("comp_next_type", "A"))
-        self.comp_post.set(s.get("comp_post", "無"))
-        self.comp_save_name.set(s.get("comp_save_name", ""))
-        self.comp_save_entity.set(s.get("comp_save_entity", "ELEM"))
-        self.comp_with_none.set(s.get("comp_with_none", False))
-        self.log_cleanup.set(s.get("log_cleanup", True))
-        self.log_strip_comments.set(s.get("log_strip_comments", False))
-        self.log_compress_ranges.set(s.get("log_compress_ranges", False))
-        self.append_mode.set(s.get("append_mode", False))
-        self.add_allsel_end.set(s.get("add_allsel_end", False))
-        saved_tab = s.get("active_tab", "ID 清單")
-        if isinstance(saved_tab, int):
-            if 0 <= saved_tab < len(LEGACY_TAB_ORDER):
-                saved_tab = LEGACY_TAB_ORDER[saved_tab]
-            else:
-                saved_tab = "ID 清單"
-        if saved_tab == "ID 範圍":
-            saved_tab = "ID 清單"
-        elif saved_tab == "元件操作":
-            saved_tab = "Box / 區域"
-        for tab_id in self.notebook.tabs():
-            if self.notebook.tab(tab_id, "text") == saved_tab:
-                self.notebook.select(tab_id)
-                break
+        self._on_tab_changed()
 
-    # ── UI 建構 ─────────────────────────────────────────────────────────────────
+    # ── 共用小工具 ───────────────────────────────────────────────────────────
+
+    def _section_title(self, parent: tk.Widget, text: str) -> None:
+        ttk.Label(
+            parent, text=text, font=("Microsoft JhengHei UI", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+    def _section_title_grid(self, parent: tk.Widget, text: str, row: int) -> None:
+        ttk.Label(
+            parent, text=text, font=("Microsoft JhengHei UI", 10, "bold"),
+        ).grid(row=row, column=0, sticky="w", pady=(0, 4))
+
+    def _new_tab_pane(self, tab_text: str) -> tk.PanedWindow:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text=tab_text)
+        pane = tk.PanedWindow(tab, orient="vertical", borderwidth=0, sashwidth=6, sashrelief="raised")
+        pane.pack(fill="both", expand=True)
+        return pane
+
+    # ── 整體版面 ─────────────────────────────────────────────────────────────
 
     def build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=10)
         main.pack(fill="both", expand=True)
 
-        header = ttk.Frame(main)
-        header.pack(fill="x", pady=(0, 6))
-        header.columnconfigure(1, weight=1)
-        self.title_label = ttk.Label(
-            header,
+        ttk.Label(
+            main,
             text="APDL 選取語法工具箱",
             font=("Microsoft JhengHei UI", 13, "bold"),
-        )
-        self.title_label.grid(row=0, column=0, sticky="nw")
-        self.header_help = ttk.Label(
-            header,
-            text="支援 ID 清單 / Box / 拓樸鏈 / 元件操作；"
+        ).pack(anchor="w", pady=(0, 2))
+        ttk.Label(
+            main,
+            text="ID 清單／Box／元件操作／拓樸鏈共用下方「輸出結果」視窗；"
                  "可直接貼入 ANSYS LIST 輸出（CMLIST/NLIST/ELIST/ALIST/LLIST/KLIST/VLIST/PRNSOL 等）自動解析。",
             foreground="gray",
             justify="left",
-        )
-        self.header_help.grid(row=0, column=1, sticky="ew", padx=(HEADER_HELP_GAP, 0))
-        header.bind("<Configure>", self._resize_header_help, add="+")
+        ).pack(anchor="w", pady=(0, 8))
 
-        # ── 垂直分割：上方（頁籤 + 全域選項）/ 下方（輸出區）可拖曳調整 ──
         self.main_pane = tk.PanedWindow(main, orient="vertical", borderwidth=0)
         self.main_pane.pack(fill="both", expand=True)
 
-        # 上方框架
         self.top_frame = ttk.Frame(self.main_pane)
         self.main_pane.add(self.top_frame, minsize=1, stretch="always")
 
@@ -1379,646 +1197,91 @@ class APDLSelectorGUI:
 
         self.build_tab_id_list()
         self.build_tab_box()
+        self.build_tab_component()
         self.build_tab_topology()
         self.build_tab_log_converter()
 
-        # 下方框架（輸出區）
         self.bot_frame = ttk.Frame(self.main_pane)
         self.main_pane.add(self.bot_frame, minsize=1, stretch="always")
-
-        ttk.Label(self.bot_frame, text="輸出結果：").pack(anchor="w", pady=(4, 2))
-        self.output_text = tk.Text(self.bot_frame, height=8, wrap="none")
-        self.output_text.pack(fill="both", expand=True)
+        self.build_shared_output(self.bot_frame)
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
-        self._on_tab_changed()
+
+    def _current_tab_text(self) -> str:
+        return self.notebook.tab(self.notebook.select(), "text")
 
     def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
-        """LOG 轉 APDL 分頁有自己的左右轉換結果區，用不到下方共用的「輸出結果」面板。"""
-        is_log_tab = self.notebook.tab(self.notebook.select(), "text") == "LOG 轉 APDL"
+        """LOG 轉 APDL 分頁有自己的左右轉換結果區，用不到共用的「輸出結果」面板。"""
+        is_log = self._current_tab_text() == "LOG 轉 APDL"
         bot_visible = str(self.bot_frame) in {str(pane) for pane in self.main_pane.panes()}
-        if is_log_tab and bot_visible:
+        if is_log and bot_visible:
             self.main_pane.forget(self.bot_frame)
-        elif not is_log_tab and not bot_visible:
+        elif not is_log and not bot_visible:
             self.main_pane.add(self.bot_frame, minsize=1, stretch="always")
+        if not is_log:
+            self._refresh_shared_toolbar()
 
-    def _resize_header_help(self, event: tk.Event) -> None:
-        available_width = max(
-            event.width - self.title_label.winfo_reqwidth() - HEADER_HELP_GAP,
-            1,
-        )
-        self.header_help.configure(wraplength=available_width)
+    # ── 共用輸出結果視窗 ─────────────────────────────────────────────────────
 
-    def _resize_id_input1_help(self, event: tk.Event) -> None:
-        """依主要輸入區寬度換行，並同步更新可拖曳窗格的安全高度。"""
-        self.id_input1_help.configure(wraplength=max(event.width, 1))
-        self._schedule_pane_minimum_update()
+    def build_shared_output(self, parent: tk.Widget) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+        self._section_title_grid(parent, "輸出結果", row=0)
 
-    def _resize_box_value_help(self, event: tk.Event) -> None:
-        self.box_value_help.configure(wraplength=max(event.width, 1))
-        self._schedule_pane_minimum_update()
-
-    def _resize_topology_help(self, event: tk.Event) -> None:
-        self.topo_help_label.configure(wraplength=max(event.width, 1))
-        self._schedule_pane_minimum_update()
-
-    def _update_topology_mode_ui(self, _event: tk.Event | None = None) -> None:
-        is_cmsel = self.topo_mode.get() == TOPOLOGY_CMSEL_MODE
-        if is_cmsel:
-            self.topo_source_label.configure(text="元件／組合名稱")
-            self.topo_style_label.configure(text="ID 輸出（不適用）")
-            self.topo_style_combo.configure(state="disabled")
-            self.topo_help_label.configure(
-                text="支援多筆元件或組合名稱（空白／逗號／分號分隔）；"
-                     "第一筆使用 CMSEL,S，後續使用 CMSEL,A。"
-            )
-            self.topo_save_label.configure(text="儲存最終結果元件（不適用）：")
-            self.topo_save_entry.configure(state="disabled")
-            self.topo_generate_button.configure(text="產生 CMSEL")
-        else:
-            self.topo_source_label.configure(text="來源 IDs")
-            self.topo_style_label.configure(text="ID 輸出")
-            self.topo_style_combo.configure(state="readonly")
-            self.topo_help_label.configure(
-                text="可直接貼入任何 ANSYS LIST 輸出"
-                     "（CMLIST/NLIST/ALIST/LLIST/KLIST 等），"
-                     "自動識別並萃取來源實體 ID"
-            )
-            self.topo_save_label.configure(text="儲存最終結果元件：")
-            self.topo_save_entry.configure(state="normal")
-            self.topo_generate_button.configure(text="產生拓樸鏈")
-        self._schedule_pane_minimum_update()
-
-    def _schedule_pane_minimum_update(self) -> None:
-        if self._pane_minimum_job is None:
-            self._pane_minimum_job = self.root.after_idle(self._update_pane_minimums)
-
-    @staticmethod
-    def _minimum_text_height(text_widget: tk.Text) -> int:
-        visible_rows = max(int(text_widget.cget("height")), 1)
-        return max(text_widget.winfo_reqheight() // visible_rows, 1)
-
-    def _update_pane_minimums(self) -> None:
-        """限制分隔線，避免 Text 區縮放時裁掉灰色提示文字。"""
-        self._pane_minimum_job = None
-        try:
-            self.root.update_idletasks()
-
-            primary_minimum = (
-                self.id_input1_help.winfo_reqheight()
-                + self.id_seltol_check.winfo_reqheight()
-                + self._minimum_text_height(self.id_input1)
-                + 4
-            )
-            secondary_minimum = (
-                self.id_secondary_controls.winfo_reqheight()
-                + self.id_input2_help.winfo_reqheight()
-                + self._minimum_text_height(self.id_input2)
-                + 6
-            )
-            id_minimums = (primary_minimum, secondary_minimum)
-            if id_minimums != self._id_pane_minimums:
-                self.id_input_pane.paneconfigure(
-                    self.id_primary_area, minsize=primary_minimum
-                )
-                self.id_input_pane.paneconfigure(
-                    self.id_secondary_area, minsize=secondary_minimum
-                )
-                self._id_pane_minimums = id_minimums
-                self.root.update_idletasks()
-
-            top_minimum = self.top_frame.winfo_reqheight()
-            if top_minimum != self._main_top_minimum:
-                self.main_pane.paneconfigure(self.top_frame, minsize=top_minimum)
-                self._main_top_minimum = top_minimum
-        except tk.TclError:
-            pass
-
-    def _entity_radio_row(self, parent: tk.Widget, var: tk.StringVar,
-                          entities: list[str] | None = None) -> ttk.Frame:
-        """建立橫排 RadioButton 實體選擇列。"""
-        if entities is None:
-            entities = list(ENTITY_INFO.keys())
-        frame = ttk.Frame(parent)
-        for ent in entities:
-            ttk.Radiobutton(frame, text=ent, variable=var, value=ent).pack(side="left", padx=(0, 6))
-        return frame
-
-    def _type_radio_row(self, parent: tk.Widget, var: tk.StringVar,
-                         options: list[tuple[str, str]]) -> ttk.Frame:
-        """建立橫排 RadioButton 選取類型列。options = [(顯示文字, 值), ...]"""
-        frame = ttk.Frame(parent)
-        for label, val in options:
-            ttk.Radiobutton(frame, text=label, variable=var, value=val).pack(side="left", padx=(0, 8))
-        return frame
-
-    # ── Tab 1：ID 清單 ──────────────────────────────────────────────────────────
-
-    def build_tab_id_list(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="ID 清單")
-
-        # 實體類型 + 輸出模式
-        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 8))
-        ttk.Label(r0, text="主要選取", foreground="red").pack(side="left", padx=(0, 12))
-        ttk.Label(r0, text="實體類型：").pack(side="left")
-        self.id_entity = tk.StringVar(value="AREA")
-        self._entity_radio_row(r0, self.id_entity).pack(side="left")
-
-        ttk.Label(r0, text="輸出模式：").pack(side="left", padx=(12, 0))
-        self.id_style = tk.StringVar(value="逐一加選")
-        for lbl, val in [("逐一加選", "逐一加選"), ("壓縮排序範圍", "壓縮排序範圍")]:
-            ttk.Radiobutton(r0, text=lbl, variable=self.id_style, value=val).pack(side="left", padx=(0, 3))
-
+        option_row = ttk.Frame(parent)
+        option_row.grid(row=1, column=0, sticky="ew", pady=(0, 2))
         self.append_mode = tk.BooleanVar(value=False)
         self.add_allsel_end = tk.BooleanVar(value=False)
-        option_style = ttk.Style(self.root)
-        option_style.configure("BlueOption.TCheckbutton", foreground="blue")
-        option_style.map(
-            "BlueOption.TCheckbutton",
-            foreground=[("!disabled", "blue")],
-        )
         ttk.Checkbutton(
-            r0,
-            text="追加模式",
-            variable=self.append_mode,
-            style="BlueOption.TCheckbutton",
-        ).pack(side="left")
+            option_row, text="追加模式", variable=self.append_mode, style="BlueOption.TCheckbutton",
+        ).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(
-            r0,
-            text="結尾加上 ALLSEL, ALL",
-            variable=self.add_allsel_end,
+            option_row, text="結尾加上 ALLSEL, ALL", variable=self.add_allsel_end,
             style="BlueOption.TCheckbutton",
         ).pack(side="left")
 
-        # ── 輸入框 1 & 2：垂直可拖曳分割 ──
-        self.id_input_pane = tk.PanedWindow(tab, orient="vertical", borderwidth=0)
-        self.id_input_pane.pack(fill="both", expand=True, pady=(0, 6))
+        self.toolbar = ttk.Frame(parent)
+        self.toolbar.grid(row=2, column=0, sticky="ew", pady=(4, 4))
 
-        self.id_primary_area = ttk.Frame(self.id_input_pane)
-        self.id_primary_area.columnconfigure(0, weight=1)
-        self.id_primary_area.rowconfigure(0, weight=1)
-        self.id_input_pane.add(self.id_primary_area, minsize=1, stretch="always")
-        self.id_input1 = tk.Text(self.id_primary_area, height=4, wrap="word")
-        self.id_input1.grid(row=0, column=0, sticky="nsew")
-        self.id_input1.insert("1.0", "1 5 8 12")
-        self.id_input1_help = ttk.Label(
-            self.id_primary_area,
-            text="支援：整數、1-10、1:10:2；首筆 S 起始，後續自動聯集 A；或直接貼入任何 ANSYS LIST 指令輸出（CMLIST/NLIST/ELIST/ALIST/LLIST/KLIST/VLIST/PRNSOL 等），自動識別並萃取實體 ID",
-            foreground="gray",
-            justify="left",
-        )
-        self.id_input1_help.grid(row=1, column=0, sticky="ew", pady=(2, 0))
-        self.id_add_seltol = tk.BooleanVar(value=False)
-        self.id_seltol_check = ttk.Checkbutton(
-            self.id_primary_area,
-            text=f"加入 {SELTOL_COMMAND}",
-            variable=self.id_add_seltol,
-        )
-        self.id_seltol_check.grid(row=2, column=0, sticky="w", pady=(2, 0))
-        self.id_primary_area.bind("<Configure>", self._resize_id_input1_help, add="+")
+        self.output_text = tk.Text(parent, height=8, wrap="none")
+        self.output_text.grid(row=3, column=0, sticky="nsew")
+        parent.rowconfigure(3, weight=1)
 
-        self.id_secondary_area = ttk.Frame(self.id_input_pane)
-        self.id_secondary_area.columnconfigure(0, weight=1)
-        self.id_secondary_area.rowconfigure(1, weight=1)
-        self.id_input_pane.add(self.id_secondary_area, minsize=1, stretch="always")
+    def _refresh_shared_toolbar(self) -> None:
+        for child in self.toolbar.winfo_children():
+            child.destroy()
 
-        self.id_secondary_controls = ttk.Frame(self.id_secondary_area)
-        self.id_secondary_controls.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        tr = self.id_secondary_controls
-        ttk.Label(tr, text="疊加／精選 IDs", foreground="red").pack(side="left", padx=(0, 12))
-        ttk.Label(tr, text="疊加模式：").pack(side="left")
-        self.id_next_type = tk.StringVar(value="A")
-        for label, value in NEXT_TYPE_OPTIONS:
-            ttk.Radiobutton(
-                tr, text=label, variable=self.id_next_type, value=value
-            ).pack(side="left", padx=(0, 8))
+        tab_text = self._current_tab_text()
+        if tab_text == "ID 清單":
+            generate_actions = [("產生 ID 選取", self.generate_id_list, "RedAction.TButton")]
+        elif tab_text == "Box / 區域":
+            generate_actions = [("產生 Box 選取", self.generate_box, "RedAction.TButton")]
+        elif tab_text == "元件操作":
+            generate_actions = [
+                ("產生 CMDELE 刪除", self.generate_component_delete, "RedAction.TButton"),
+                ("產生 CMSEL 合併", self.generate_component_merge, "RedAction.TButton"),
+            ]
+        elif tab_text == "拓樸鏈":
+            label = "產生 CMSEL" if self._resolve_topology_mode_key() == TOPOLOGY_CMSEL_MODE else "產生拓樸鏈"
+            generate_actions = [(label, self.generate_topology, "RedAction.TButton")]
+        else:
+            generate_actions = []
 
-        save_controls = ttk.Frame(tr)
-        save_controls.pack(side="left", padx=(6, 8))
-        ttk.Label(save_controls, text="儲存成元件：").pack(side="left")
-        self.id_cm_name = tk.StringVar(value="")
-        ttk.Entry(
-            save_controls,
-            textvariable=self.id_cm_name,
-            width=ID_COMPONENT_ENTRY_WIDTH,
-        ).pack(
-            side="left", padx=(4, 6)
-        )
-        action_style = ttk.Style(self.root)
-        action_style.configure("RedAction.TButton", foreground="red")
-        action_style.map("RedAction.TButton", foreground=[("!disabled", "red")])
-        ttk.Button(
-            save_controls,
-            text="產生 ID 選取",
-            command=self.generate_id_list,
-            style="RedAction.TButton",
-        ).pack(side="left", padx=(0, 4))
-        output_actions = (
-            ("複製結果", self.copy_output),
-            ("清空輸出", self.clear_output),
-            ("插入分隔線", self.insert_divider),
-        )
-        for index, (label, command) in enumerate(output_actions):
-            trailing_space = 2 if index < len(output_actions) - 1 else 0
-            ttk.Button(
-                save_controls,
-                text=label,
-                command=command,
-                width=OUTPUT_ACTION_BUTTON_WIDTHS[label],
-                style="RedAction.TButton",
-            ).pack(side="left", padx=(0, trailing_space))
-
-        self.id_input2 = tk.Text(self.id_secondary_area, height=4, wrap="word")
-        self.id_input2.grid(row=1, column=0, sticky="nsew")
-        self.id_input2_help = ttk.Label(
-            self.id_secondary_area, text="留空則略過此欄", foreground="gray"
-        )
-        self.id_input2_help.grid(row=2, column=0, sticky="w", pady=(2, 0))
-
-    # ── Tab 2：Box / 區域 ───────────────────────────────────────────────────────
-
-    def build_tab_box(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="Box / 區域")
-
-        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 4))
-        ttk.Label(r0, text="主要選取", foreground="red").pack(side="left", padx=(0, 12))
-        ttk.Label(r0, text="實體類型：").pack(side="left")
-        self.box_entity = tk.StringVar(value="ELEM")
-        self._entity_radio_row(r0, self.box_entity).pack(side="left")
-
-        r1 = ttk.Frame(tab); r1.pack(fill="x", pady=(0, 4))
-        ttk.Label(r1, text="首軸選取方式：").pack(side="left")
-        self.box_first_type = tk.StringVar(value="S")
-        self._type_radio_row(r1, self.box_first_type, BOX_SELECTION_OPTIONS).pack(side="left")
-
-        r2 = ttk.Frame(tab); r2.pack(fill="x", pady=(0, 8))
-        ttk.Label(r2, text="後續軸方式：  ").pack(side="left")
-        self.box_refine_type = tk.StringVar(value="R")
-        self._type_radio_row(
-            r2, self.box_refine_type, BOX_REFINE_OPTIONS
-        ).pack(side="left")
-
-        grid = ttk.Frame(tab); grid.pack(fill="x", pady=(0, 8))
-        self.box_x1 = tk.StringVar(value="0");  self.box_x2 = tk.StringVar(value="10")
-        self.box_y1 = tk.StringVar(value="");   self.box_y2 = tk.StringVar(value="")
-        self.box_z1 = tk.StringVar(value="");   self.box_z2 = tk.StringVar(value="")
-        for row, (axis, v1, v2) in enumerate([
-                ("X", self.box_x1, self.box_x2),
-                ("Y", self.box_y1, self.box_y2),
-                ("Z", self.box_z1, self.box_z2)]):
-            ttk.Label(grid, text=f"{axis}min").grid(row=row, column=0, sticky="w", padx=(0, 4), pady=2)
-            ttk.Entry(grid, textvariable=v1, width=14).grid(row=row, column=1, padx=(0, 16), pady=2)
-            ttk.Label(grid, text=f"{axis}max").grid(row=row, column=2, sticky="w", padx=(0, 4), pady=2)
-            ttk.Entry(grid, textvariable=v2, width=14).grid(row=row, column=3, pady=2)
-
-        self.box_value_help = ttk.Label(
-            tab,
-            text="X/Y/Z 最小值與最大值可輸入數值或 APDL 純量變數名稱"
-                 "（例：X_MIN、X_MAX；變數需事先定義）。",
-            foreground="gray",
-            justify="left",
-        )
-        self.box_value_help.pack(fill="x", anchor="w", pady=(0, 6))
-        tab.bind("<Configure>", self._resize_box_value_help, add="+")
-
-        self.box_add_seltol = tk.BooleanVar(value=False)
-        self.box_seltol_check = ttk.Checkbutton(
-            tab,
-            text=f"加入 {SELTOL_COMMAND}",
-            variable=self.box_add_seltol,
-        )
-        self.box_seltol_check.pack(anchor="w", pady=(0, 6))
-
-        cr = ttk.Frame(tab); cr.pack(fill="x")
-        ttk.Label(cr, text="儲存成元件：").pack(side="left")
-        self.box_cm_name = tk.StringVar(value="")
-        ttk.Entry(cr, textvariable=self.box_cm_name, width=20).pack(side="left", padx=(4, 14))
-        ttk.Button(cr, text="產生 Box 選取", command=self.generate_box).pack(side="left")
-
-        ttk.Separator(tab, orient="horizontal").pack(
-            fill="x", pady=(12, 8)
-        )
-        self.build_component_section(tab)
-
-    # ── Tab 3：拓樸鏈 ───────────────────────────────────────────────────────────
-
-    def build_tab_topology(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="拓樸鏈")
-
-        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 6))
-        ttk.Label(r0, text="模式").pack(side="left")
-        self.topo_mode = tk.StringVar(value=list(TOPOLOGY_MODES.keys())[0])
-        self.topo_mode_combo = ttk.Combobox(
-            r0,
-            state="readonly",
-            textvariable=self.topo_mode,
-            values=list(TOPOLOGY_MODES.keys()),
-            width=44,
-            height=len(TOPOLOGY_MODES),
-        )
-        self.topo_mode_combo.pack(side="left", padx=(6, 14))
-        self.topo_mode_combo.bind(
-            "<<ComboboxSelected>>", self._update_topology_mode_ui, add="+"
-        )
-        self.topo_style_label = ttk.Label(r0, text="ID 輸出")
-        self.topo_style_label.pack(side="left")
-        self.topo_id_style = tk.StringVar(value="逐一加選")
-        self.topo_style_combo = ttk.Combobox(
-            r0,
-            state="readonly",
-            width=14,
-            textvariable=self.topo_id_style,
-            values=["逐一加選", "壓縮排序範圍"],
-        )
-        self.topo_style_combo.pack(side="left", padx=(6, 0))
-
-        self.topo_source_label = ttk.Label(tab, text="來源 IDs")
-        self.topo_source_label.pack(anchor="w")
-        self.topo_ids = tk.Text(tab, height=4, wrap="word")
-        self.topo_ids.pack(fill="both", expand=True, pady=(2, 4))
-        self.topo_ids.insert("1.0", "8 25")
-        self.topo_help_label = ttk.Label(
-            tab,
-            text="可直接貼入任何 ANSYS LIST 輸出"
-                 "（CMLIST/NLIST/ALIST/LLIST/KLIST 等），"
-                 "自動識別並萃取來源實體 ID",
-            foreground="gray",
-            justify="left",
-        )
-        self.topo_help_label.pack(fill="x", anchor="w", pady=(0, 6))
-        tab.bind("<Configure>", self._resize_topology_help, add="+")
-
-        r2 = ttk.Frame(tab); r2.pack(fill="x")
-        self.topo_save_label = ttk.Label(r2, text="儲存最終結果元件：")
-        self.topo_save_label.pack(side="left")
-        self.topo_cm_name = tk.StringVar(value="")
-        self.topo_save_entry = ttk.Entry(
-            r2, textvariable=self.topo_cm_name, width=20
-        )
-        self.topo_save_entry.pack(side="left", padx=(4, 14))
-        self.topo_generate_button = ttk.Button(
-            r2, text="產生拓樸鏈", command=self.generate_topology
-        )
-        self.topo_generate_button.pack(side="left")
-
-    # ── Tab 4：ANSYS LOG 轉 APDL ────────────────────────────────────────────────
-
-    def build_tab_log_converter(self) -> None:
-        tab = ttk.Frame(self.notebook, padding=10)
-        self.notebook.add(tab, text="LOG 轉 APDL")
-        tab.columnconfigure(0, weight=1)
-        tab.rowconfigure(1, weight=1)
-
-        self.log_cleanup = tk.BooleanVar(value=True)
-        self.log_strip_comments = tk.BooleanVar(value=False)
-        self.log_compress_ranges = tk.BooleanVar(value=False)
-        self.log_status = tk.StringVar(value="待命")
-
-        help_label = ttk.Label(
-            tab,
-            text="左側貼上 ANSYS LOG / LGW 指令，按「開始轉換」後右側顯示轉換結果。"
-                 "中間橫桿可左右拖曳調整兩側寬度。"
-                 "「壓縮排序範圍」會忽略原始 log 的挑選順序，排序去重後合併成最少的等差範圍。"
-                 "無法無損改寫的區塊會保留原始語法；執行中的 /INPUT 一律保留。",
-            foreground="gray",
-            justify="left",
-        )
-        help_label.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        tab.bind(
-            "<Configure>",
-            lambda event: help_label.configure(wraplength=max(event.width - 20, 1)),
-            add="+",
-        )
-
-        paned = ttk.PanedWindow(tab, orient="horizontal")
-        paned.grid(row=1, column=0, sticky="nsew")
-
-        source_frame, self.log_source_text, self.log_source_linenumbers = (
-            self._build_log_text_panel(paned, "尚未轉換", editable=True)
-        )
-        paned.add(source_frame, weight=1)
-
-        result_frame, self.log_result_text, self.log_result_linenumbers = (
-            self._build_log_text_panel(paned, "轉換結果", editable=False)
-        )
-        paned.add(result_frame, weight=1)
-
-        action_row = ttk.Frame(tab)
-        action_row.grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        self.log_cleanup_check = ttk.Checkbutton(
-            action_row,
-            text="移除 GUI 顯示／視角雜訊",
-            variable=self.log_cleanup,
-        )
-        self.log_cleanup_check.pack(side="left")
-        self.log_strip_comments_check = ttk.Checkbutton(
-            action_row,
-            text="移除註解",
-            variable=self.log_strip_comments,
-        )
-        self.log_strip_comments_check.pack(side="left", padx=(12, 0))
-        self.log_compress_ranges_check = ttk.Checkbutton(
-            action_row,
-            text="壓縮排序範圍",
-            variable=self.log_compress_ranges,
-        )
-        self.log_compress_ranges_check.pack(side="left", padx=(12, 0))
-        self.log_start_button = ttk.Button(
-            action_row, text="開始轉換", command=self._start_log_conversion
-        )
-        self.log_start_button.pack(side="left", padx=(16, 6))
-        self.log_clear_button = ttk.Button(
-            action_row, text="清除", command=self._clear_log_conversion
-        )
-        self.log_clear_button.pack(side="left")
-        self.log_copy_button = ttk.Button(
-            action_row,
-            text="複製結果",
-            command=self._copy_log_result,
-            state="disabled",
-        )
-        self.log_copy_button.pack(side="left", padx=(6, 0))
-
-        ttk.Label(tab, textvariable=self.log_status).grid(
-            row=3, column=0, sticky="w", pady=(4, 0)
-        )
-
-    def _build_log_text_panel(
-        self, parent: tk.Widget, title: str, *, editable: bool
-    ) -> tuple[ttk.Frame, tk.Text, tk.Text]:
-        frame = ttk.Frame(parent)
-        frame.rowconfigure(1, weight=1)
-        frame.columnconfigure(1, weight=1)
-        ttk.Label(frame, text=title).grid(
-            row=0, column=0, columnspan=3, sticky="w", pady=(0, 2)
-        )
-
-        line_numbers = tk.Text(
-            frame,
-            width=5,
-            padx=4,
-            takefocus=0,
-            border=0,
-            state="disabled",
-            wrap="none",
-            background="#f0f0f0",
-            foreground="#808080",
-        )
-        line_numbers.grid(row=1, column=0, sticky="ns")
-
-        text_widget = tk.Text(frame, wrap="none", undo=editable)
-        text_widget.grid(row=1, column=1, sticky="nsew")
-        if not editable:
-            text_widget.configure(state="disabled")
-
-        yscroll = ttk.Scrollbar(frame, orient="vertical")
-        yscroll.grid(row=1, column=2, sticky="ns")
-        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=text_widget.xview)
-        xscroll.grid(row=2, column=1, sticky="ew")
-
-        def _on_text_yscroll(first: str, last: str) -> None:
-            yscroll.set(first, last)
-            line_numbers.yview_moveto(float(first))
-
-        def _on_scrollbar(*args: str) -> None:
-            text_widget.yview(*args)
-            line_numbers.yview(*args)
-
-        text_widget.configure(yscrollcommand=_on_text_yscroll, xscrollcommand=xscroll.set)
-        yscroll.configure(command=_on_scrollbar)
-
-        def _forward_wheel(event: tk.Event) -> str:
-            text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
-            line_numbers.yview_moveto(text_widget.yview()[0])
-            return "break"
-
-        line_numbers.bind("<MouseWheel>", _forward_wheel)
-
-        def _on_modified(_event: tk.Event) -> None:
-            self._refresh_line_numbers(text_widget, line_numbers)
-            text_widget.edit_modified(False)
-
-        text_widget.bind("<<Modified>>", _on_modified, add="+")
-        self._refresh_line_numbers(text_widget, line_numbers)
-
-        return frame, text_widget, line_numbers
-
-    @staticmethod
-    def _refresh_line_numbers(text_widget: tk.Text, line_numbers: tk.Text) -> None:
-        line_count = int(text_widget.index("end-1c").split(".")[0])
-        numbers = "\n".join(str(n) for n in range(1, line_count + 1))
-        line_numbers.configure(state="normal")
-        line_numbers.delete("1.0", "end")
-        line_numbers.insert("1.0", numbers)
-        line_numbers.configure(state="disabled")
-
-    def _clear_log_conversion(self) -> None:
-        self.log_source_text.delete("1.0", "end")
-        self._set_log_result("")
-        self.log_status.set("待命")
-
-    def _set_log_result(self, text: str) -> None:
-        self.log_result_text.configure(state="normal")
-        self.log_result_text.delete("1.0", "end")
-        self.log_result_text.insert("1.0", text)
-        self.log_result_text.configure(state="disabled")
-        self.log_copy_button.configure(state="normal" if text else "disabled")
-        self._refresh_line_numbers(self.log_result_text, self.log_result_linenumbers)
-
-    def _copy_log_result(self) -> None:
-        result = self.log_result_text.get("1.0", "end-1c")
-        if not result:
-            return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(result)
-        self.root.update_idletasks()
-        line_count = len(result.splitlines())
-        self.log_status.set(f"已複製轉換結果（{line_count:,} 行）")
-
-    def _start_log_conversion(self) -> None:
-        source_text = self.log_source_text.get("1.0", "end-1c")
-        if not source_text.strip():
-            messagebox.showwarning(
-                "資料不足", "請先在左側貼上要轉換的 LOG / LGW 指令。", parent=self.root
-            )
-            return
-
-        sink = io.StringIO()
-        try:
-            report = convert_lgw_stream(
-                io.StringIO(source_text),
-                sink,
-                cleanup=self.log_cleanup.get(),
-                strip_comments=self.log_strip_comments.get(),
-                compress_ranges=self.log_compress_ranges.get(),
-            )
-        except Exception as exc:
-            self.log_status.set("轉換失敗")
-            messagebox.showerror(
-                "轉換失敗", f"{type(exc).__name__}: {exc}", parent=self.root
-            )
-            return
-
-        self._set_log_result(sink.getvalue())
-        summary = f"轉換完成：輸入 {report.input_lines:,} 行 → 輸出 {report.output_lines:,} 行"
-        details = []
-        if report.removed_noise_lines:
-            details.append(f"移除 GUI 雜訊 {report.removed_noise_lines:,} 行")
-        if report.removed_comment_lines:
-            details.append(f"移除註解 {report.removed_comment_lines:,} 行")
-        if report.preserved_blocks:
-            details.append(f"保留 {report.preserved_blocks:,} 個區塊")
-        if report.warnings:
-            details.append(f"警告 {len(report.warnings):,} 筆")
-        if details:
-            summary += "（" + "；".join(details) + "）"
-        self.log_status.set(summary)
-        if report.warnings:
-            messagebox.showwarning(
-                "部分區塊原樣保留",
-                "\n".join(report.warnings),
-                parent=self.root,
-            )
-
-    # ── Box / 區域內：元件操作 ──────────────────────────────────────────────────
-
-    def build_component_section(self, tab: ttk.Frame) -> None:
-        ttk.Label(tab, text="元件操作").pack(anchor="w", pady=(0, 4))
-
-        ttk.Label(tab, text="元件名稱清單（空白 / 逗號 / 分號 分隔）").pack(anchor="w")
-        self.comp_names = tk.Text(tab, height=4, wrap="word")
-        self.comp_names.pack(fill="both", expand=True, pady=(2, 8))
-        self.comp_names.insert("1.0", "CM_2_ELEM CM_3_ELEM CM_4_ELEM")
-
-        r0 = ttk.Frame(tab); r0.pack(fill="x", pady=(0, 8))
-        self.comp_with_none = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r0, text="前置 CMSEL, NONE",
-                         variable=self.comp_with_none).pack(side="left", padx=(0, 16))
-        ttk.Label(r0, text="後續疊加：").pack(side="left")
-        self.comp_next_type = tk.StringVar(value="A")
-        self._type_radio_row(
-            r0, self.comp_next_type, NEXT_TYPE_OPTIONS
-        ).pack(side="left")
-        ttk.Label(r0, text="  後處理：").pack(side="left")
-        self.comp_post = tk.StringVar(value="無")
-        ttk.Combobox(r0, state="readonly", width=14, textvariable=self.comp_post,
-                     values=["無", "NSLE, S", "ESLN, S, 0"]).pack(side="left", padx=(4, 0))
-
-        r1 = ttk.Frame(tab); r1.pack(fill="x")
-        ttk.Label(r1, text="儲存合併後元件：").pack(side="left")
-        self.comp_save_name = tk.StringVar(value="")
-        ttk.Entry(r1, textvariable=self.comp_save_name, width=16).pack(side="left", padx=(4, 8))
-        self.comp_save_entity = tk.StringVar(value="ELEM")
-        self._entity_radio_row(r1, self.comp_save_entity).pack(side="left", padx=(0, 12))
-        ttk.Button(r1, text="產生 CMSEL 合併",
-                    command=self.generate_component_merge).pack(side="left", padx=(4, 0))
-        ttk.Button(r1, text="產生 CMDELE 刪除",
-                    command=self.generate_component_delete).pack(side="left", padx=(6, 0))
-
-    # ── 輸出工具 ─────────────────────────────────────────────────────────────────
+        # 由右往左 pack：畫面上由左到右依序是「(此分頁的產生按鈕)」「插入分隔線」「清空輸出」「複製結果」。
+        fixed_actions = [
+            ("複製結果", self.copy_output, None),
+            ("清空輸出", self.clear_output, None),
+            ("插入分隔線", self.insert_divider, None),
+        ]
+        for label, command, style in fixed_actions + generate_actions:
+            kwargs = {
+                "text": label,
+                "command": command,
+                "width": OUTPUT_ACTION_BUTTON_WIDTHS[label],
+            }
+            if style:
+                kwargs["style"] = style
+            ttk.Button(self.toolbar, **kwargs).pack(side="right", padx=(4, 0))
 
     def write_output(self, text: str) -> None:
         output = text.rstrip()
@@ -2051,7 +1314,72 @@ class APDLSelectorGUI:
     def insert_divider(self) -> None:
         self.output_text.insert("end", "\n! ==============================\n")
 
-    # ── 產生處理器 ───────────────────────────────────────────────────────────────
+    # ── ① ID 清單分頁 ───────────────────────────────────────────────────────
+
+    def build_tab_id_list(self) -> None:
+        pane = self._new_tab_pane("ID 清單")
+
+        box1 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box1, minsize=1, stretch="always")
+        box1.columnconfigure(0, weight=1)
+        box1.rowconfigure(3, weight=1)
+        self._section_title_grid(box1, "① 主要選取", row=0)
+
+        row1 = ttk.Frame(box1); row1.grid(row=1, column=0, sticky="w")
+        ttk.Label(row1, text="實體類型：").pack(side="left")
+        self.id_entity = tk.StringVar(value="AREA")
+        for ent in ENTITY_INFO.keys():
+            ttk.Radiobutton(row1, text=ent, variable=self.id_entity, value=ent).pack(side="left", padx=(0, 6))
+
+        row2 = ttk.Frame(box1); row2.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(row2, text="輸出模式：").pack(side="left")
+        self.id_style = tk.StringVar(value="逐一加選")
+        for lbl in ["逐一加選", "壓縮排序範圍"]:
+            ttk.Radiobutton(row2, text=lbl, variable=self.id_style, value=lbl).pack(side="left", padx=(0, 10))
+
+        self.id_input1 = tk.Text(box1, height=5, wrap="word")
+        self.id_input1.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
+        self.id_input1.insert("1.0", "1 5 8 12")
+        ttk.Label(
+            box1,
+            text="支援：整數、1-10、1:10:2；第一筆用上方「實體類型」選取 (S)，其餘自動聯集 (A)。",
+            foreground="gray", justify="left", wraplength=620,
+        ).grid(row=4, column=0, sticky="ew", pady=(2, 0))
+
+        self.id_add_seltol = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            box1, text=f"加入 {SELTOL_COMMAND}", variable=self.id_add_seltol,
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
+
+        box2 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box2, minsize=1, stretch="always")
+        box2.columnconfigure(0, weight=1)
+        box2.rowconfigure(3, weight=1)
+        self._section_title_grid(box2, "② 疊加／精選（可留空）", row=0)
+
+        row3 = ttk.Frame(box2); row3.grid(row=1, column=0, sticky="w")
+        ttk.Label(row3, text="疊加模式：").pack(side="left")
+        self.id_next_type = tk.StringVar(value="A")
+        for label, value in NEXT_TYPE_OPTIONS:
+            ttk.Radiobutton(row3, text=label, variable=self.id_next_type, value=value).pack(side="left", padx=(0, 8))
+
+        ttk.Label(
+            box2,
+            text="此模式套用在下面輸入框的 ID，疊加到①的結果上（與①使用同一個實體類型）。",
+            foreground="gray", justify="left", wraplength=620,
+        ).grid(row=2, column=0, sticky="ew", pady=(2, 4))
+
+        self.id_input2 = tk.Text(box2, height=4, wrap="word")
+        self.id_input2.grid(row=3, column=0, sticky="nsew")
+        ttk.Label(box2, text="留空則略過此欄", foreground="gray").grid(row=4, column=0, sticky="w", pady=(2, 0))
+
+        box3 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box3, minsize=1, stretch="never")
+        self._section_title(box3, "③ 儲存設定")
+        row4 = ttk.Frame(box3); row4.pack(fill="x")
+        ttk.Label(row4, text="儲存成元件：").pack(side="left")
+        self.id_cm_name = tk.StringVar(value="")
+        ttk.Entry(row4, textvariable=self.id_cm_name, width=16).pack(side="left", padx=(4, 0))
 
     def generate_id_list(self) -> None:
         try:
@@ -2072,7 +1400,6 @@ class APDLSelectorGUI:
                 if cmd:
                     lines.extend(cmd.splitlines())
             if nums2:
-                # 第二框：全部使用所選的疊加模式
                 cmd = build_id_list_commands(entity, nums2, style, next_type, next_type)
                 if cmd:
                     lines.extend(cmd.splitlines())
@@ -2082,8 +1409,103 @@ class APDLSelectorGUI:
         except Exception as exc:
             messagebox.showerror("錯誤", str(exc))
 
-    def _parse_axis_pair(self, vmin_str: str, vmax_str: str,
-                          axis_name: str) -> tuple[BoxBound, BoxBound] | None:
+    # ── ② Box / 區域分頁 ────────────────────────────────────────────────────
+
+    def _build_box_bounds_grid(self, parent: tk.Widget, v: dict) -> None:
+        grid = ttk.Frame(parent); grid.pack(fill="x")
+        for row, (axis, key1, key2) in enumerate([
+                ("X", "x1", "x2"), ("Y", "y1", "y2"), ("Z", "z1", "z2")]):
+            ttk.Label(grid, text=f"{axis}min").grid(row=row, column=0, sticky="w", padx=(0, 4), pady=2)
+            ttk.Entry(grid, textvariable=v[key1], width=14).grid(row=row, column=1, padx=(0, 16), pady=2)
+            ttk.Label(grid, text=f"{axis}max").grid(row=row, column=2, sticky="w", padx=(0, 4), pady=2)
+            ttk.Entry(grid, textvariable=v[key2], width=14).grid(row=row, column=3, pady=2)
+
+    def build_tab_box(self) -> None:
+        pane = self._new_tab_pane("Box / 區域")
+
+        box1 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box1, minsize=1, stretch="always")
+        self._section_title(box1, "① 主要 Box")
+
+        row1 = ttk.Frame(box1); row1.pack(fill="x")
+        ttk.Label(row1, text="實體類型：").pack(side="left")
+        self.box_entity = tk.StringVar(value="ELEM")
+        for ent in ENTITY_INFO.keys():
+            ttk.Radiobutton(row1, text=ent, variable=self.box_entity, value=ent).pack(side="left", padx=(0, 6))
+
+        row2 = ttk.Frame(box1); row2.pack(fill="x", pady=(4, 0))
+        ttk.Label(row2, text="首軸選取方式：").pack(side="left")
+        self.box_first_type = tk.StringVar(value="S")
+        for label, value in BOX_SELECTION_OPTIONS:
+            ttk.Radiobutton(row2, text=label, variable=self.box_first_type, value=value).pack(side="left", padx=(0, 8))
+
+        row3 = ttk.Frame(box1); row3.pack(fill="x", pady=(4, 0))
+        ttk.Label(row3, text="後續軸方式：").pack(side="left")
+        self.box_refine_type = tk.StringVar(value="R")
+        for label, value in BOX_REFINE_OPTIONS:
+            ttk.Radiobutton(row3, text=label, variable=self.box_refine_type, value=value).pack(side="left", padx=(0, 8))
+
+        self.box_x1 = tk.StringVar(value="0");  self.box_x2 = tk.StringVar(value="10")
+        self.box_y1 = tk.StringVar(value="");   self.box_y2 = tk.StringVar(value="")
+        self.box_z1 = tk.StringVar(value="");   self.box_z2 = tk.StringVar(value="")
+        self._build_box_bounds_grid(box1, {
+            "x1": self.box_x1, "x2": self.box_x2,
+            "y1": self.box_y1, "y2": self.box_y2,
+            "z1": self.box_z1, "z2": self.box_z2,
+        })
+        ttk.Label(
+            box1, text="留空的軸將略過；X/Y/Z 至少要填一組範圍。",
+            foreground="gray", justify="left", wraplength=620,
+        ).pack(anchor="w", pady=(4, 0))
+
+        box2 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box2, minsize=1, stretch="always")
+        self._section_title(box2, "② 疊加／精選 Box（可留空）")
+
+        row4 = ttk.Frame(box2); row4.pack(fill="x")
+        ttk.Label(row4, text="疊加模式：").pack(side="left")
+        self.box2_next_type = tk.StringVar(value="A")
+        for label, value in NEXT_TYPE_OPTIONS:
+            ttk.Radiobutton(row4, text=label, variable=self.box2_next_type, value=value).pack(side="left", padx=(0, 8))
+
+        row5 = ttk.Frame(box2); row5.pack(fill="x", pady=(4, 0))
+        ttk.Label(row5, text="後續軸方式：").pack(side="left")
+        self.box2_refine_type = tk.StringVar(value="R")
+        for label, value in BOX_REFINE_OPTIONS:
+            ttk.Radiobutton(row5, text=label, variable=self.box2_refine_type, value=value).pack(side="left", padx=(0, 8))
+
+        ttk.Label(
+            box2,
+            text="此 Box 的範圍會以上面的疊加模式套用在①的結果上（與①使用同一個實體類型）。"
+                 "例如①選 X=0~1 (S)，這裡再填 X=3~7 並選「再加入 (A)」，"
+                 "即可得到 X 在 0~1 或 3~7 的聯集。",
+            foreground="gray", justify="left", wraplength=620,
+        ).pack(anchor="w", pady=(2, 4))
+
+        self.box2_x1 = tk.StringVar(value="");  self.box2_x2 = tk.StringVar(value="")
+        self.box2_y1 = tk.StringVar(value="");  self.box2_y2 = tk.StringVar(value="")
+        self.box2_z1 = tk.StringVar(value="");  self.box2_z2 = tk.StringVar(value="")
+        self._build_box_bounds_grid(box2, {
+            "x1": self.box2_x1, "x2": self.box2_x2,
+            "y1": self.box2_y1, "y2": self.box2_y2,
+            "z1": self.box2_z1, "z2": self.box2_z2,
+        })
+        ttk.Label(box2, text="留空則略過此 Box", foreground="gray").pack(anchor="w", pady=(4, 0))
+
+        box3 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box3, minsize=1, stretch="never")
+        self._section_title(box3, "③ 儲存設定")
+        row6 = ttk.Frame(box3); row6.pack(fill="x")
+        ttk.Label(row6, text="儲存成元件：").pack(side="left")
+        self.box_cm_name = tk.StringVar(value="")
+        ttk.Entry(row6, textvariable=self.box_cm_name, width=20).pack(side="left", padx=(4, 0))
+
+        self.box_add_seltol = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            box3, text=f"加入 {SELTOL_COMMAND}", variable=self.box_add_seltol,
+        ).pack(anchor="w", pady=(6, 0))
+
+    def _parse_axis_pair(self, vmin_str: str, vmax_str: str, axis_name: str) -> tuple[BoxBound, BoxBound] | None:
         vmin = parse_box_bound_optional(vmin_str, f"{axis_name}min")
         vmax = parse_box_bound_optional(vmax_str, f"{axis_name}max")
         if vmin is None and vmax is None:
@@ -2094,43 +1516,85 @@ class APDLSelectorGUI:
 
     def generate_box(self) -> None:
         try:
-            entity      = self.box_entity.get().strip()
-            first_type  = self.box_first_type.get().strip()
-            refine_type = self.box_refine_type.get().strip()
+            entity = self.box_entity.get().strip()
+
+            lines: list[str] = []
+            if self.box_add_seltol.get():
+                lines.append(SELTOL_COMMAND)
+
             x_pair = self._parse_axis_pair(self.box_x1.get(), self.box_x2.get(), "X")
             y_pair = self._parse_axis_pair(self.box_y1.get(), self.box_y2.get(), "Y")
             z_pair = self._parse_axis_pair(self.box_z1.get(), self.box_z2.get(), "Z")
-            text  = build_box_commands(entity, first_type, refine_type, x_pair, y_pair, z_pair)
-            lines = text.splitlines()
-            if self.box_add_seltol.get():
-                lines.insert(0, SELTOL_COMMAND)
+            lines.extend(build_box_commands(
+                entity, self.box_first_type.get().strip(), self.box_refine_type.get().strip(),
+                x_pair, y_pair, z_pair,
+            ).splitlines())
+
+            x2_pair = self._parse_axis_pair(self.box2_x1.get(), self.box2_x2.get(), "疊加 X")
+            y2_pair = self._parse_axis_pair(self.box2_y1.get(), self.box2_y2.get(), "疊加 Y")
+            z2_pair = self._parse_axis_pair(self.box2_z1.get(), self.box2_z2.get(), "疊加 Z")
+            if x2_pair or y2_pair or z2_pair:
+                lines.extend(build_box_commands(
+                    entity, self.box2_next_type.get().strip(), self.box2_refine_type.get().strip(),
+                    x2_pair, y2_pair, z2_pair,
+                ).splitlines())
+
             append_cm_line(lines, self.box_cm_name.get(), ENTITY_INFO[entity]["cm_item"])
             self.write_output("\n".join(lines))
         except Exception as exc:
             messagebox.showerror("錯誤", str(exc))
 
-    def generate_topology(self) -> None:
-        try:
-            mode_name = self.topo_mode.get().strip()
-            mode      = TOPOLOGY_MODES[mode_name]
-            if mode.get("kind") == "component":
-                names = parse_component_names(self.topo_ids.get("1.0", "end"))
-                if not names:
-                    raise ValueError("請輸入至少一個元件或組合名稱。")
-                self.write_output(build_component_select_commands(names))
-                return
+    # ── ③ 元件操作分頁 ──────────────────────────────────────────────────────
 
-            ids       = parse_numbers(self.topo_ids.get("1.0", "end"))
-            if not ids:
-                raise ValueError("請輸入來源 IDs。")
-            style  = self.topo_id_style.get().strip()
-            source = mode["source"]
-            lines  = build_id_list_commands(source, ids, style, "S", "A").splitlines()
-            lines.extend(mode["steps"])
-            append_cm_line(lines, self.topo_cm_name.get(), mode["target"])
-            self.write_output("\n".join(lines))
-        except Exception as exc:
-            messagebox.showerror("錯誤", str(exc))
+    def build_tab_component(self) -> None:
+        pane = self._new_tab_pane("元件操作")
+
+        box1 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box1, minsize=1, stretch="always")
+        box1.columnconfigure(0, weight=1)
+        box1.rowconfigure(1, weight=1)
+        self._section_title_grid(box1, "① 元件名稱清單", row=0)
+
+        self.comp_names = tk.Text(box1, height=5, wrap="word")
+        self.comp_names.grid(row=1, column=0, sticky="nsew", pady=(0, 2))
+        self.comp_names.insert("1.0", "CM_2_ELEM CM_3_ELEM CM_4_ELEM")
+        ttk.Label(
+            box1,
+            text="元件名稱清單（空白 / 逗號 / 分號 分隔）；第一筆用 CMSEL,S，其餘用下方「後續疊加」模式。",
+            foreground="gray", justify="left", wraplength=620,
+        ).grid(row=2, column=0, sticky="ew", pady=(2, 0))
+
+        box2 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box2, minsize=1, stretch="never")
+        self._section_title(box2, "② 疊加與後處理設定")
+
+        self.comp_with_none = tk.BooleanVar(value=False)
+        ttk.Checkbutton(box2, text="前置 CMSEL, NONE", variable=self.comp_with_none).pack(anchor="w")
+
+        row1 = ttk.Frame(box2); row1.pack(fill="x", pady=(4, 0))
+        ttk.Label(row1, text="後續疊加：").pack(side="left")
+        self.comp_next_type = tk.StringVar(value="A")
+        for label, value in NEXT_TYPE_OPTIONS:
+            ttk.Radiobutton(row1, text=label, variable=self.comp_next_type, value=value).pack(side="left", padx=(0, 8))
+
+        row2 = ttk.Frame(box2); row2.pack(fill="x", pady=(4, 0))
+        ttk.Label(row2, text="後處理：").pack(side="left")
+        self.comp_post = tk.StringVar(value="無")
+        for val in COMP_POST_OPTIONS:
+            ttk.Radiobutton(row2, text=val, variable=self.comp_post, value=val).pack(side="left", padx=(0, 8))
+
+        box3 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box3, minsize=1, stretch="never")
+        self._section_title(box3, "③ 儲存設定")
+
+        row3 = ttk.Frame(box3); row3.pack(fill="x")
+        ttk.Label(row3, text="儲存合併後元件：").pack(side="left")
+        self.comp_save_name = tk.StringVar(value="")
+        ttk.Entry(row3, textvariable=self.comp_save_name, width=16).pack(side="left", padx=(4, 8))
+        ttk.Label(row3, text="實體類型：").pack(side="left")
+        self.comp_save_entity = tk.StringVar(value="ELEM")
+        for ent in ENTITY_INFO.keys():
+            ttk.Radiobutton(row3, text=ent, variable=self.comp_save_entity, value=ent).pack(side="left", padx=(0, 6))
 
     def generate_component_merge(self) -> None:
         try:
@@ -2145,9 +1609,7 @@ class APDLSelectorGUI:
             if self.comp_with_none.get():
                 lines.append("CMSEL, NONE")
             lines.extend(
-                build_component_select_commands(
-                    names, first_type="S", next_type=next_type
-                ).splitlines()
+                build_component_select_commands(names, first_type="S", next_type=next_type).splitlines()
             )
             if post != "無":
                 lines.append(post)
@@ -2165,9 +1627,331 @@ class APDLSelectorGUI:
         except Exception as exc:
             messagebox.showerror("錯誤", str(exc))
 
+    # ── ④ 拓樸鏈分頁 ────────────────────────────────────────────────────────
+
+    def build_tab_topology(self) -> None:
+        pane = self._new_tab_pane("拓樸鏈")
+
+        box1 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box1, minsize=1, stretch="never")
+        self._section_title(box1, "① 模式設定")
+
+        row1 = ttk.Frame(box1); row1.pack(fill="x")
+        ttk.Label(row1, text="模式：").pack(side="left")
+        self.topo_mode_display = tk.StringVar(value=TOPOLOGY_DISPLAY_OPTIONS[0][0])
+        self.topo_mode_combo = ttk.Combobox(
+            row1, state="readonly", textvariable=self.topo_mode_display,
+            values=[label for label, _key in TOPOLOGY_DISPLAY_OPTIONS],
+            width=50, height=len(TOPOLOGY_DISPLAY_OPTIONS),
+        )
+        self.topo_mode_combo.pack(side="left", padx=(6, 14))
+        self.topo_mode_combo.bind("<<ComboboxSelected>>", self._update_topology_mode_ui, add="+")
+
+        row2 = ttk.Frame(box1); row2.pack(fill="x", pady=(6, 0))
+        self.topo_style_label = ttk.Label(row2, text="ID 輸出：")
+        self.topo_style_label.pack(side="left")
+        self.topo_id_style = tk.StringVar(value="逐一加選")
+        self.topo_style_radios: list[ttk.Radiobutton] = []
+        for lbl in ["逐一加選", "壓縮排序範圍"]:
+            rb = ttk.Radiobutton(row2, text=lbl, variable=self.topo_id_style, value=lbl)
+            rb.pack(side="left", padx=(0, 10))
+            self.topo_style_radios.append(rb)
+
+        box2 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box2, minsize=1, stretch="always")
+        box2.columnconfigure(0, weight=1)
+        box2.rowconfigure(2, weight=1)
+        self._section_title_grid(box2, "② 來源輸入", row=0)
+
+        self.topo_source_label = ttk.Label(box2, text="來源 IDs")
+        self.topo_source_label.grid(row=1, column=0, sticky="w")
+
+        self.topo_ids = tk.Text(box2, height=4, wrap="word")
+        self.topo_ids.grid(row=2, column=0, sticky="nsew", pady=(2, 0))
+        self.topo_ids.insert("1.0", "8 25")
+
+        self.topo_help_label = ttk.Label(
+            box2,
+            text="可直接貼入任何 ANSYS LIST 輸出（CMLIST/NLIST/ALIST/LLIST/KLIST 等），自動識別並萃取來源實體 ID",
+            foreground="gray", justify="left", wraplength=620,
+        )
+        self.topo_help_label.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+
+        box3 = ttk.Frame(pane, padding=(0, 6))
+        pane.add(box3, minsize=1, stretch="never")
+        self._section_title(box3, "③ 儲存設定")
+
+        row3 = ttk.Frame(box3); row3.pack(fill="x")
+        self.topo_save_label = ttk.Label(row3, text="儲存最終結果元件：")
+        self.topo_save_label.pack(side="left")
+        self.topo_cm_name = tk.StringVar(value="")
+        self.topo_save_entry = ttk.Entry(row3, textvariable=self.topo_cm_name, width=20)
+        self.topo_save_entry.pack(side="left", padx=(4, 0))
+
+    def _resolve_topology_mode_key(self) -> str:
+        return DISPLAY_TO_MODE_KEY[self.topo_mode_display.get()]
+
+    def _update_topology_mode_ui(self, _event: tk.Event | None = None) -> None:
+        is_cmsel = self._resolve_topology_mode_key() == TOPOLOGY_CMSEL_MODE
+        if is_cmsel:
+            self.topo_source_label.configure(text="元件／組合名稱")
+            self.topo_style_label.configure(text="ID 輸出（不適用）：")
+            for rb in self.topo_style_radios:
+                rb.configure(state="disabled")
+            self.topo_help_label.configure(
+                text="支援多筆元件或組合名稱（空白／逗號／分號分隔）；"
+                     "第一筆使用 CMSEL,S，後續使用 CMSEL,A。"
+            )
+            self.topo_save_label.configure(text="儲存最終結果元件（不適用）：")
+            self.topo_save_entry.configure(state="disabled")
+        else:
+            self.topo_source_label.configure(text="來源 IDs")
+            self.topo_style_label.configure(text="ID 輸出：")
+            for rb in self.topo_style_radios:
+                rb.configure(state="normal")
+            self.topo_help_label.configure(
+                text="可直接貼入任何 ANSYS LIST 輸出（CMLIST/NLIST/ALIST/LLIST/KLIST 等），自動識別並萃取來源實體 ID"
+            )
+            self.topo_save_label.configure(text="儲存最終結果元件：")
+            self.topo_save_entry.configure(state="normal")
+        if hasattr(self, "toolbar"):
+            self._refresh_shared_toolbar()
+
+    def generate_topology(self) -> None:
+        try:
+            mode_name = self._resolve_topology_mode_key()
+            mode      = TOPOLOGY_MODES[mode_name]
+            if mode.get("kind") == "component":
+                names = parse_component_names(self.topo_ids.get("1.0", "end"))
+                if not names:
+                    raise ValueError("請輸入至少一個元件或組合名稱。")
+                self.write_output(build_component_select_commands(names))
+                return
+
+            ids    = parse_numbers(self.topo_ids.get("1.0", "end"))
+            if not ids:
+                raise ValueError("請輸入來源 IDs。")
+            style  = self.topo_id_style.get().strip()
+            source = mode["source"]
+            lines  = build_id_list_commands(source, ids, style, "S", "A").splitlines()
+            lines.extend(mode["steps"])
+            append_cm_line(lines, self.topo_cm_name.get(), mode["target"])
+            self.write_output("\n".join(lines))
+        except Exception as exc:
+            messagebox.showerror("錯誤", str(exc))
+
+    # ── ⑤ LOG 轉 APDL 分頁（獨立左右兩欄，不使用共用輸出結果視窗）────────────────
+
+    def build_tab_log_converter(self) -> None:
+        tab = ttk.Frame(self.notebook, padding=10)
+        self.notebook.add(tab, text="LOG 轉 APDL")
+
+        self.log_cleanup = tk.BooleanVar(value=True)
+        self.log_strip_comments = tk.BooleanVar(value=False)
+        self.log_compress_ranges = tk.BooleanVar(value=False)
+        self.log_status = tk.StringVar(value="待命")
+
+        self.log_help_label = ttk.Label(
+            tab,
+            text="左側貼上 ANSYS LOG / LGW 指令，按「開始轉換」後右側顯示轉換結果。"
+                 "中間橫桿可左右拖曳調整兩側寬度；也可以 Ctrl+滾輪 或 Ctrl +/- 放大縮小字體。"
+                 "「壓縮排序範圍」會忽略原始 log 的挑選順序，排序去重後合併成最少的等差範圍。"
+                 "無法無損改寫的區塊會保留原始語法；執行中的 /INPUT 一律保留。",
+            foreground="gray", justify="left",
+        )
+        self.log_help_label.pack(fill="x", anchor="w", pady=(0, 8))
+        tab.bind(
+            "<Configure>",
+            lambda event: self.log_help_label.configure(wraplength=max(event.width - 20, 1)),
+            add="+",
+        )
+
+        log_pane = tk.PanedWindow(tab, orient="vertical", borderwidth=0, sashwidth=6, sashrelief="raised")
+        log_pane.pack(fill="both", expand=True)
+
+        settings_box = ttk.Frame(log_pane, padding=(0, 6))
+        log_pane.add(settings_box, minsize=1, stretch="never")
+        self._section_title(settings_box, "① 轉換設定")
+
+        row = ttk.Frame(settings_box); row.pack(fill="x")
+        ttk.Checkbutton(row, text="移除 GUI 顯示／視角雜訊", variable=self.log_cleanup).pack(side="left")
+        ttk.Checkbutton(row, text="移除註解", variable=self.log_strip_comments).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(row, text="壓縮排序範圍", variable=self.log_compress_ranges).pack(side="left", padx=(12, 0))
+
+        zoom_row = ttk.Frame(row)
+        zoom_row.pack(side="right")
+        ttk.Label(zoom_row, text="字體縮放：").pack(side="left")
+        ttk.Button(zoom_row, text="A-", width=3, command=lambda: self._log_zoom(-1)).pack(side="left")
+        ttk.Button(zoom_row, text="重設", width=4, command=self._log_zoom_reset).pack(side="left", padx=(2, 0))
+        ttk.Button(zoom_row, text="A+", width=3, command=lambda: self._log_zoom(1)).pack(side="left", padx=(2, 0))
+
+        panels_box = ttk.Frame(log_pane, padding=(0, 6))
+        log_pane.add(panels_box, minsize=1, stretch="always")
+        panels_box.columnconfigure(0, weight=1)
+        panels_box.rowconfigure(0, weight=1)
+
+        self.log_text_pane = tk.PanedWindow(panels_box, orient="horizontal", borderwidth=0, sashwidth=6)
+        self.log_text_pane.grid(row=0, column=0, sticky="nsew")
+
+        source_frame, self.log_source_text, self.log_source_linenumbers = (
+            self._build_log_text_panel(self.log_text_pane, "來源 LOG / LGW（可直接貼上）", editable=True)
+        )
+        self.log_text_pane.add(source_frame, minsize=1, stretch="always")
+
+        result_frame, self.log_result_text, self.log_result_linenumbers = (
+            self._build_log_text_panel(self.log_text_pane, "轉換結果（可選取複製，Ctrl+A 全選）", editable=False)
+        )
+        self.log_text_pane.add(result_frame, minsize=1, stretch="always")
+
+        actions_box = ttk.Frame(log_pane, padding=(0, 6))
+        log_pane.add(actions_box, minsize=1, stretch="never")
+
+        action_row = ttk.Frame(actions_box)
+        action_row.pack(fill="x")
+        ttk.Button(action_row, text="清除全部", command=self._clear_log_conversion).pack(side="left")
+        ttk.Button(
+            action_row, text="開始轉換", command=self._start_log_conversion, style="RedAction.TButton",
+        ).pack(side="left", padx=(6, 0))
+
+        ttk.Label(actions_box, textvariable=self.log_status).pack(anchor="w", pady=(4, 0))
+
+        self.root.bind_all("<Control-equal>", lambda _e: self._log_zoom(1))
+        self.root.bind_all("<Control-plus>", lambda _e: self._log_zoom(1))
+        self.root.bind_all("<Control-minus>", lambda _e: self._log_zoom(-1))
+        self.root.bind_all("<Control-0>", lambda _e: self._log_zoom_reset())
+
+    def _build_log_text_panel(
+        self, parent: tk.Widget, title: str, *, editable: bool
+    ) -> tuple[ttk.Frame, tk.Text, tk.Text]:
+        frame = ttk.Frame(parent)
+        frame.rowconfigure(2, weight=1)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text=title).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 2))
+
+        line_numbers = tk.Text(
+            frame, width=5, padx=4, takefocus=0, border=0, state="disabled", wrap="none",
+            background="#f0f0f0", foreground="#808080", font=self.log_gutter_font,
+        )
+        line_numbers.grid(row=2, column=0, sticky="ns")
+
+        text_widget = tk.Text(frame, wrap="none", undo=editable, font=self.log_text_font)
+        text_widget.grid(row=2, column=1, sticky="nsew")
+        if not editable:
+            _make_readonly_but_selectable(text_widget)
+        _bind_select_all_shortcut(text_widget)
+
+        yscroll = ttk.Scrollbar(frame, orient="vertical")
+        yscroll.grid(row=2, column=2, sticky="ns")
+        xscroll = ttk.Scrollbar(frame, orient="horizontal", command=text_widget.xview)
+        xscroll.grid(row=3, column=1, sticky="ew")
+
+        def _on_text_yscroll(first: str, last: str) -> None:
+            yscroll.set(first, last)
+            line_numbers.yview_moveto(float(first))
+
+        def _on_scrollbar(*args: str) -> None:
+            text_widget.yview(*args)
+            line_numbers.yview(*args)
+
+        text_widget.configure(yscrollcommand=_on_text_yscroll, xscrollcommand=xscroll.set)
+        yscroll.configure(command=_on_scrollbar)
+
+        def _forward_wheel(event: tk.Event) -> str:
+            text_widget.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            line_numbers.yview_moveto(text_widget.yview()[0])
+            return "break"
+
+        line_numbers.bind("<MouseWheel>", _forward_wheel)
+
+        def _on_ctrl_wheel(event: tk.Event) -> str:
+            self._log_zoom(1 if event.delta > 0 else -1)
+            return "break"
+
+        text_widget.bind("<Control-MouseWheel>", _on_ctrl_wheel)
+        line_numbers.bind("<Control-MouseWheel>", _on_ctrl_wheel)
+
+        def _on_modified(_event: tk.Event) -> None:
+            self._refresh_log_line_numbers(text_widget, line_numbers)
+            text_widget.edit_modified(False)
+
+        if editable:
+            text_widget.bind("<<Modified>>", _on_modified, add="+")
+            ttk.Button(
+                frame, text="清除本欄", width=8,
+                command=lambda w=text_widget: w.delete("1.0", "end"),
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        self._refresh_log_line_numbers(text_widget, line_numbers)
+
+        return frame, text_widget, line_numbers
+
+    def _log_zoom(self, delta: int) -> None:
+        new_size = max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, self.log_text_font.cget("size") + delta))
+        self.log_text_font.configure(size=new_size)
+        self.log_gutter_font.configure(size=new_size)
+
+    def _log_zoom_reset(self) -> None:
+        self.log_text_font.configure(size=DEFAULT_FONT_SIZE)
+        self.log_gutter_font.configure(size=DEFAULT_FONT_SIZE)
+
+    @staticmethod
+    def _refresh_log_line_numbers(text_widget: tk.Text, line_numbers: tk.Text) -> None:
+        line_count = int(text_widget.index("end-1c").split(".")[0])
+        numbers = "\n".join(str(n) for n in range(1, line_count + 1))
+        line_numbers.configure(state="normal")
+        line_numbers.delete("1.0", "end")
+        line_numbers.insert("1.0", numbers)
+        line_numbers.configure(state="disabled")
+
+    def _clear_log_conversion(self) -> None:
+        self.log_source_text.delete("1.0", "end")
+        self._set_log_result("")
+        self.log_status.set("待命")
+
+    def _set_log_result(self, text: str) -> None:
+        self.log_result_text.configure(state="normal")
+        self.log_result_text.delete("1.0", "end")
+        self.log_result_text.insert("1.0", text)
+        _make_readonly_but_selectable(self.log_result_text)
+        _bind_select_all_shortcut(self.log_result_text)
+        self._refresh_log_line_numbers(self.log_result_text, self.log_result_linenumbers)
+
+    def _start_log_conversion(self) -> None:
+        source_text = self.log_source_text.get("1.0", "end-1c")
+        if not source_text.strip():
+            messagebox.showwarning("資料不足", "請先在左側貼上要轉換的 LOG / LGW 指令。", parent=self.root)
+            return
+
+        sink = io.StringIO()
+        try:
+            report = convert_lgw_stream(
+                io.StringIO(source_text), sink,
+                cleanup=self.log_cleanup.get(),
+                strip_comments=self.log_strip_comments.get(),
+                compress_ranges=self.log_compress_ranges.get(),
+            )
+        except Exception as exc:
+            self.log_status.set("轉換失敗")
+            messagebox.showerror("轉換失敗", f"{type(exc).__name__}: {exc}", parent=self.root)
+            return
+
+        self._set_log_result(sink.getvalue())
+        summary = f"轉換完成：輸入 {report.input_lines:,} 行 → 輸出 {report.output_lines:,} 行"
+        details = []
+        if report.removed_noise_lines:
+            details.append(f"移除 GUI 雜訊 {report.removed_noise_lines:,} 行")
+        if report.removed_comment_lines:
+            details.append(f"移除註解 {report.removed_comment_lines:,} 行")
+        if report.preserved_blocks:
+            details.append(f"保留 {report.preserved_blocks:,} 個區塊")
+        if report.warnings:
+            details.append(f"警告 {len(report.warnings):,} 筆")
+        if details:
+            summary += "（" + "；".join(details) + "）"
+        self.log_status.set(summary)
+
 
 if __name__ == "__main__":
     _ensure_configured_python()
     root = tk.Tk()
-    app = APDLSelectorGUI(root)
+    app = MergedSelectToolGUI(root)
     root.mainloop()
