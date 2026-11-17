@@ -17,7 +17,7 @@ from typing import Callable, Iterable, Optional, TextIO, Union
 
 # 換到其他電腦時，只需修改下一行的 pythonw.exe 絕對路徑。
 PYTHONW_EXE = Path(
-    r"C:\Users\kade\Desktop\xxx\010_vendor_refs\015_python\python3.8\win64\pythonw.exe"
+    r"C:\Users\python3.8\win64\pythonw.exe"
 )
 
 
@@ -166,7 +166,30 @@ COMPONENT_COMMANDS = {
     "LCCAT", "ADELE", "VEXT", "ACCAT", "LCOMB", "ACLEAR", "AADD",
     "VOVLAP", "KGEN", "LDELE", "VGEN", "ASBW", "VDRAG", "KMODIF",
     "VSBV", "EMODIF", "AGLUE", "VSBA", "LGEN", "KDELE", "AGEN",
-    "EDELE", "VADD", "ADRAG", "LSBW", "NDELE", "VPTN",
+    "EDELE", "VADD", "ADRAG", "LSBW", "NDELE", "VPTN", "ASBA",
+    # AREA
+    "AESIZE", "AINA", "ALIST", "AMESH", "AOVLAP", "AREFINE", "AREVERSE",
+    "ARSCALE", "ARSYM", "ASBL", "ASBV", "ATRAN", "BFA", "BFADELE",
+    "BFALIST", "DA", "DALIST", "VROTAT",
+    # LINE
+    "AROTAT", "LCLEAR", "LDIV", "LGLUE", "LINL", "LLIST", "LMESH",
+    "LOVLAP", "LREFINE", "LREVERSE", "LSBA", "LSBL", "LSBV", "LSSCALE",
+    "LSYMM", "LTRAN", "BFL", "BFLDELE", "BFLLIST", "DL", "DLDELE",
+    "DLLIST",
+    # KP
+    "KCLEAR", "KLIST", "KMESH", "KPSCALE", "KREFINE", "KSCALE", "KSCON",
+    "KSYMM", "KTRAN", "LROTAT", "NKPT", "BFK", "BFKDELE", "BFKLIST",
+    "DK", "DKDELE", "DKLIST", "FK", "FKDELE", "FKLIST",
+    # ELEM
+    "DETAB", "EALIVE", "EGEN", "EKILL", "ELIST", "ENGEN", "ENSYM",
+    "EREFINE", "ESYM", "VFQUERY", "BFE", "BFEDELE", "BFELIST",
+    # NODE
+    "DESOL", "DNSOL", "M", "MDELE", "MGEN", "MLIST", "NGEN", "NLIST",
+    "NMODIF", "NREFINE", "NROTAT", "NSCALE", "NSYM", "BF", "D", "DDELE",
+    "DLIST", "F", "FDELE", "FLIST",
+    # VOLU
+    "VIMP", "VINP", "VINV", "VLIST", "VLSCALE", "VMESH", "VSYMM",
+    "VTRAN", "BFV", "BFVDELE", "BFVLIST",
 }
 
 DIRECT_COMMAND_LIMITS = {
