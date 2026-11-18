@@ -1,0 +1,30 @@
+Z_B = 0.0                        ! ★新增：起始 Z 位置
+H_C = 0.03                       ! ★新增：厚度
+
+/INQUIRE,EXIST_CIRCLE,EXIST,shape_export_circle,txt
+*IF,EXIST_CIRCLE,EQ,1,THEN
+    /INQUIRE,N_CIRCLE,LINES,shape_export_circle,txt
+    *DIM,CIRC,ARRAY,N_CIRCLE,4
+    *VREAD,CIRC(1,1),shape_export_circle,txt,,JIK,4,N_CIRCLE
+(F9.0,3E21.13E3)
+
+    *DO,I_C,1,N_CIRCLE
+        CX_C = CIRC(I_C,2)
+        CY_C = CIRC(I_C,3)
+        R_C  = CIRC(I_C,4)
+
+        TOL_C = R_C*1E-6
+
+        LOCAL,15,1,CX_C,CY_C,0
+        ESEL,S,CENT,X,-TOL_C,R_C+TOL_C            ! ★改：元素形心半徑 ≤ R_C
+        CSYS,0
+        ESEL,R,CENT,Z,Z_B-TOL_C,Z_B+H_C+TOL_C     ! ★新增：形心落在 Z_B ~ Z_B+H_C
+
+        *IF,I_C,GT,1,THEN
+            CMSEL,A,CIRCLE_ELEM                    ! ★改：CIRCLE_AREA → CIRCLE_ELEM
+        *ENDIF
+        CM,CIRCLE_ELEM,ELEM                        ! ★改：AREA → ELEM
+    *ENDDO
+*ELSE
+    /COM,[座標重建CM] 找不到 shape_export_circle.txt，略過 CIRCLE 類別
+*ENDIF
