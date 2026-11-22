@@ -1,0 +1,3065 @@
+;;; sreg_2008.lsp
+;;; Project location: 012_autocad/022_sat
+;;;
+;;; AutoCAD 2008 compatible Visual LISP utility.
+;;; Command: SREG
+;;;
+;;; The command copies selected 2D curves to a work set, splits
+;;; LINE/ARC/CIRCLE/ELLIPSE/SPLINE geometry at true intersections, traces every
+;;; bounded planar face, and
+;;; creates mutually non-overlapping REGION objects.  Original entities are
+;;; moved to a hidden backup layer only after the complete result succeeds.
+
+(vl-load-com)
+
+(setq *sr-app-name*       "SR2008"
+      *sr-layer-backup*   "SR_SOURCE_BACKUP"
+      *sr-layer-split*    "SR_SPLIT"
+      *sr-layer-region*   "SR_REGION"
+      *sr-layer-temp*     "SR_TEMP"
+      *sr-role-source*    "SOURCE"
+      *sr-role-split*     "SPLIT"
+      *sr-role-region*    "REGION"
+      *sr-role-temp*      "TEMP"
+      *sr-two-pi*         (* 2.0 pi)
+      *sr-geom-rel-tol*   1.0e-9
+      *sr-geom-abs-tol*   1.0e-6
+      *sr-area-rel-tol*   1.0e-8
+      *sr-area-abs-tol*   1.0e-16
+      *sr-color-backup*   8
+      *sr-color-split*    7
+      *sr-color-region*   3
+      *sr-color-temp*     9
+      *sr-ac-extend-none* 0
+      *sr-ac-intersection* 1
+      *sr-ac-subtraction*  2
+      *sr-ac-all-viewports* 1
+      *sr-polyline-unsupported-flags* (+ 8 16 64)
+)
+
+;;; --------------------------------------------------------------------------
+;;; Basic helpers
+;;; --------------------------------------------------------------------------
+
+(defun sr-abort (message)
+  (setq *sr-failure* message)
+  ;; Raise a normal AutoLISP exception.  The complete processing transaction
+  ;; is invoked through VL-CATCH-ALL-APPLY, which is available in AutoCAD 2008.
+  ;; Common Lisp CATCH/THROW are not part of this AutoLISP release.
+  (/ 1 0)
+)
+
+(defun sr-as-list (value / converted)
+  (cond
+    ((null value) nil)
+    ((= (type value) 'VARIANT)
+     ;; AutoCAD 2008 IntersectWith returns an empty VARIANT/SAFEARRAY for
+     ;; non-intersecting curves.  Reading that value can raise "Invalid index"
+     ;; instead of returning NIL, so treat a failed conversion as an empty list.
+     (setq converted
+       (vl-catch-all-apply 'vlax-variant-value (list value)))
+     (if (vl-catch-all-error-p converted)
+       nil
+       (sr-as-list converted)
+     )
+    )
+    ((= (type value) 'SAFEARRAY)
+     (setq converted
+       (vl-catch-all-apply 'vlax-safearray->list (list value)))
+     (if (vl-catch-all-error-p converted) nil converted)
+    )
+    ((listp value) value)
+    (t (list value))
+  )
+)
+
+(defun sr-vla-point-list (value / result)
+  (setq result (sr-as-list value))
+  (if (= (length result) 2)
+    (append result (list 0.0))
+    result
+  )
+)
+
+(defun sr-range (count / index result)
+  (setq index 0
+        result nil)
+  (repeat count
+    (setq result (cons index result)
+          index (1+ index))
+  )
+  (reverse result)
+)
+
+(defun sr-ss-to-list (selection / index result)
+  (setq index 0
+        result nil)
+  (if selection
+    (repeat (sslength selection)
+      (setq result (cons (ssname selection index) result)
+            index (1+ index))
+    )
+  )
+  (reverse result)
+)
+
+(defun sr-handle (entity / data)
+  (setq data (entget entity))
+  (cdr (assoc 5 data))
+)
+
+(defun sr-entity-type (entity)
+  (cdr (assoc 0 (entget entity)))
+)
+
+(defun sr-safe-entdel (entity)
+  (if (and entity (entget entity))
+    (vl-catch-all-apply 'entdel (list entity))
+  )
+)
+
+(defun sr-safe-vla-delete (object)
+  (if object
+    (vl-catch-all-apply 'vla-Delete (list object))
+  )
+)
+
+(defun sr-restore-vars (saved / item)
+  (foreach item saved
+    (vl-catch-all-apply 'setvar (list (car item) (cdr item)))
+  )
+)
+
+(defun sr-normalize-angle (angle)
+  (while (< angle 0.0)
+    (setq angle (+ angle *sr-two-pi*))
+  )
+  (while (>= angle *sr-two-pi*)
+    (setq angle (- angle *sr-two-pi*))
+  )
+  angle
+)
+
+(defun sr-positive-sweep (start end / sweep)
+  (setq sweep (- (sr-normalize-angle end) (sr-normalize-angle start)))
+  (if (< sweep 0.0)
+    (setq sweep (+ sweep *sr-two-pi*))
+  )
+  sweep
+)
+
+(defun sr-distance-2d (p1 p2)
+  (sqrt
+    (+
+      (expt (- (car p2) (car p1)) 2.0)
+      (expt (- (cadr p2) (cadr p1)) 2.0)
+    )
+  )
+)
+
+(defun sr-point-equal-p (p1 p2 tolerance)
+  (and p1 p2
+       (<= (sr-distance-2d p1 p2) tolerance)
+       (<= (abs (- (caddr p1) (caddr p2))) tolerance))
+)
+
+(defun sr-dot-2d (v1 v2)
+  (+ (* (car v1) (car v2)) (* (cadr v1) (cadr v2)))
+)
+
+(defun sr-cross-2d (v1 v2)
+  (- (* (car v1) (cadr v2)) (* (cadr v1) (car v2)))
+)
+
+(defun sr-vector-2d (p1 p2)
+  (list (- (car p2) (car p1)) (- (cadr p2) (cadr p1)))
+)
+
+(defun sr-vector-length-2d (vector)
+  (sqrt (+ (* (car vector) (car vector))
+           (* (cadr vector) (cadr vector))))
+)
+
+(defun sr-negate-vector-2d (vector)
+  (list (- (car vector)) (- (cadr vector)))
+)
+
+(defun sr-safe-curve-value (function-name arguments / result)
+  (setq result (vl-catch-all-apply function-name arguments))
+  (if (vl-catch-all-error-p result) nil result)
+)
+
+(defun sr-curve-object (entity)
+  (if (= (type entity) 'VLA-OBJECT)
+    entity
+    (vlax-ename->vla-object entity)
+  )
+)
+
+(defun sr-curve-closed-p (entity / result)
+  (setq result
+    (sr-safe-curve-value
+      'vlax-curve-isClosed (list (sr-curve-object entity))))
+  (if result t nil)
+)
+
+(defun sr-curve-planar-p (entity / result)
+  (setq result
+    (sr-safe-curve-value
+      'vlax-curve-isPlanar (list (sr-curve-object entity))))
+  (if result t nil)
+)
+
+(defun sr-curve-start-point (entity)
+  (sr-safe-curve-value
+    'vlax-curve-getStartPoint (list (sr-curve-object entity)))
+)
+
+(defun sr-curve-end-point (entity)
+  (sr-safe-curve-value
+    'vlax-curve-getEndPoint (list (sr-curve-object entity)))
+)
+
+(defun sr-curve-start-param (entity)
+  (sr-safe-curve-value
+    'vlax-curve-getStartParam (list (sr-curve-object entity)))
+)
+
+(defun sr-curve-end-param (entity)
+  (sr-safe-curve-value
+    'vlax-curve-getEndParam (list (sr-curve-object entity)))
+)
+
+(defun sr-curve-length (entity / end-parameter)
+  (setq end-parameter (sr-curve-end-param entity))
+  (if (null end-parameter)
+    nil
+    (sr-safe-curve-value
+      'vlax-curve-getDistAtParam
+      (list (sr-curve-object entity) end-parameter))
+  )
+)
+
+(defun sr-curve-enclosed-area (entity)
+  (sr-safe-curve-value
+    'vlax-curve-getArea (list (sr-curve-object entity)))
+)
+
+(defun sr-curve-point-at-distance (entity distance)
+  (sr-safe-curve-value
+    'vlax-curve-getPointAtDist
+    (list (sr-curve-object entity) distance))
+)
+
+(defun sr-curve-point-at-fraction (entity fraction / length)
+  (setq length (sr-curve-length entity))
+  (if length
+    (sr-curve-point-at-distance entity (* length fraction))
+    nil
+  )
+)
+
+(defun sr-curve-distance-at-point (entity point / parameter)
+  (setq parameter
+    (sr-safe-curve-value
+      'vlax-curve-getParamAtPoint
+      (list (sr-curve-object entity) point)))
+  (if (null parameter)
+    nil
+    (sr-safe-curve-value
+      'vlax-curve-getDistAtParam
+      (list (sr-curve-object entity) parameter))
+  )
+)
+
+(defun sr-curve-closest-point (entity point)
+  (sr-safe-curve-value
+    'vlax-curve-getClosestPointTo
+    (list (sr-curve-object entity) point))
+)
+
+(defun sr-curve-first-derivative (entity parameter)
+  (sr-safe-curve-value
+    'vlax-curve-getFirstDeriv
+    (list (sr-curve-object entity) parameter))
+)
+
+(defun sr-add-unique-point (point points tolerance / found candidate)
+  (setq found nil)
+  (foreach candidate points
+    (if (sr-point-equal-p point candidate tolerance)
+      (setq found t)
+    )
+  )
+  (if found points (cons point points))
+)
+
+(defun sr-add-unique-angle (angle angles tolerance / found candidate delta)
+  (setq angle (sr-normalize-angle angle)
+        found nil)
+  (foreach candidate angles
+    (setq delta (abs (- angle candidate)))
+    (setq delta (min delta (- *sr-two-pi* delta)))
+    (if (<= delta tolerance)
+      (setq found t)
+    )
+  )
+  (if found angles (cons angle angles))
+)
+
+(defun sr-unique-enames (entities / result entity)
+  (setq result nil)
+  (foreach entity entities
+    (if (not (member entity result))
+      (setq result (cons entity result))
+    )
+  )
+  (reverse result)
+)
+
+(defun sr-alist-put (key values alist / old-entry new-entry)
+  ;; AutoLISP 2008 has no SETCDR.  Replace the complete association entry.
+  (setq old-entry (assoc key alist)
+        new-entry (cons key values))
+  (if old-entry
+    (subst new-entry old-entry alist)
+    (cons new-entry alist)
+  )
+)
+
+(defun sr-area-equal-p (area1 area2 area-tolerance)
+  (<= (abs (- area1 area2))
+      (max area-tolerance
+           (* *sr-area-rel-tol* (max (abs area1) (abs area2)))))
+)
+
+;;; --------------------------------------------------------------------------
+;;; XData ownership and output layers
+;;; --------------------------------------------------------------------------
+
+(defun sr-set-role (entity role metadata / data old-record new-app new-record)
+  (regapp *sr-app-name*)
+  (setq data (entget entity (list *sr-app-name*))
+        old-record (assoc -3 data)
+        new-app (list *sr-app-name* (cons 1000 role)))
+  (if metadata
+    (setq new-app (append new-app (list (cons 1000 metadata))))
+  )
+  (setq new-record (list -3 new-app))
+  (if old-record
+    (setq data (subst new-record old-record data))
+    (setq data (append data (list new-record)))
+  )
+  (if (null (entmod data))
+    (sr-abort (strcat "Unable to attach SR2008 XData to entity "
+                      (sr-handle entity) "."))
+  )
+  (entupd entity)
+  entity
+)
+
+(defun sr-xdata-values (entity / data record app-data result item)
+  (setq data (entget entity (list *sr-app-name*))
+        record (assoc -3 data)
+        result nil)
+  (if record
+    (progn
+      (setq app-data (assoc *sr-app-name* (cdr record)))
+      (foreach item (cdr app-data)
+        (if (= (car item) 1000)
+          (setq result (append result (list (cdr item))))
+        )
+      )
+    )
+  )
+  result
+)
+
+(defun sr-role (entity)
+  (car (sr-xdata-values entity))
+)
+
+(defun sr-metadata (entity)
+  (cadr (sr-xdata-values entity))
+)
+
+(defun sr-entities-by-role (role / selection result entity)
+  (setq selection
+    (ssget "_X" (list (list -3 (list *sr-app-name*)))))
+  (setq result nil)
+  (foreach entity (sr-ss-to-list selection)
+    (if (= (sr-role entity) role)
+      (setq result (cons entity result))
+    )
+  )
+  (reverse result)
+)
+
+(defun sr-delete-role (role / entity)
+  (foreach entity (sr-entities-by-role role)
+    (sr-safe-entdel entity)
+  )
+)
+
+(defun sr-find-layer (document name / layers layer found)
+  ;; Collection.Item can raise "Invalid index" on some AutoCAD 2008 builds
+  ;; when a string key is passed through Visual LISP.  Enumerating is slower
+  ;; but reliable and the layer collection is small.
+  (setq layers (vla-get-Layers document)
+        found nil)
+  (vlax-for layer layers
+    (if (= (strcase (vla-get-Name layer)) (strcase name))
+      (setq found layer)
+    )
+  )
+  found
+)
+
+(defun sr-ensure-layer (document name color / layers layer)
+  (setq layers (vla-get-Layers document)
+        layer (sr-find-layer document name))
+  (if (null layer)
+    (setq layer (vla-Add layers name))
+  )
+  (vl-catch-all-apply 'vla-put-Lock (list layer :vlax-false))
+  (vl-catch-all-apply 'vla-put-Freeze (list layer :vlax-false))
+  (vl-catch-all-apply 'vla-put-LayerOn (list layer :vlax-true))
+  (vl-catch-all-apply 'vla-put-Color (list layer color))
+  layer
+)
+
+(defun sr-prepare-layers (document)
+  (sr-ensure-layer document *sr-layer-backup* *sr-color-backup*)
+  (sr-ensure-layer document *sr-layer-split* *sr-color-split*)
+  (sr-ensure-layer document *sr-layer-region* *sr-color-region*)
+  (sr-ensure-layer document *sr-layer-temp* *sr-color-temp*)
+)
+
+(defun sr-set-layer-on (document name state / layer)
+  (setq layer (sr-find-layer document name))
+  (if layer
+    (vl-catch-all-apply 'vla-put-LayerOn
+      (list layer (if state :vlax-true :vlax-false)))
+  )
+)
+
+(defun sr-isolate-layer (document keep-name / layers layer)
+  ;; Freeze every layer in the drawing except keep-name (must already be
+  ;; CLAYER -- AutoCAD refuses to freeze the current layer), so a later
+  ;; "select all" / ACISOUT style export can only ever pick up the final
+  ;; REGION geometry. Freeze (not just LayerOn/Off) matters here: objects on
+  ;; an off-but-unfrozen layer are still picked up by an "ALL" selection,
+  ;; while frozen layers are fully excluded from selection.
+  (setq layers (vla-get-Layers document))
+  (vlax-for layer layers
+    (if (/= (strcase (vla-get-Name layer)) (strcase keep-name))
+      (vl-catch-all-apply 'vla-put-Freeze (list layer :vlax-true))
+    )
+  )
+)
+
+;;; --------------------------------------------------------------------------
+;;; Source validation and tolerance
+;;; --------------------------------------------------------------------------
+
+(defun sr-supported-source-p (entity / kind flags)
+  (setq kind (sr-entity-type entity))
+  (cond
+    ((member kind
+       '("LINE" "ARC" "CIRCLE" "ELLIPSE" "SPLINE" "LWPOLYLINE")) t)
+    ((= kind "POLYLINE")
+     (setq flags (cdr (assoc 70 (entget entity))))
+     (if (null flags) (setq flags 0))
+     (= (logand flags *sr-polyline-unsupported-flags*) 0)
+    )
+    (t nil)
+  )
+)
+
+(defun sr-filter-supported-sources (entities / result entity)
+  (setq result nil)
+  (foreach entity entities
+    (if (and (entget entity) (sr-supported-source-p entity))
+      (setq result (cons entity result))
+    )
+  )
+  (reverse result)
+)
+
+(defun sr-layer-locked-p (document layer-name / layer)
+  (setq layer (sr-find-layer document layer-name))
+  (if (null layer)
+    nil
+    (= (vla-get-Lock layer) :vlax-true)
+  )
+)
+
+(defun sr-object-bounds (object / minimum maximum result)
+  (setq result
+    (vl-catch-all-apply 'vla-GetBoundingBox
+      (list object 'minimum 'maximum)))
+  (if (vl-catch-all-error-p result)
+    nil
+    (list (sr-vla-point-list minimum) (sr-vla-point-list maximum))
+  )
+)
+
+(defun sr-normal-wcs-positive-p (object tolerance / normal values result)
+  (if (vlax-property-available-p object 'Normal)
+    (progn
+      (setq result
+        (vl-catch-all-apply 'vla-get-Normal (list object)))
+      (if (vl-catch-all-error-p result)
+        nil
+        (progn
+          (setq normal result
+                values (sr-vla-point-list normal))
+          (and values
+               (<= (abs (car values)) tolerance)
+               (<= (abs (cadr values)) tolerance)
+               (<= (abs (- (caddr values) 1.0)) tolerance))
+        )
+      )
+    )
+    t
+  )
+)
+
+(defun sr-curve-end-tangents-valid-p (entity tolerance / start-param end-param
+                                       start-vector end-vector)
+  (setq start-param (sr-curve-start-param entity)
+        end-param (sr-curve-end-param entity))
+  (if (or (null start-param) (null end-param))
+    nil
+    (progn
+      (setq start-vector (sr-curve-first-derivative entity start-param)
+            end-vector (sr-curve-first-derivative entity end-param))
+      (and start-vector end-vector
+           (> (sr-vector-length-2d start-vector) tolerance)
+           (> (sr-vector-length-2d end-vector) tolerance))
+    )
+  )
+)
+
+(defun sr-validate-sources (document sources / entity kind data object bounds
+                             minimum maximum minx miny minz maxx maxy maxz
+                             dx dy diagonal tolerance area-tolerance layer-name
+                             curve-length start-point end-point)
+  (if (null sources)
+    (sr-abort "No source entities were selected."))
+  (setq minx nil miny nil minz nil maxx nil maxy nil maxz nil)
+  (foreach entity sources
+    (if (null (entget entity))
+      (sr-abort "A selected source entity no longer exists."))
+    (if (not (sr-supported-source-p entity))
+      (progn
+        (setq kind (sr-entity-type entity))
+        (sr-abort
+          (strcat "Unsupported entity " (sr-handle entity)
+                  " (type " (if kind kind "UNKNOWN") "). Use LINE, ARC, CIRCLE, "
+                  "ELLIPSE, SPLINE, LWPOLYLINE, or 2D POLYLINE."))))
+    (setq data (entget entity))
+    (if (and (assoc 67 data) (= (cdr (assoc 67 data)) 1))
+      (sr-abort
+        (strcat "Paper-space entity " (sr-handle entity)
+                " is not supported. Run the command in Model Space.")))
+    (setq object (vlax-ename->vla-object entity)
+          layer-name (vla-get-Layer object))
+    (if (sr-layer-locked-p document layer-name)
+      (sr-abort
+        (strcat "Entity " (sr-handle entity)
+                " is on locked layer " layer-name ".")))
+    (if (not (sr-normal-wcs-positive-p object 1.0e-9))
+      (sr-abort
+        (strcat "Entity " (sr-handle entity)
+                " is not on a positive-WCS-XY plane.")))
+    (setq bounds (sr-object-bounds object))
+    (if (null bounds)
+      (sr-abort
+        (strcat "Cannot read extents for entity " (sr-handle entity) ".")))
+    (setq minimum (car bounds)
+          maximum (cadr bounds))
+    (if (null minx)
+      (setq minx (car minimum)
+            miny (cadr minimum)
+            minz (caddr minimum)
+            maxx (car maximum)
+            maxy (cadr maximum)
+            maxz (caddr maximum))
+      (setq minx (min minx (car minimum))
+            miny (min miny (cadr minimum))
+            minz (min minz (caddr minimum))
+            maxx (max maxx (car maximum))
+            maxy (max maxy (cadr maximum))
+            maxz (max maxz (caddr maximum)))
+    )
+  )
+  (setq dx (- maxx minx)
+        dy (- maxy miny)
+        diagonal (sqrt (+ (* dx dx) (* dy dy))))
+  (if (<= diagonal *sr-geom-abs-tol*)
+    (sr-abort "The selected geometry has no usable XY extent."))
+  (setq tolerance
+    (max *sr-geom-abs-tol* (* diagonal *sr-geom-rel-tol*)))
+  (if (> (- maxz minz) tolerance)
+    (sr-abort "Selected entities are not coplanar; their Z extents differ."))
+  (setq area-tolerance
+    (max *sr-area-abs-tol* (* diagonal diagonal 1.0e-12)))
+  (foreach entity sources
+    (setq kind (sr-entity-type entity))
+    (if (member kind '("ELLIPSE" "SPLINE"))
+      (progn
+        (setq curve-length (sr-curve-length entity)
+              start-point (sr-curve-start-point entity)
+              end-point (sr-curve-end-point entity))
+        (if (or (null curve-length)
+                (<= curve-length tolerance)
+                (null start-point)
+                (null end-point))
+          (sr-abort
+            (strcat "Curve " (sr-handle entity)
+                    " has no usable exact curve parameterization.")))
+        (if (not (sr-curve-planar-p entity))
+          (sr-abort
+            (strcat "Curve " (sr-handle entity)
+                    " is not planar.")))
+        (if (not (sr-curve-end-tangents-valid-p entity tolerance))
+          (sr-abort
+            (strcat "Curve " (sr-handle entity)
+                    " has a zero or undefined endpoint tangent.")))
+      )
+    )
+  )
+  (list diagonal tolerance area-tolerance minz)
+)
+
+;;; --------------------------------------------------------------------------
+;;; Work-copy creation and primitive inspection
+;;; --------------------------------------------------------------------------
+
+(defun sr-vla-object-list (value / result item output)
+  (setq result (sr-as-list value)
+        output nil)
+  (foreach item result
+    (if (= (type item) 'VLA-OBJECT)
+      (setq output (cons item output))
+    )
+  )
+  (reverse output)
+)
+
+(defun sr-copy-and-explode (sources / source source-object source-handle clone
+                             clone-entity kind exploded result object entity object-name)
+  (setq result nil)
+  (foreach source sources
+    (setq *sr-phase* (strcat "copy source " (sr-handle source)))
+    (setq source-object (vlax-ename->vla-object source)
+          source-handle (sr-handle source)
+          clone (vl-catch-all-apply 'vla-Copy (list source-object)))
+    (if (vl-catch-all-error-p clone)
+      (sr-abort
+        (strcat "Cannot copy source entity " source-handle ".")))
+    (vla-put-Layer clone *sr-layer-temp*)
+    (setq clone-entity (vlax-vla-object->ename clone)
+          kind (sr-entity-type clone-entity))
+    (sr-set-role clone-entity *sr-role-temp* source-handle)
+    (if (member kind '("LINE" "ARC" "CIRCLE" "ELLIPSE" "SPLINE"))
+      (setq result (cons clone-entity result))
+      (progn
+        (setq exploded
+          (vl-catch-all-apply 'vlax-invoke (list clone 'Explode)))
+        (if (vl-catch-all-error-p exploded)
+          (sr-abort
+            (strcat "Cannot explode polyline source " source-handle ".")))
+        (setq exploded (sr-vla-object-list exploded))
+        (if (null exploded)
+          (sr-abort
+            (strcat "Polyline source " source-handle
+                    " produced no primitive curves.")))
+        (foreach object exploded
+          (setq object-name (vla-get-ObjectName object))
+          (if (not (member object-name '("AcDbLine" "AcDbArc" "AcDbCircle")))
+            (sr-abort
+              (strcat "Polyline source " source-handle
+                      " exploded to unsupported object " object-name ".")))
+          (vla-put-Layer object *sr-layer-temp*)
+          (setq entity (vlax-vla-object->ename object))
+          (sr-set-role entity *sr-role-temp* source-handle)
+          (setq result (cons entity result))
+        )
+        (sr-safe-vla-delete clone)
+      )
+    )
+  )
+  (reverse result)
+)
+
+(defun sr-edge-record (entity / object kind p1 p2 center radius start-angle end-angle)
+  (setq object (vlax-ename->vla-object entity)
+        kind (sr-entity-type entity))
+  (cond
+    ((= kind "LINE")
+     (setq p1 (sr-vla-point-list (vla-get-StartPoint object))
+           p2 (sr-vla-point-list (vla-get-EndPoint object)))
+     (list entity kind p1 p2 nil nil nil nil)
+    )
+    ((= kind "ARC")
+     (setq p1 (sr-vla-point-list (vla-get-StartPoint object))
+           p2 (sr-vla-point-list (vla-get-EndPoint object))
+           center (sr-vla-point-list (vla-get-Center object))
+           radius (vla-get-Radius object)
+           start-angle (vla-get-StartAngle object)
+           end-angle (vla-get-EndAngle object))
+     (list entity kind p1 p2 center radius start-angle end-angle)
+    )
+    ((= kind "CIRCLE")
+     (setq center (sr-vla-point-list (vla-get-Center object))
+           radius (vla-get-Radius object))
+     (list entity kind nil nil center radius 0.0 *sr-two-pi*)
+    )
+    ((member kind '("ELLIPSE" "SPLINE"))
+     (setq p1 (sr-curve-start-point entity)
+           p2 (sr-curve-end-point entity))
+     (if (or (null p1) (null p2))
+       (sr-abort
+         (strcat "Cannot read exact curve endpoints for entity "
+                 (sr-handle entity) ".")))
+     (list entity kind p1 p2 nil nil nil nil)
+    )
+    (t nil)
+  )
+)
+
+;;; --------------------------------------------------------------------------
+;;; Coincident-overlap detection
+;;; --------------------------------------------------------------------------
+
+(defun sr-line-overlap-p (edge1 edge2 tolerance / a1 a2 b1 b2 d1 d2 len1 len2
+                           parallel-distance line-distance unit projection1 projection2
+                           low high)
+  (setq a1 (nth 2 edge1)
+        a2 (nth 3 edge1)
+        b1 (nth 2 edge2)
+        b2 (nth 3 edge2)
+        d1 (sr-vector-2d a1 a2)
+        d2 (sr-vector-2d b1 b2)
+        len1 (sr-distance-2d a1 a2)
+        len2 (sr-distance-2d b1 b2))
+  (if (or (<= len1 tolerance) (<= len2 tolerance))
+    nil
+    (progn
+      (setq parallel-distance
+        (/ (abs (sr-cross-2d d1 d2)) (* len1 len2)))
+      (if (> parallel-distance 1.0e-10)
+        nil
+        (progn
+          (setq line-distance
+            (/ (abs (sr-cross-2d d1 (sr-vector-2d a1 b1))) len1))
+          (if (> line-distance tolerance)
+            nil
+            (progn
+              (setq unit (list (/ (car d1) len1) (/ (cadr d1) len1))
+                    projection1 (sr-dot-2d (sr-vector-2d a1 b1) unit)
+                    projection2 (sr-dot-2d (sr-vector-2d a1 b2) unit)
+                    low (max 0.0 (min projection1 projection2))
+                    high (min len1 (max projection1 projection2)))
+              (> (- high low) tolerance)
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+(defun sr-angular-overlap (start1 sweep1 start2 sweep2 / shifts shift low high best)
+  (setq shifts (list (- *sr-two-pi*) 0.0 *sr-two-pi*)
+        best 0.0
+        start1 (sr-normalize-angle start1)
+        start2 (sr-normalize-angle start2))
+  (foreach shift shifts
+    (setq low (max start1 (+ start2 shift))
+          high (min (+ start1 sweep1) (+ start2 shift sweep2)))
+    (if (> (- high low) best)
+      (setq best (- high low))
+    )
+  )
+  best
+)
+
+(defun sr-curved-overlap-p (edge1 edge2 tolerance / kind1 kind2 center1 center2
+                             radius1 radius2 sweep1 sweep2 angular-tolerance)
+  (setq kind1 (nth 1 edge1)
+        kind2 (nth 1 edge2)
+        center1 (nth 4 edge1)
+        center2 (nth 4 edge2)
+        radius1 (nth 5 edge1)
+        radius2 (nth 5 edge2))
+  (if (or (> (sr-distance-2d center1 center2) tolerance)
+          (> (abs (- radius1 radius2)) tolerance))
+    nil
+    (cond
+      ((and (= kind1 "CIRCLE") (= kind2 "CIRCLE")) t)
+      ((or (= kind1 "CIRCLE") (= kind2 "CIRCLE")) t)
+      (t
+       (setq sweep1 (sr-positive-sweep (nth 6 edge1) (nth 7 edge1))
+             sweep2 (sr-positive-sweep (nth 6 edge2) (nth 7 edge2))
+             angular-tolerance (/ tolerance (max radius1 tolerance)))
+       (> (sr-angular-overlap
+            (nth 6 edge1) sweep1 (nth 6 edge2) sweep2)
+          angular-tolerance)
+      )
+    )
+  )
+)
+
+(defun sr-curves-same-shape-p (entity1 entity2 tolerance / length1 length2
+                                length-tolerance fractions fraction point1
+                                point2 point-forward point-reverse closest
+                                forward reverse closed-match)
+  ;; This catches identical native SPLINE entities (including reversed copies).
+  ;; General partially coincident NURBS curves have no overlap query in the
+  ;; AutoCAD 2008 ActiveX API and are rejected later if BREAK/topology cannot
+  ;; produce an unambiguous graph.
+  (setq length1 (sr-curve-length entity1)
+        length2 (sr-curve-length entity2))
+  (if (or (null length1) (null length2))
+    nil
+    (progn
+      (setq length-tolerance
+        (max tolerance (* (max length1 length2) *sr-geom-rel-tol*)))
+      (if (> (abs (- length1 length2)) length-tolerance)
+        nil
+        (progn
+          (setq fractions
+                '(0.0 0.0625 0.125 0.1875 0.25 0.375 0.5
+                  0.625 0.75 0.8125 0.875 0.9375 1.0)
+                forward t
+                reverse t
+                closed-match
+                  (and (sr-curve-closed-p entity1)
+                       (sr-curve-closed-p entity2)))
+          (foreach fraction fractions
+            (setq point1 (sr-curve-point-at-fraction entity1 fraction)
+                  point2 (sr-curve-point-at-fraction entity2 fraction)
+                  point-forward
+                    (sr-curve-point-at-fraction entity2 fraction)
+                  point-reverse
+                    (sr-curve-point-at-fraction entity2 (- 1.0 fraction)))
+            (if (or (null point1) (null point-forward)
+                    (not (sr-point-equal-p point1 point-forward tolerance)))
+              (setq forward nil)
+            )
+            (if (or (null point1) (null point-reverse)
+                    (not (sr-point-equal-p point1 point-reverse tolerance)))
+              (setq reverse nil)
+            )
+            (if closed-match
+              (progn
+                (setq closest (if point1
+                                (sr-curve-closest-point entity2 point1)
+                                nil))
+                (if (or (null closest)
+                        (not (sr-point-equal-p point1 closest tolerance)))
+                  (setq closed-match nil)
+                )
+                (setq closest (if point2
+                                (sr-curve-closest-point entity1 point2)
+                                nil))
+                (if (or (null closest)
+                        (not (sr-point-equal-p point2 closest tolerance)))
+                  (setq closed-match nil)
+                )
+              )
+            )
+          )
+          (or forward reverse closed-match)
+        )
+      )
+    )
+  )
+)
+
+(defun sr-ellipse-geometry (entity / object center major-axis ratio major-length
+                             minor-length)
+  (setq object (vlax-ename->vla-object entity)
+        center (sr-vla-point-list (vla-get-Center object))
+        major-axis (sr-vla-point-list (vla-get-MajorAxis object))
+        ratio (vla-get-RadiusRatio object)
+        major-length (sr-vector-length-2d major-axis)
+        minor-length (* major-length ratio))
+  (list center major-axis major-length minor-length)
+)
+
+(defun sr-same-ellipse-geometry-p (data1 data2 tolerance / axis1 axis2 a1 a2
+                                    b1 b2 parallel)
+  (setq axis1 (cadr data1)
+        axis2 (cadr data2)
+        a1 (nth 2 data1)
+        a2 (nth 2 data2)
+        b1 (nth 3 data1)
+        b2 (nth 3 data2))
+  (if (or (<= a1 tolerance) (<= a2 tolerance))
+    nil
+    (progn
+      (setq parallel
+        (/ (abs (sr-cross-2d axis1 axis2)) (* a1 a2)))
+      (and (sr-point-equal-p (car data1) (car data2) tolerance)
+           (<= (abs (- a1 a2)) tolerance)
+           (<= (abs (- b1 b2)) tolerance)
+           ;; A circular ELLIPSE can legitimately use any major-axis angle.
+           (or (and (<= (abs (- a1 b1)) tolerance)
+                    (<= (abs (- a2 b2)) tolerance))
+               (<= parallel 1.0e-10)))
+    )
+  )
+)
+
+(defun sr-ellipse-canonical-angle (ellipse-data point / center axis a b unit-a
+                                    unit-b vector x y)
+  (setq center (car ellipse-data)
+        axis (cadr ellipse-data)
+        a (nth 2 ellipse-data)
+        b (nth 3 ellipse-data)
+        unit-a (list (/ (car axis) a) (/ (cadr axis) a))
+        unit-b (list (- (cadr unit-a)) (car unit-a))
+        vector (sr-vector-2d center point)
+        x (/ (sr-dot-2d vector unit-a) a)
+        y (/ (sr-dot-2d vector unit-b) b))
+  (sr-normalize-angle (atan y x))
+)
+
+(defun sr-ellipse-interval (entity reference-data / start-point end-point start
+                            end sweep)
+  (if (sr-curve-closed-p entity)
+    (list 0.0 *sr-two-pi*)
+    (progn
+      (setq start-point (sr-curve-start-point entity)
+            end-point (sr-curve-end-point entity)
+            start (sr-ellipse-canonical-angle reference-data start-point)
+            end (sr-ellipse-canonical-angle reference-data end-point)
+            sweep (sr-positive-sweep start end))
+      (list start sweep)
+    )
+  )
+)
+
+(defun sr-ellipse-overlap-p (edge1 edge2 tolerance / entity1 entity2 data1 data2
+                              interval1 interval2 angular-tolerance)
+  (setq entity1 (nth 0 edge1)
+        entity2 (nth 0 edge2)
+        data1 (sr-ellipse-geometry entity1)
+        data2 (sr-ellipse-geometry entity2))
+  (if (not (sr-same-ellipse-geometry-p data1 data2 tolerance))
+    nil
+    (progn
+      (setq interval1 (sr-ellipse-interval entity1 data1)
+            interval2 (sr-ellipse-interval entity2 data1)
+            angular-tolerance
+              (/ tolerance (max (nth 3 data1) tolerance)))
+      (> (sr-angular-overlap
+           (car interval1) (cadr interval1)
+           (car interval2) (cadr interval2))
+         angular-tolerance)
+    )
+  )
+)
+
+(defun sr-circular-ellipse-interval (entity center / start-point end-point start end)
+  (if (sr-curve-closed-p entity)
+    (list 0.0 *sr-two-pi*)
+    (progn
+      (setq start-point (sr-curve-start-point entity)
+            end-point (sr-curve-end-point entity)
+            start (sr-normalize-angle
+                    (atan (- (cadr start-point) (cadr center))
+                          (- (car start-point) (car center))))
+            end (sr-normalize-angle
+                  (atan (- (cadr end-point) (cadr center))
+                        (- (car end-point) (car center)))))
+      (list start (sr-positive-sweep start end))
+    )
+  )
+)
+
+(defun sr-circle-edge-interval (edge)
+  (if (= (nth 1 edge) "CIRCLE")
+    (list 0.0 *sr-two-pi*)
+    (list (nth 6 edge) (sr-positive-sweep (nth 6 edge) (nth 7 edge)))
+  )
+)
+
+(defun sr-circular-ellipse-overlap-p (ellipse-edge circle-edge tolerance /
+                                       ellipse-entity ellipse-data center radius
+                                       ellipse-interval circle-interval
+                                       angular-tolerance)
+  (setq ellipse-entity (nth 0 ellipse-edge)
+        ellipse-data (sr-ellipse-geometry ellipse-entity)
+        center (car ellipse-data)
+        radius (nth 2 ellipse-data))
+  (if (or (> (abs (- radius (nth 3 ellipse-data))) tolerance)
+          (> (sr-distance-2d center (nth 4 circle-edge)) tolerance)
+          (> (abs (- radius (nth 5 circle-edge))) tolerance))
+    nil
+    (progn
+      (setq ellipse-interval
+              (sr-circular-ellipse-interval ellipse-entity center)
+            circle-interval (sr-circle-edge-interval circle-edge)
+            angular-tolerance (/ tolerance (max radius tolerance)))
+      (> (sr-angular-overlap
+           (car ellipse-interval) (cadr ellipse-interval)
+           (car circle-interval) (cadr circle-interval))
+         angular-tolerance)
+    )
+  )
+)
+
+(defun sr-coincident-overlap-p (edge1 edge2 tolerance / kind1 kind2)
+  (setq kind1 (nth 1 edge1)
+        kind2 (nth 1 edge2))
+  (cond
+    ((and (= kind1 "LINE") (= kind2 "LINE"))
+     (sr-line-overlap-p edge1 edge2 tolerance))
+    ((and (member kind1 '("ARC" "CIRCLE"))
+          (member kind2 '("ARC" "CIRCLE")))
+     (sr-curved-overlap-p edge1 edge2 tolerance))
+    ((and (= kind1 "ELLIPSE") (= kind2 "ELLIPSE"))
+     (sr-ellipse-overlap-p edge1 edge2 tolerance))
+    ((and (= kind1 "ELLIPSE") (member kind2 '("ARC" "CIRCLE")))
+     (sr-circular-ellipse-overlap-p edge1 edge2 tolerance))
+    ((and (= kind2 "ELLIPSE") (member kind1 '("ARC" "CIRCLE")))
+     (sr-circular-ellipse-overlap-p edge2 edge1 tolerance))
+    ((and (= kind1 "SPLINE") (= kind2 "SPLINE"))
+     (sr-curves-same-shape-p (nth 0 edge1) (nth 0 edge2) tolerance))
+    (t nil)
+  )
+)
+
+(defun sr-source-label (entity / metadata)
+  (setq metadata (sr-metadata entity))
+  (if metadata metadata (sr-handle entity))
+)
+
+(defun sr-open-curve-endpoints (entity / start-point end-point)
+  (if (sr-curve-closed-p entity)
+    nil
+    (progn
+      (setq start-point (sr-curve-start-point entity)
+            end-point (sr-curve-end-point entity))
+      (if (and start-point end-point)
+        (list start-point end-point)
+        nil
+      )
+    )
+  )
+)
+
+(defun sr-overlap-boundary-points (entity1 entity2 tolerance /
+                                    candidates result point closest1 closest2)
+  ;; IntersectWith does not define a useful result for coincident curves. Use
+  ;; every open endpoint that lies on both curves instead. These points split
+  ;; partial overlaps into atomic pieces; a later pass removes only pieces
+  ;; whose complete geometry is duplicated.
+  (setq candidates
+          (append (sr-open-curve-endpoints entity1)
+                  (sr-open-curve-endpoints entity2))
+        result nil)
+  (foreach point candidates
+    (setq closest1 (sr-curve-closest-point entity1 point)
+          closest2 (sr-curve-closest-point entity2 point))
+    (if (and closest1 closest2
+             (sr-point-equal-p point closest1 tolerance)
+             (sr-point-equal-p point closest2 tolerance))
+      (setq result (sr-add-unique-point point result tolerance))
+    )
+  )
+  (reverse result)
+)
+
+;;; --------------------------------------------------------------------------
+;;; Intersection collection and curve splitting
+;;; --------------------------------------------------------------------------
+
+(defun sr-flat-to-points (values / result)
+  (setq result nil)
+  (while (>= (length values) 3)
+    (setq result
+      (cons (list (car values) (cadr values) (caddr values)) result)
+          values (cdddr values))
+  )
+  (reverse result)
+)
+
+(defun sr-intersections (entity1 entity2 / object1 object2 result values)
+  (setq *sr-phase*
+    (strcat "intersect sources " (sr-source-label entity1)
+            " / " (sr-source-label entity2)))
+  (setq object1 (vlax-ename->vla-object entity1)
+        object2 (vlax-ename->vla-object entity2)
+        result
+          (vl-catch-all-apply 'vla-IntersectWith
+            (list object1 object2 *sr-ac-extend-none*)))
+  (if (vl-catch-all-error-p result)
+    (sr-abort
+      (strcat "IntersectWith failed for source handles "
+              (sr-source-label entity1) " and "
+              (sr-source-label entity2) ".")))
+  (setq values (sr-as-list result))
+  (if values (sr-flat-to-points values) nil)
+)
+
+(defun sr-collect-intersections (primitives tolerance /
+                                 map entity edge i j other other-edge
+                                 points point values)
+  (setq map nil)
+  (foreach entity primitives
+    (setq map (cons (list entity) map))
+  )
+  (setq i 0)
+  (while (< i (length primitives))
+    (setq entity (nth i primitives)
+          edge (sr-edge-record entity)
+          j (1+ i))
+    (while (< j (length primitives))
+      (setq other (nth j primitives)
+            other-edge (sr-edge-record other))
+      (if (sr-coincident-overlap-p edge other-edge tolerance)
+        (setq points
+          (sr-overlap-boundary-points entity other tolerance))
+        (setq points (sr-intersections entity other))
+      )
+      (foreach point points
+        (setq values
+          (sr-add-unique-point point (cdr (assoc entity map)) tolerance)
+              map (sr-alist-put entity values map)
+              values
+          (sr-add-unique-point point (cdr (assoc other map)) tolerance)
+              map (sr-alist-put other values map))
+      )
+      (setq j (1+ j))
+    )
+    (setq i (1+ i))
+  )
+  map
+)
+
+(defun sr-new-line (model-space p1 p2 metadata / object entity)
+  (setq object
+    (vla-AddLine model-space (vlax-3d-point p1) (vlax-3d-point p2)))
+  (vla-put-Layer object *sr-layer-temp*)
+  (setq entity (vlax-vla-object->ename object))
+  (sr-set-role entity *sr-role-temp* metadata)
+  entity
+)
+
+(defun sr-new-arc (model-space center radius start-angle end-angle metadata / object entity)
+  (setq object
+    (vla-AddArc model-space (vlax-3d-point center) radius
+                (sr-normalize-angle start-angle)
+                (sr-normalize-angle end-angle)))
+  (vla-put-Layer object *sr-layer-temp*)
+  (setq entity (vlax-vla-object->ename object))
+  (sr-set-role entity *sr-role-temp* metadata)
+  entity
+)
+
+(defun sr-split-line (entity points model-space tolerance / edge p1 p2 vector length2
+                       parameter parameters sorted result pair t1 t2 q1 q2 metadata)
+  (setq edge (sr-edge-record entity)
+        p1 (nth 2 edge)
+        p2 (nth 3 edge)
+        vector (sr-vector-2d p1 p2)
+        length2 (sr-dot-2d vector vector)
+        parameters (list 0.0 1.0)
+        metadata (sr-metadata entity))
+  (if (<= length2 (* tolerance tolerance))
+    (sr-abort
+      (strcat "Zero-length LINE found in source " (sr-source-label entity) ".")))
+  (foreach point points
+    (setq parameter
+      (/ (sr-dot-2d (sr-vector-2d p1 point) vector) length2))
+    (if (and (> parameter (/ tolerance (sqrt length2)))
+             (< parameter (- 1.0 (/ tolerance (sqrt length2)))))
+      (if (not (vl-some
+                 (function (lambda (existing)
+                   (<= (abs (- parameter existing))
+                       (/ tolerance (sqrt length2)))))
+                 parameters))
+        (setq parameters (cons parameter parameters))
+      )
+    )
+  )
+  (setq sorted (vl-sort parameters '<))
+  (if (= (length sorted) 2)
+    (list entity)
+    (progn
+      (setq result nil)
+      (while (cdr sorted)
+        (setq t1 (car sorted)
+              t2 (cadr sorted)
+              q1 (list (+ (car p1) (* t1 (car vector)))
+                       (+ (cadr p1) (* t1 (cadr vector)))
+                       (caddr p1))
+              q2 (list (+ (car p1) (* t2 (car vector)))
+                       (+ (cadr p1) (* t2 (cadr vector)))
+                       (caddr p1)))
+        (if (> (sr-distance-2d q1 q2) tolerance)
+          (setq result (cons (sr-new-line model-space q1 q2 metadata) result))
+        )
+        (setq sorted (cdr sorted))
+      )
+      (sr-safe-entdel entity)
+      (reverse result)
+    )
+  )
+)
+
+(defun sr-split-arc (entity points model-space tolerance / edge center radius start-angle
+                      end-angle total angular-tolerance angle offset offsets sorted result
+                      d1 d2 metadata)
+  (setq edge (sr-edge-record entity)
+        center (nth 4 edge)
+        radius (nth 5 edge)
+        start-angle (nth 6 edge)
+        end-angle (nth 7 edge)
+        total (sr-positive-sweep start-angle end-angle)
+        angular-tolerance (/ tolerance (max radius tolerance))
+        offsets (list 0.0 total)
+        metadata (sr-metadata entity))
+  (foreach point points
+    (setq angle (atan (- (cadr point) (cadr center))
+                      (- (car point) (car center)))
+          offset (sr-positive-sweep start-angle angle))
+    (if (and (> offset angular-tolerance)
+             (< offset (- total angular-tolerance)))
+      (if (not (vl-some
+                 (function (lambda (existing)
+                   (<= (abs (- offset existing)) angular-tolerance)))
+                 offsets))
+        (setq offsets (cons offset offsets))
+      )
+    )
+  )
+  (setq sorted (vl-sort offsets '<))
+  (if (= (length sorted) 2)
+    (list entity)
+    (progn
+      (setq result nil)
+      (while (cdr sorted)
+        (setq d1 (car sorted)
+              d2 (cadr sorted))
+        (if (> (- d2 d1) angular-tolerance)
+          (setq result
+            (cons
+              (sr-new-arc model-space center radius
+                          (+ start-angle d1) (+ start-angle d2) metadata)
+              result))
+        )
+        (setq sorted (cdr sorted))
+      )
+      (sr-safe-entdel entity)
+      (reverse result)
+    )
+  )
+)
+
+(defun sr-split-circle (entity points model-space tolerance / edge center radius
+                         angular-tolerance angles point angle sorted work first-angle
+                         next-angle result metadata)
+  (setq edge (sr-edge-record entity)
+        center (nth 4 edge)
+        radius (nth 5 edge)
+        angular-tolerance (/ tolerance (max radius tolerance))
+        angles nil
+        metadata (sr-metadata entity))
+  (foreach point points
+    (setq angle
+      (atan (- (cadr point) (cadr center))
+            (- (car point) (car center))))
+    (setq angles (sr-add-unique-angle angle angles angular-tolerance))
+  )
+  ;; A single point is normally a tangency.  Keeping the CIRCLE intact avoids
+  ;; creating artificial zero-area faces at that tangency.
+  (if (< (length angles) 2)
+    (list entity)
+    (progn
+      (setq sorted (vl-sort angles '<)
+            work sorted
+            first-angle (car sorted)
+            result nil)
+      (while (cdr work)
+        (setq angle (car work)
+              next-angle (cadr work))
+        (if (> (sr-positive-sweep angle next-angle) angular-tolerance)
+          (setq result
+            (cons (sr-new-arc model-space center radius angle next-angle metadata)
+                  result))
+        )
+        (setq work (cdr work))
+      )
+      (setq angle (car work)
+            next-angle first-angle)
+      (if (> (sr-positive-sweep angle next-angle) angular-tolerance)
+        (setq result
+          (cons (sr-new-arc model-space center radius angle next-angle metadata)
+                result))
+      )
+      (sr-safe-entdel entity)
+      (reverse result)
+    )
+  )
+)
+
+(defun sr-curve-distance-for-point (entity point / closest)
+  (setq closest (sr-curve-closest-point entity point))
+  (if closest
+    (sr-curve-distance-at-point entity closest)
+    nil
+  )
+)
+
+(defun sr-sort-points-on-curve (entity points / pairs point distance)
+  (setq pairs nil)
+  (foreach point points
+    (setq distance (sr-curve-distance-for-point entity point))
+    (if (null distance)
+      (sr-abort
+        (strcat "Cannot parameterize an intersection on source "
+                (sr-source-label entity) ".")))
+    (setq pairs (cons (list distance point) pairs))
+  )
+  (setq pairs
+    (vl-sort pairs
+      (function (lambda (left right) (< (car left) (car right))))))
+  (mapcar 'cadr pairs)
+)
+
+(defun sr-point-on-curve-p (entity point tolerance / closest)
+  (setq closest (sr-curve-closest-point entity point))
+  (and closest (sr-point-equal-p closest point tolerance))
+)
+
+(defun sr-point-at-open-curve-end-p (entity point tolerance / start-point end-point)
+  (if (sr-curve-closed-p entity)
+    nil
+    (progn
+      (setq start-point (sr-curve-start-point entity)
+            end-point (sr-curve-end-point entity))
+      (or (sr-point-equal-p point start-point tolerance)
+          (sr-point-equal-p point end-point tolerance))
+    )
+  )
+)
+
+(defun sr-point-at-any-piece-end-p (pieces point tolerance / found piece)
+  (setq found nil)
+  (foreach piece pieces
+    (if (and (entget piece)
+             (sr-point-at-open-curve-end-p piece point tolerance))
+      (setq found t)
+    )
+  )
+  found
+)
+
+(defun sr-find-piece-for-break (pieces point tolerance / found piece)
+  (setq found nil)
+  (foreach piece pieces
+    (if (and (null found)
+             (entget piece)
+             (sr-point-on-curve-p piece point tolerance)
+             (or (sr-curve-closed-p piece)
+                 (not (sr-point-at-open-curve-end-p piece point tolerance))))
+      (setq found piece)
+    )
+  )
+  found
+)
+
+(defun sr-entities-after (marker / entity result)
+  (setq entity (if marker (entnext marker) (entnext))
+        result nil)
+  (while entity
+    (setq result (cons entity result)
+          entity (entnext entity))
+  )
+  (reverse result)
+)
+
+(defun sr-tag-break-output (entity metadata / object)
+  (if (entget entity)
+    (progn
+      (setq object (vlax-ename->vla-object entity))
+      (vla-put-Layer object *sr-layer-temp*)
+      (sr-set-role entity *sr-role-temp* metadata)
+    )
+  )
+  entity
+)
+
+(defun sr-curve-list-total-length (entities / total entity length)
+  (setq total 0.0)
+  (foreach entity entities
+    (setq length (sr-curve-length entity))
+    (if (null length)
+      (sr-abort
+        (strcat "Cannot measure BREAK output entity "
+                (sr-handle entity) ".")))
+    (setq total (+ total length))
+  )
+  total
+)
+
+(defun sr-count-endpoint-hits (entities point tolerance / count entity start-point
+                                end-point)
+  (setq count 0)
+  (foreach entity entities
+    (setq start-point (sr-curve-start-point entity)
+          end-point (sr-curve-end-point entity))
+    (if (sr-point-equal-p point start-point tolerance)
+      (setq count (1+ count)))
+    (if (sr-point-equal-p point end-point tolerance)
+      (setq count (1+ count)))
+  )
+  count
+)
+
+(defun sr-break-native-curve-at-point
+       (document entity point tolerance / metadata original-kind original-length
+        marker command-result created new-entity candidates candidate
+        total-length length-tolerance point-ucs candidate-length)
+  (setq metadata (sr-metadata entity)
+        original-kind (sr-entity-type entity)
+        original-length (sr-curve-length entity)
+        marker (entlast)
+        point-ucs (trans point 0 1))
+  (if (null original-length)
+    (sr-abort
+      (strcat "Cannot measure native curve " (sr-source-label entity) ".")))
+
+  ;; AutoCAD 2008 exposes no ActiveX split method for ELLIPSE/SPLINE. On an
+  ;; open curve, BREAK with the same first/second point preserves the exact
+  ;; geometry and creates two open native curve objects.
+  (vla-Regen document *sr-ac-all-viewports*)
+  (setq command-result
+    (command "_.BREAK" entity "_F" point-ucs "@"))
+
+  ;; Tag every entity created by BREAK before validating it so transaction
+  ;; cleanup can remove even a partial/failed command result.
+  (setq created (sr-entities-after marker))
+  (foreach new-entity created
+    (if (entget new-entity)
+      (sr-tag-break-output new-entity metadata))
+  )
+  (if (and entity (entget entity))
+    (sr-tag-break-output entity metadata))
+
+  (if (vl-catch-all-error-p command-result)
+    (sr-abort
+      (strcat "BREAK failed for source " metadata ".")))
+  (if (/= (getvar "CMDACTIVE") 0)
+    (progn
+      (command)
+      (sr-abort
+        (strcat "BREAK did not finish for source "
+                metadata ".")))
+  )
+
+  (setq candidates nil)
+  (if (and entity (entget entity)
+           (= (sr-entity-type entity) original-kind))
+    (setq candidates (list entity))
+  )
+  (foreach candidate created
+    (if (and (entget candidate)
+             (= (sr-entity-type candidate) original-kind)
+             (not (member candidate candidates)))
+      (setq candidates (append candidates (list candidate)))
+    )
+  )
+  (if (null candidates)
+    (sr-abort
+      (strcat "BREAK produced no usable " original-kind
+              " curve for source " metadata ".")))
+  (foreach candidate candidates
+    (if (sr-curve-closed-p candidate)
+      (sr-abort
+        (strcat "BREAK did not open/split the closed curve from source "
+                metadata ".")))
+    (setq candidate-length (sr-curve-length candidate))
+    (if (or (null candidate-length) (<= candidate-length tolerance))
+      (sr-abort
+        (strcat "BREAK produced a zero-length curve for source "
+                metadata ".")))
+  )
+  (if (/= (length candidates) 2)
+    (sr-abort
+      (strcat "BREAK produced " (itoa (length candidates))
+              " curve objects instead of two for source " metadata ".")))
+  (if (< (sr-count-endpoint-hits candidates point tolerance) 2)
+    (sr-abort
+      (strcat "BREAK output does not terminate at the expected intersection "
+              "for source " metadata ".")))
+
+  (setq total-length (sr-curve-list-total-length candidates)
+        length-tolerance
+          (max (* 10.0 tolerance) (* original-length 1.0e-8)))
+  (if (> (abs (- total-length original-length)) length-tolerance)
+    (sr-abort
+      (strcat "BREAK changed the total curve length for source " metadata ".")))
+  candidates
+)
+
+(defun sr-replace-piece (pieces target replacements / result piece)
+  (setq result nil)
+  (foreach piece pieces
+    (if (equal piece target)
+      (setq result (append result replacements))
+      (setq result (append result (list piece)))
+    )
+  )
+  result
+)
+
+(defun sr-split-closed-native-curve
+       (document entity point1 point2 tolerance / metadata original-kind
+        original-length source-object clone-object clone-entity marker1 marker2
+        result1 result2 created1 created2 new-entity candidates candidate
+        point1-ucs point2-ucs total-length length-tolerance candidate-length)
+  (setq metadata (sr-metadata entity)
+        original-kind (sr-entity-type entity)
+        original-length (sr-curve-length entity)
+        source-object (vlax-ename->vla-object entity)
+        clone-object (vl-catch-all-apply 'vla-Copy (list source-object)))
+  (if (or (null original-length) (vl-catch-all-error-p clone-object))
+    (sr-abort
+      (strcat "Cannot prepare closed curve split for source " metadata ".")))
+  (vla-put-Layer clone-object *sr-layer-temp*)
+  (setq clone-entity (vlax-vla-object->ename clone-object))
+  (sr-set-role clone-entity *sr-role-temp* metadata)
+  (setq point1-ucs (trans point1 0 1)
+        point2-ucs (trans point2 0 1)
+        marker1 (entlast))
+
+  ;; BREAK removes the portion from its first point to its second point on a
+  ;; closed curve. Run it in opposite directions on two exact copies; the two
+  ;; survivors are complementary and together preserve the complete curve.
+  (vla-Regen document *sr-ac-all-viewports*)
+  (setq result1
+    (command "_.BREAK" entity "_F" point1-ucs point2-ucs))
+  (setq created1 (sr-entities-after marker1))
+  (foreach new-entity created1
+    (if (entget new-entity)
+      (sr-tag-break-output new-entity metadata))
+  )
+  (if (and entity (entget entity))
+    (sr-tag-break-output entity metadata))
+  (if (or (vl-catch-all-error-p result1) (/= (getvar "CMDACTIVE") 0))
+    (progn
+      (if (/= (getvar "CMDACTIVE") 0)
+        (command))
+      (sr-abort
+        (strcat "First complementary BREAK failed for source " metadata ".")))
+  )
+
+  (setq marker2 (entlast))
+  (vla-Regen document *sr-ac-all-viewports*)
+  (setq result2
+    (command "_.BREAK" clone-entity "_F" point2-ucs point1-ucs))
+  (setq created2 (sr-entities-after marker2))
+  (foreach new-entity created2
+    (if (entget new-entity)
+      (sr-tag-break-output new-entity metadata))
+  )
+  (if (and clone-entity (entget clone-entity))
+    (sr-tag-break-output clone-entity metadata))
+  (if (or (vl-catch-all-error-p result2) (/= (getvar "CMDACTIVE") 0))
+    (progn
+      (if (/= (getvar "CMDACTIVE") 0)
+        (command))
+      (sr-abort
+        (strcat "Second complementary BREAK failed for source " metadata ".")))
+  )
+
+  (setq candidates nil)
+  (foreach candidate
+      (append (list entity clone-entity) created1 created2)
+    (if (and candidate (entget candidate)
+             (= (sr-entity-type candidate) original-kind)
+             (not (member candidate candidates)))
+      (setq candidates (append candidates (list candidate)))
+    )
+  )
+  (if (/= (length candidates) 2)
+    (sr-abort
+      (strcat "Complementary BREAK produced " (itoa (length candidates))
+              " pieces instead of two for source " metadata ".")))
+  (foreach candidate candidates
+    (setq candidate-length (sr-curve-length candidate))
+    (if (or (sr-curve-closed-p candidate)
+            (null candidate-length)
+            (<= candidate-length tolerance))
+      (sr-abort
+        (strcat "Complementary BREAK produced an invalid open curve for source "
+                metadata ".")))
+  )
+  (if (or (< (sr-count-endpoint-hits candidates point1 tolerance) 2)
+          (< (sr-count-endpoint-hits candidates point2 tolerance) 2))
+    (sr-abort
+      (strcat "Complementary BREAK endpoints do not match the intersections for source "
+              metadata ".")))
+  (setq total-length (sr-curve-list-total-length candidates)
+        length-tolerance
+          (max (* 10.0 tolerance) (* original-length 1.0e-8)))
+  (if (> (abs (- total-length original-length)) length-tolerance)
+    (sr-abort
+      (strcat "Complementary BREAK did not preserve total length for source "
+              metadata ".")))
+  candidates
+)
+
+(defun sr-split-native-curve
+       (document entity points tolerance / closed sorted pieces point piece replacements
+        metadata remaining)
+  (setq closed (sr-curve-closed-p entity)
+        metadata (sr-metadata entity))
+  ;; As with CIRCLE, one point on a closed curve is normally a tangency. Keep
+  ;; the curve closed instead of creating a zero-area topological cut.
+  (if (or (null points) (and closed (< (length points) 2)))
+    (list entity)
+    (progn
+      (setq sorted (sr-sort-points-on-curve entity points)
+            pieces (if closed
+                     (sr-split-closed-native-curve
+                       document entity (car sorted) (cadr sorted) tolerance)
+                     (list entity))
+            remaining (if closed (cddr sorted) sorted))
+      (foreach point remaining
+        (if (not (sr-point-at-any-piece-end-p pieces point tolerance))
+          (progn
+            (setq piece (sr-find-piece-for-break pieces point tolerance))
+            (if (null piece)
+              (sr-abort
+                (strcat "No exact curve piece contains an intersection for source "
+                        metadata ".")))
+            (setq replacements
+              (sr-break-native-curve-at-point
+                document piece point tolerance)
+                  pieces (sr-replace-piece pieces piece replacements))
+          )
+        )
+      )
+      pieces
+    )
+  )
+)
+
+(defun sr-split-primitives (primitives intersection-map model-space document tolerance / result
+                             entity points pieces)
+  (setq result nil)
+  (foreach entity primitives
+    (setq *sr-phase* (strcat "split source " (sr-source-label entity)))
+    (setq points (cdr (assoc entity intersection-map)))
+    (cond
+      ((= (sr-entity-type entity) "LINE")
+       (setq pieces (sr-split-line entity points model-space tolerance)))
+      ((= (sr-entity-type entity) "ARC")
+       (setq pieces (sr-split-arc entity points model-space tolerance)))
+      ((= (sr-entity-type entity) "CIRCLE")
+       (setq pieces (sr-split-circle entity points model-space tolerance)))
+      ((member (sr-entity-type entity) '("ELLIPSE" "SPLINE"))
+       (setq pieces
+         (sr-split-native-curve document entity points tolerance)))
+      (t
+       (sr-abort "An unexpected primitive type reached the splitter."))
+    )
+    (setq result (append result pieces))
+  )
+  result
+)
+
+(defun sr-normalize-split-overlaps (entities tolerance /
+                                     kept duplicate-count entity existing duplicate
+                                     edge1 edge2)
+  ;; Overlap endpoints were added to the split map before this pass. Therefore
+  ;; every remaining coincident pair must either be the same complete atomic
+  ;; edge (safe to keep once) or an overlap that the supported splitters could
+  ;; not normalize (unsafe to guess about).
+  (setq kept nil
+        duplicate-count 0)
+  (foreach entity entities
+    (setq duplicate nil
+          edge1 (sr-edge-record entity))
+    (foreach existing kept
+      (if (null duplicate)
+        (progn
+          (setq edge2 (sr-edge-record existing))
+          (if (sr-coincident-overlap-p edge1 edge2 tolerance)
+            (if (sr-curves-same-shape-p entity existing tolerance)
+              (setq duplicate existing)
+              (sr-abort
+                (strcat
+                  "A partial coincident overlap could not be normalized. "
+                  "Source handles: " (sr-source-label entity) " and "
+                  (sr-source-label existing) "."))
+            )
+          )
+        )
+      )
+    )
+    (if duplicate
+      (progn
+        (sr-safe-entdel entity)
+        (setq duplicate-count (1+ duplicate-count))
+      )
+      (setq kept (append kept (list entity)))
+    )
+  )
+  (list kept duplicate-count)
+)
+
+;;; --------------------------------------------------------------------------
+;;; Half-edge planar-face tracing
+;;; --------------------------------------------------------------------------
+
+(defun sr-find-point-index (point points tolerance / index found)
+  (setq index 0
+        found -1)
+  (while (and (< index (length points)) (= found -1))
+    (if (sr-point-equal-p point (nth index points) tolerance)
+      (setq found index)
+      (setq index (1+ index))
+    )
+  )
+  found
+)
+
+(defun sr-curve-point-at-param (entity parameter)
+  (sr-safe-curve-value
+    'vlax-curve-getPointAtParam
+    (list (sr-curve-object entity) parameter))
+)
+
+(defun sr-halfedge-start-angle (edge direction tolerance / kind p1 p2 entity
+                                 parameter derivative)
+  (setq kind (nth 1 edge))
+  (cond
+    ((= kind "LINE")
+     (if (= direction 1)
+       (setq p1 (nth 2 edge) p2 (nth 3 edge))
+       (setq p1 (nth 3 edge) p2 (nth 2 edge)))
+     (sr-normalize-angle
+       (atan (- (cadr p2) (cadr p1)) (- (car p2) (car p1))))
+    )
+    ((= kind "ARC")
+     (if (= direction 1)
+       (sr-normalize-angle (+ (nth 6 edge) (/ pi 2.0)))
+       (sr-normalize-angle (- (nth 7 edge) (/ pi 2.0)))
+     )
+    )
+    ((member kind '("ELLIPSE" "SPLINE"))
+     (setq entity (nth 0 edge)
+           parameter (if (= direction 1)
+                       (sr-curve-start-param entity)
+                       (sr-curve-end-param entity))
+           derivative (if parameter
+                        (sr-curve-first-derivative entity parameter)
+                        nil))
+     (if (= direction -1)
+       (setq derivative (if derivative
+                          (sr-negate-vector-2d derivative)
+                          nil)))
+     (if (or (null derivative)
+             (<= (sr-vector-length-2d derivative)
+                 (max *sr-geom-abs-tol* (* tolerance 1.0e-3))))
+       (sr-abort
+         (strcat "Undefined curve tangent at entity "
+                 (sr-handle entity) ".")))
+     (sr-normalize-angle (atan (cadr derivative) (car derivative)))
+    )
+    (t
+     (sr-abort "Unexpected curve type while ordering half-edges."))
+  )
+)
+
+(defun sr-insert-halfedge (halfedge-id sorted halfedges / angle current-angle)
+  (if (null sorted)
+    (list halfedge-id)
+    (progn
+      (setq angle (nth 5 (nth halfedge-id halfedges))
+            current-angle (nth 5 (nth (car sorted) halfedges)))
+      (if (or (< angle current-angle)
+              (and (equal angle current-angle 1.0e-12)
+                   (< halfedge-id (car sorted))))
+        (cons halfedge-id sorted)
+        (cons (car sorted)
+              (sr-insert-halfedge halfedge-id (cdr sorted) halfedges))
+      )
+    )
+  )
+)
+
+(defun sr-sort-halfedges (ids halfedges / sorted id)
+  (setq sorted nil)
+  (foreach id ids
+    (setq sorted (sr-insert-halfedge id sorted halfedges))
+  )
+  sorted
+)
+
+(defun sr-next-halfedge (halfedge-id halfedges outgoing / halfedge vertex reverse-id
+                          candidates position)
+  (setq halfedge (nth halfedge-id halfedges)
+        vertex (nth 4 halfedge)
+        reverse-id (if (= (rem halfedge-id 2) 0)
+                     (1+ halfedge-id)
+                     (1- halfedge-id))
+        candidates (cdr (assoc vertex outgoing))
+        position (vl-position reverse-id candidates))
+  (if (null position)
+    (sr-abort "Internal topology error: reverse half-edge was not found."))
+  ;; Previous in CCW order is the clockwise turn from the reverse edge,
+  ;; therefore the traversed face remains on the left.
+  (if (= position 0)
+    (nth (1- (length candidates)) candidates)
+    (nth (1- position) candidates)
+  )
+)
+
+(defun sr-curve-area-integrand (entity parameter / point derivative)
+  (setq point (sr-curve-point-at-param entity parameter)
+        derivative (sr-curve-first-derivative entity parameter))
+  (if (or (null point) (null derivative))
+    (sr-abort
+      (strcat "Cannot integrate SPLINE area at entity "
+              (sr-handle entity) ".")))
+  (* 0.5
+     (- (* (car point) (cadr derivative))
+        (* (cadr point) (car derivative))))
+)
+
+(defun sr-simpson-value (a b fa fm fb)
+  (* (/ (- b a) 6.0) (+ fa (* 4.0 fm) fb))
+)
+
+(defun sr-adaptive-simpson (entity a b fa fm fb whole tolerance depth /
+                             middle left-middle right-middle flm frm left right
+                             delta)
+  (setq middle (* 0.5 (+ a b))
+        left-middle (* 0.5 (+ a middle))
+        right-middle (* 0.5 (+ middle b))
+        flm (sr-curve-area-integrand entity left-middle)
+        frm (sr-curve-area-integrand entity right-middle)
+        left (sr-simpson-value a middle fa flm fm)
+        right (sr-simpson-value middle b fm frm fb)
+        delta (- (+ left right) whole))
+  (if (or (<= depth 0) (<= (abs delta) (* 15.0 tolerance)))
+    (+ left right (/ delta 15.0))
+    (+
+      (sr-adaptive-simpson entity a middle fa flm fm left
+                           (* 0.5 tolerance) (1- depth))
+      (sr-adaptive-simpson entity middle b fm frm fb right
+                           (* 0.5 tolerance) (1- depth)))
+  )
+)
+
+(defun sr-spline-directed-area (entity direction area-tolerance / start end middle
+                                 fa fm fb whole integration-tolerance)
+  (if (= direction 1)
+    (setq start (sr-curve-start-param entity)
+          end (sr-curve-end-param entity))
+    (setq start (sr-curve-end-param entity)
+          end (sr-curve-start-param entity))
+  )
+  (if (or (null start) (null end))
+    (sr-abort
+      (strcat "Cannot read SPLINE parameter range at entity "
+              (sr-handle entity) ".")))
+  (setq middle (* 0.5 (+ start end))
+        fa (sr-curve-area-integrand entity start)
+        fm (sr-curve-area-integrand entity middle)
+        fb (sr-curve-area-integrand entity end)
+        whole (sr-simpson-value start end fa fm fb)
+        integration-tolerance
+          (max *sr-area-abs-tol* (* 0.1 area-tolerance)))
+  (sr-adaptive-simpson entity start end fa fm fb whole
+                       integration-tolerance 16)
+)
+
+(defun sr-ellipse-directed-area (entity direction / object center major-axis ratio
+                                  minor-axis start end p1 p2 delta)
+  (setq object (vlax-ename->vla-object entity)
+        center (sr-vla-point-list (vla-get-Center object))
+        major-axis (sr-vla-point-list (vla-get-MajorAxis object))
+        ratio (vla-get-RadiusRatio object)
+        minor-axis (list (* (- (cadr major-axis)) ratio)
+                         (* (car major-axis) ratio)))
+  (if (= direction 1)
+    (setq start (sr-curve-start-param entity)
+          end (sr-curve-end-param entity))
+    (setq start (sr-curve-end-param entity)
+          end (sr-curve-start-param entity))
+  )
+  (if (or (null start) (null end))
+    (sr-abort
+      (strcat "Cannot read ELLIPSE parameter range at entity "
+              (sr-handle entity) ".")))
+  (setq p1 (sr-curve-point-at-param entity start)
+        p2 (sr-curve-point-at-param entity end)
+        delta (- end start))
+  (if (or (null p1) (null p2))
+    (sr-abort
+      (strcat "Cannot evaluate ELLIPSE at entity "
+              (sr-handle entity) ".")))
+  (* 0.5
+     (+ (sr-cross-2d center (sr-vector-2d p1 p2))
+        (* (sr-cross-2d major-axis minor-axis) delta)))
+)
+
+(defun sr-halfedge-area (halfedge edges area-tolerance / edge direction kind p1 p2
+                          center radius theta1 theta2 delta entity)
+  (setq edge (nth (nth 1 halfedge) edges)
+        direction (nth 2 halfedge)
+        kind (nth 1 edge))
+  (cond
+    ((= kind "LINE")
+      (if (= direction 1)
+        (setq p1 (nth 2 edge) p2 (nth 3 edge))
+        (setq p1 (nth 3 edge) p2 (nth 2 edge)))
+      (* 0.5 (- (* (car p1) (cadr p2)) (* (car p2) (cadr p1))))
+    )
+    ((= kind "ARC")
+      (setq center (nth 4 edge)
+            radius (nth 5 edge))
+      (if (= direction 1)
+        (setq theta1 (nth 6 edge)
+              delta (sr-positive-sweep (nth 6 edge) (nth 7 edge)))
+        (setq theta1 (nth 7 edge)
+              delta (- (sr-positive-sweep (nth 6 edge) (nth 7 edge))))
+      )
+      (setq theta2 (+ theta1 delta))
+      (* 0.5
+         (+
+           (* radius (car center) (- (sin theta2) (sin theta1)))
+           (* (- radius) (cadr center) (- (cos theta2) (cos theta1)))
+           (* radius radius delta)))
+    )
+    ((= kind "ELLIPSE")
+     (sr-ellipse-directed-area (nth 0 edge) direction))
+    ((= kind "SPLINE")
+     (sr-spline-directed-area (nth 0 edge) direction area-tolerance))
+    (t
+     (sr-abort "Unexpected curve type while integrating face area."))
+  )
+)
+
+(defun sr-cycle-area (cycle halfedges edges area-tolerance / total halfedge-id)
+  (setq total 0.0)
+  (foreach halfedge-id cycle
+    (setq total
+      (+ total
+         (sr-halfedge-area
+           (nth halfedge-id halfedges) edges area-tolerance)))
+  )
+  total
+)
+
+(defun sr-build-loops (split-entities tolerance area-tolerance / edges closed-curves
+                        entity edge kind closed-area
+                        vertices p index edge-index halfedges outgoing from to forward-id
+                        reverse-id cell used start current local cycle closed guard next area
+                        loop-entities loop-segments halfedge direction start-point end-point
+                        loops circle-record radius)
+  (setq edges nil closed-curves nil)
+  (foreach entity split-entities
+    (setq edge (sr-edge-record entity))
+    (if (sr-curve-closed-p entity)
+      (setq closed-curves (cons entity closed-curves))
+      (setq edges (append edges (list edge)))
+    )
+  )
+
+  (setq vertices nil)
+  (foreach edge edges
+    (foreach p (list (nth 2 edge) (nth 3 edge))
+      (setq index (sr-find-point-index p vertices tolerance))
+      (if (= index -1)
+        (setq vertices (append vertices (list p)))
+      )
+    )
+  )
+
+  (setq outgoing
+    (mapcar (function (lambda (vertex-index) (list vertex-index)))
+            (sr-range (length vertices))))
+  (setq halfedges nil
+        edge-index 0)
+  (foreach edge edges
+    (setq from (sr-find-point-index (nth 2 edge) vertices tolerance)
+          to (sr-find-point-index (nth 3 edge) vertices tolerance))
+    (if (= from to)
+      (sr-abort
+        (strcat "A degenerate edge was found at handle "
+                (sr-handle (nth 0 edge)) ".")))
+    (setq forward-id (length halfedges)
+          reverse-id (1+ forward-id)
+          halfedges
+            (append halfedges
+              (list
+                (list forward-id edge-index 1 from to
+                      (sr-halfedge-start-angle edge 1 tolerance))
+                (list reverse-id edge-index -1 to from
+                      (sr-halfedge-start-angle edge -1 tolerance)))))
+    (setq outgoing
+      (sr-alist-put from
+        (cons forward-id (cdr (assoc from outgoing))) outgoing)
+          outgoing
+      (sr-alist-put to
+        (cons reverse-id (cdr (assoc to outgoing))) outgoing))
+    (setq edge-index (1+ edge-index))
+  )
+  (setq outgoing
+    (mapcar
+      (function
+        (lambda (entry)
+          (cons (car entry)
+                (sr-sort-halfedges (cdr entry) halfedges))))
+      outgoing))
+
+  (setq used nil loops nil)
+  (foreach start (sr-range (length halfedges))
+    (if (not (member start used))
+      (progn
+        (setq current start
+              local nil
+              cycle nil
+              closed nil
+              guard 0)
+        (while (and (not closed)
+                    (< guard (+ 2 (length halfedges)))
+                    (not (and (member current local) (/= current start))))
+          (if (and (= current start) local)
+            (setq closed t)
+            (progn
+              (setq local (cons current local)
+                    cycle (cons current cycle)
+                    used (cons current used)
+                    next (sr-next-halfedge current halfedges outgoing)
+                    current next
+                    guard (1+ guard))
+            )
+          )
+        )
+        (if closed
+          (progn
+            (setq cycle (reverse cycle)
+                  area (sr-cycle-area cycle halfedges edges area-tolerance))
+            (if (> area area-tolerance)
+              (progn
+                (setq loop-entities nil
+                      loop-segments nil)
+                (foreach current cycle
+                  (setq halfedge (nth current halfedges)
+                        edge (nth (nth 1 halfedge) edges)
+                        entity (nth 0 edge)
+                        direction (nth 2 halfedge)
+                        start-point (nth (nth 3 halfedge) vertices)
+                        end-point (nth (nth 4 halfedge) vertices)
+                        loop-entities (cons entity loop-entities)
+                        loop-segments
+                          (cons (list entity direction start-point end-point)
+                                loop-segments))
+                )
+                (setq loop-entities (sr-unique-enames (reverse loop-entities))
+                      loop-segments (reverse loop-segments))
+                (if (= (length loop-entities) (length cycle))
+                  (setq loops
+                    (cons (list loop-entities area loop-segments) loops))
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+
+  ;; An unsplit closed CIRCLE, ELLIPSE, or SPLINE is already one loop. The
+  ;; signed SPLINE integral is used only for topology; AddRegion receives the
+  ;; original exact curve object.
+  (foreach entity closed-curves
+    (setq kind (sr-entity-type entity))
+    (cond
+      ((= kind "CIRCLE")
+       (setq circle-record (sr-edge-record entity)
+             radius (nth 5 circle-record)
+             closed-area (* pi radius radius)))
+      ((= kind "ELLIPSE")
+       (setq closed-area (abs (sr-ellipse-directed-area entity 1))))
+      ((= kind "SPLINE")
+       (setq closed-area (sr-curve-enclosed-area entity))
+       (if (null closed-area)
+         (setq closed-area
+           (abs (sr-spline-directed-area entity 1 area-tolerance))))
+       (setq closed-area (abs closed-area)))
+      (t (setq closed-area 0.0))
+    )
+    (if (> closed-area area-tolerance)
+      (setq loops (cons (list (list entity) closed-area nil) loops))
+    )
+  )
+  (reverse loops)
+)
+
+(defun sr-count-unbounded-curves (split-entities loops / bounded loop entity count)
+  (setq bounded nil
+        count 0)
+  (foreach loop loops
+    (foreach entity (car loop)
+      (if (not (member entity bounded))
+        (setq bounded (cons entity bounded))
+      )
+    )
+  )
+  (foreach entity split-entities
+    (if (not (member entity bounded))
+      (setq count (1+ count))
+    )
+  )
+  count
+)
+
+;;; --------------------------------------------------------------------------
+;;; REGION construction, containment, and hole subtraction
+;;; --------------------------------------------------------------------------
+
+(defun sr-line-arc-segments-p (segments / valid segment)
+  (setq valid (if segments t nil))
+  (foreach segment segments
+    (if (not (member (sr-entity-type (car segment)) '("LINE" "ARC")))
+      (setq valid nil)
+    )
+  )
+  valid
+)
+
+(defun sr-segment-bulge (segment / entity direction edge sweep quarter)
+  (setq entity (car segment)
+        direction (cadr segment))
+  (if (= (sr-entity-type entity) "LINE")
+    0.0
+    (progn
+      (setq edge (sr-edge-record entity)
+            sweep (sr-positive-sweep (nth 6 edge) (nth 7 edge)))
+      (if (= direction -1)
+        (setq sweep (- sweep)))
+      (setq quarter (/ sweep 4.0))
+      (/ (sin quarter) (cos quarter))
+    )
+  )
+)
+
+(defun sr-add-loop-repair-polyline (model-space segments /
+                                     coordinates segment point array result object
+                                     entity index)
+  ;; Rebuild a LINE/ARC face as one closed LWPOLYLINE. Every adjacent segment
+  ;; then shares the exact same stored vertex, while bulges retain circular
+  ;; arcs. The canonical graph vertices differ from the source endpoints by no
+  ;; more than the validated geometry tolerance.
+  (setq coordinates nil)
+  (foreach segment segments
+    (setq point (nth 2 segment)
+          coordinates
+            (append coordinates (list (car point) (cadr point))))
+  )
+  (setq array
+    (vlax-make-safearray vlax-vbDouble
+      (cons 0 (1- (length coordinates)))))
+  (vlax-safearray-fill array coordinates)
+  (setq result
+    (vl-catch-all-apply 'vla-AddLightWeightPolyline
+      (list model-space (vlax-make-variant array))))
+  (if (vl-catch-all-error-p result)
+    (list nil (vl-catch-all-error-message result))
+    (progn
+      (setq object result
+            entity (vlax-vla-object->ename object))
+      (vla-put-Layer object *sr-layer-temp*)
+      (sr-set-role entity *sr-role-temp* nil)
+      (vla-put-Elevation object (caddr (nth 2 (car segments))))
+      (vla-put-Closed object :vlax-true)
+      (setq index 0)
+      (foreach segment segments
+        (vla-SetBulge object index (sr-segment-bulge segment))
+        (setq index (1+ index))
+      )
+      (vla-Update object)
+      (list entity nil)
+    )
+  )
+)
+
+(defun sr-selection-from-entities (entities / selection entity)
+  (setq selection (ssadd))
+  (foreach entity entities
+    (if (and entity (entget entity))
+      (setq selection (ssadd entity selection))
+    )
+  )
+  selection
+)
+
+(defun sr-region-entities-after (marker / result entity)
+  (setq result nil)
+  (foreach entity (sr-entities-after marker)
+    (if (= (sr-entity-type entity) "REGION")
+      (setq result (cons entity result))
+    )
+  )
+  (reverse result)
+)
+
+(defun sr-sample-curve-points (entity samples / start end step i param points)
+  (setq start (sr-curve-start-param entity)
+        end (sr-curve-end-param entity))
+  (if (or (null start) (null end))
+    nil
+    (progn
+      (setq step (/ (- end start) (float samples))
+            points nil
+            i 0)
+      (while (<= i samples)
+        (setq param (+ start (* step i))
+              points (cons (sr-curve-point-at-param entity param) points))
+        (setq i (1+ i))
+      )
+      (reverse points)
+    )
+  )
+)
+
+(defun sr-loop-near-miss-report (entities segments tolerance samples max-results /
+                                  sample-map entity points i j entity-a entity-b
+                                  seg-a seg-b shared candidate points-a points-b
+                                  pa pb d best-d best-pa report trimmed)
+  ;; AutoCAD's own self-intersection pre-check for REGION/BOUNDARY runs at a
+  ;; much coarser numeric tolerance than this script's analytic tolerance
+  ;; (which is scaled to ~1e-9 of the drawing's diagonal). Two edges can pass
+  ;; extremely close -- closer than AutoCAD considers "clearly separate" --
+  ;; without ever producing an exact IntersectWith result or a merged vertex.
+  ;; Sample every curve and report the closest non-adjacent approaches.
+  (setq sample-map nil)
+  (foreach entity entities
+    (setq sample-map
+      (cons (cons entity (sr-sample-curve-points entity samples)) sample-map))
+  )
+  (setq report nil
+        i 0)
+  (while (< i (length entities))
+    (setq entity-a (nth i entities)
+          seg-a (sr-segment-record entity-a segments)
+          points-a (cdr (assoc entity-a sample-map))
+          j (1+ i))
+    (while (< j (length entities))
+      (setq entity-b (nth j entities)
+            seg-b (sr-segment-record entity-b segments)
+            points-b (cdr (assoc entity-b sample-map)))
+      (setq shared nil)
+      (if (and seg-a seg-b)
+        (foreach candidate (list (nth 2 seg-a) (nth 3 seg-a))
+          (if (or (sr-point-equal-p candidate (nth 2 seg-b) tolerance)
+                  (sr-point-equal-p candidate (nth 3 seg-b) tolerance))
+            (setq shared t)
+          )
+        )
+      )
+      (if (and (not shared) points-a points-b)
+        (progn
+          (setq best-d nil best-pa nil)
+          (foreach pa points-a
+            (foreach pb points-b
+              (setq d (sr-distance-2d pa pb))
+              (if (or (null best-d) (< d best-d))
+                (setq best-d d best-pa pa)
+              )
+            )
+          )
+          (if best-d
+            (setq report (cons (list best-d entity-a entity-b best-pa) report))
+          )
+        )
+      )
+      (setq j (1+ j))
+    )
+    (setq i (1+ i))
+  )
+  (setq report
+    (vl-sort report (function (lambda (x y) (< (car x) (car y))))))
+  (setq trimmed nil i 0)
+  (while (and (< i (length report)) (< i max-results))
+    (setq trimmed (cons (nth i report) trimmed))
+    (setq i (1+ i))
+  )
+  (reverse trimmed)
+)
+
+(defun sr-segment-record (entity segments / segment found)
+  (setq found nil)
+  (foreach segment segments
+    (if (and (null found) (equal entity (nth 0 segment)))
+      (setq found segment)
+    )
+  )
+  found
+)
+
+(defun sr-loop-repeated-vertex-report (segments tolerance /
+                                        report points n i j point-i point-j)
+  ;; A loop can be rejected as self-intersecting even with no curve-interior
+  ;; crossing: if the face tracer merges two sub-loops that only touch at one
+  ;; shared point into a single figure-eight cycle, that vertex is visited
+  ;; twice. Each segment's recorded start point should be visited exactly
+  ;; once around a correct simple loop; any repeat pinpoints such a seam.
+  (setq points
+          (mapcar (function (lambda (segment) (nth 2 segment))) segments)
+        n (length points)
+        report nil
+        i 0)
+  (while (< i n)
+    (setq point-i (nth i points)
+          j (1+ i))
+    (while (< j n)
+      (setq point-j (nth j points))
+      (if (sr-point-equal-p point-i point-j tolerance)
+        (setq report
+          (cons
+            (strcat
+              (sr-handle (nth 0 (nth i segments))) " and "
+              (sr-handle (nth 0 (nth j segments)))
+              " both start near ("
+              (rtos (car point-i) 2 6) ", " (rtos (cadr point-i) 2 6) ")")
+            report))
+      )
+      (setq j (1+ j))
+    )
+    (setq i (1+ i))
+  )
+  (reverse report)
+)
+
+(defun sr-loop-self-intersection-report (entities segments tolerance /
+                                          report i j entity-a entity-b
+                                          edge-a edge-b seg-a seg-b
+                                          shared points point candidate unexpected)
+  ;; Pairwise-check every LINE/ARC in a failed loop against every other member
+  ;; (skipping the point each adjacent pair is expected to share) to locate the
+  ;; actual geometric self-intersection that made AutoCAD reject the loop.
+  (setq report nil
+        i 0)
+  (while (< i (length entities))
+    (setq entity-a (nth i entities)
+          seg-a (sr-segment-record entity-a segments)
+          edge-a (sr-edge-record entity-a)
+          j (1+ i))
+    (while (< j (length entities))
+      (setq entity-b (nth j entities)
+            seg-b (sr-segment-record entity-b segments)
+            edge-b (sr-edge-record entity-b))
+      (if (sr-coincident-overlap-p edge-a edge-b tolerance)
+        (setq points (sr-overlap-boundary-points entity-a entity-b tolerance))
+        (setq points (sr-intersections entity-a entity-b))
+      )
+      (if points
+        (progn
+          (setq shared nil)
+          (if (and seg-a seg-b)
+            (foreach candidate (list (nth 2 seg-a) (nth 3 seg-a))
+              (if (or (sr-point-equal-p candidate (nth 2 seg-b) tolerance)
+                      (sr-point-equal-p candidate (nth 3 seg-b) tolerance))
+                (setq shared (sr-add-unique-point candidate shared tolerance))
+              )
+            )
+          )
+          (foreach point points
+            (setq unexpected t)
+            (foreach candidate shared
+              (if (sr-point-equal-p point candidate tolerance)
+                (setq unexpected nil))
+            )
+            (if unexpected
+              (setq report
+                (cons
+                  (strcat (sr-handle entity-a) " x " (sr-handle entity-b)
+                          " near (" (rtos (car point) 2 6) ", "
+                          (rtos (cadr point) 2 6) ")")
+                  report))
+            )
+          )
+        )
+      )
+      (setq j (1+ j))
+    )
+    (setq i (1+ i))
+  )
+  (reverse report)
+)
+
+(defun sr-add-region-from-loop (model-space entities segments tolerance /
+                                objects entity safe-array result regions
+                                region-object region-entity marker created
+                                activex-error selection command-result native-error
+                                repair-result repair-polyline repair-error loop-handles
+                                crossings crossing crossing-text saved-phase
+                                repeats repeat repeat-text near-misses near-miss
+                                near-miss-text)
+  (setq *sr-phase*
+    (strcat "AddRegion loop at curve " (sr-handle (car entities))))
+  (setq objects nil)
+  (foreach entity entities
+    (setq objects (append objects (list (vlax-ename->vla-object entity))))
+  )
+  (setq safe-array
+    (vlax-make-safearray vlax-vbObject (cons 0 (1- (length objects)))))
+  (vlax-safearray-fill safe-array objects)
+  (setq marker (entlast)
+        result
+    (vl-catch-all-apply 'vla-AddRegion
+      ;; AutoCAD 2008's Visual LISP wrapper expects the object SAFEARRAY
+      ;; directly; wrapping it in another VARIANT can raise an Automation
+      ;; error before ACIS examines the loop.
+      (list model-space safe-array)))
+  (if (vl-catch-all-error-p result)
+    (progn
+      (setq activex-error (vl-catch-all-error-message result)
+            created (sr-entities-after marker))
+      ;; A failed Automation call can leave a partial result behind. Remove
+      ;; only entities created after the marker before trying the native
+      ;; AutoCAD 2008 REGION command.
+      (foreach entity created (sr-safe-entdel entity))
+
+      (setq *sr-phase*
+        (strcat "native REGION fallback at curve "
+                (sr-handle (car entities))))
+      (setq selection (sr-selection-from-entities entities)
+            marker (entlast))
+      (if (/= (sslength selection) (length entities))
+        (sr-abort
+          (strcat
+            "REGION creation failed for loop containing work entity "
+            (sr-handle (car entities)) " (source "
+            (sr-source-label (car entities))
+            "): a loop member no longer exists before the native REGION fallback."))
+      )
+      ;; AutoCAD 2008's native commands can fail with an internal consistency
+      ;; error (eg. a "sort function" error) when operating on entities that
+      ;; were just created or deleted via ActiveX without an intervening
+      ;; Regen; match the BREAK call sites elsewhere in this file.
+      (vla-Regen (vla-get-Document model-space) *sr-ac-all-viewports*)
+      ;; COMMAND is a special AutoLISP function in AutoCAD 2008 and cannot be
+      ;; passed as the function argument of VL-CATCH-ALL-APPLY.
+      (setq command-result (command "_.REGION" selection ""))
+      (if (/= (getvar "CMDACTIVE") 0)
+        (command))
+      (setq created (sr-entities-after marker)
+            regions (sr-region-entities-after marker))
+
+      ;; Tag every native result before validation so the transaction cleanup
+      ;; can remove it if any later operation fails.
+      (foreach region-entity regions
+        (setq region-object (vlax-ename->vla-object region-entity))
+        (vla-put-Layer region-object *sr-layer-temp*)
+        (sr-set-role region-entity *sr-role-temp* nil)
+      )
+
+      (if (= (length regions) 1)
+        (setq region-entity (car regions))
+        (progn
+          (setq native-error
+            (strcat "created " (itoa (length regions))
+                    " REGION objects instead of one"))
+          (foreach entity created (sr-safe-entdel entity))
+
+          ;; A topology loop can be closed within the graph tolerance while
+          ;; its individual source endpoints still differ by tiny amounts.
+          ;; For LINE/ARC loops, rebuild one closed LWPOLYLINE so every joint
+          ;; is represented by a single exact vertex, then retry REGION.
+          (if (sr-line-arc-segments-p segments)
+            (progn
+              (setq repair-result
+                      (sr-add-loop-repair-polyline model-space segments)
+                    repair-polyline (car repair-result)
+                    repair-error (cadr repair-result))
+              (if repair-polyline
+                (progn
+                  (setq *sr-phase*
+                    (strcat "closed polyline REGION repair at curve "
+                            (sr-handle (car entities))))
+                  (setq selection
+                          (sr-selection-from-entities (list repair-polyline))
+                        marker (entlast))
+                  ;; The repair polyline was just created via ActiveX; Regen
+                  ;; before handing it to the native REGION command (see the
+                  ;; matching Regen above and at the BREAK call sites).
+                  (vla-Regen (vla-get-Document model-space) *sr-ac-all-viewports*)
+                  (setq command-result (command "_.REGION" selection ""))
+                  (if (/= (getvar "CMDACTIVE") 0)
+                    (command))
+                  (setq created (sr-entities-after marker)
+                        regions (sr-region-entities-after marker))
+                  (foreach region-entity regions
+                    (setq region-object
+                      (vlax-ename->vla-object region-entity))
+                    (vla-put-Layer region-object *sr-layer-temp*)
+                    (sr-set-role region-entity *sr-role-temp* nil)
+                  )
+                  (if (= (length regions) 1)
+                    (setq region-entity (car regions))
+                    (progn
+                      (setq repair-error
+                        (strcat "created " (itoa (length regions))
+                                " REGION objects instead of one"))
+                      (foreach entity created (sr-safe-entdel entity))
+                    )
+                  )
+                  (sr-safe-entdel repair-polyline)
+                )
+              )
+            )
+            (setq repair-error
+              "not available because the loop contains ELLIPSE or SPLINE geometry")
+          )
+
+          (if (null region-entity)
+            (progn
+              (setq loop-handles "")
+              (foreach entity entities
+                (setq loop-handles
+                  (strcat loop-handles
+                          (if (= loop-handles "") "" ", ")
+                          (sr-handle entity))))
+              ;; Pre-select and zoom to the failing loop so the user can see
+              ;; the self-intersection directly instead of hunting through a
+              ;; long handle list by hand.
+              (setq selection (sr-selection-from-entities entities))
+              (if (> (sslength selection) 0)
+                (progn
+                  (sssetfirst nil selection)
+                  (command "_.ZOOM" "_Object" selection "")
+                )
+              )
+              ;; Pinpoint the actual crossing: pairwise-check every member of
+              ;; the loop against every other member (skipping each adjacent
+              ;; pair's expected shared vertex) for a genuine, unexpected
+              ;; geometric intersection.
+              ;; sr-intersections overwrites *sr-phase* per pair it checks;
+              ;; restore it afterwards so the final reported phase still
+              ;; names the stage that actually failed.
+              (setq saved-phase *sr-phase*)
+              (setq crossings
+                (if (sr-line-arc-segments-p segments)
+                  (sr-loop-self-intersection-report entities segments tolerance)
+                  nil))
+              (setq *sr-phase* saved-phase)
+              (setq crossing-text "")
+              (foreach crossing crossings
+                (setq crossing-text
+                  (strcat crossing-text
+                          (if (= crossing-text "") "" "; ")
+                          crossing)))
+              ;; No curve-interior crossing does not mean the loop is simple:
+              ;; the face tracer can also merge two sub-loops that only touch
+              ;; at one shared point into a single figure-eight cycle. Check
+              ;; whether any loop vertex is visited more than once.
+              (setq repeats (sr-loop-repeated-vertex-report segments tolerance))
+              (setq repeat-text "")
+              (foreach repeat repeats
+                (setq repeat-text
+                  (strcat repeat-text
+                          (if (= repeat-text "") "" "; ")
+                          repeat)))
+              ;; Last resort: AutoCAD's own self-intersection pre-check runs at
+              ;; a far coarser numeric tolerance than this script's analytic
+              ;; tolerance (~1e-9 of the drawing diagonal). Sample every curve
+              ;; and report the closest non-adjacent approaches so an edge
+              ;; pair that passes extremely close -- without ever exactly
+              ;; touching or crossing -- can still be spotted.
+              (setq near-misses
+                (if (or crossings repeats)
+                  nil
+                  (sr-loop-near-miss-report entities segments tolerance 8 5)))
+              (setq near-miss-text "")
+              (foreach near-miss near-misses
+                (setq near-miss-text
+                  (strcat near-miss-text
+                          (if (= near-miss-text "") "" "; ")
+                          (sr-handle (nth 1 near-miss)) " x "
+                          (sr-handle (nth 2 near-miss)) " min-dist "
+                          (rtos (nth 0 near-miss) 2 9) " near ("
+                          (rtos (car (nth 3 near-miss)) 2 6) ", "
+                          (rtos (cadr (nth 3 near-miss)) 2 6) ")")))
+              (sr-abort
+                (strcat
+                  "REGION creation failed for loop containing work entity "
+                  (sr-handle (car entities)) " (source "
+                  (sr-source-label (car entities)) "). ActiveX AddRegion: "
+                  activex-error "; native REGION: " native-error
+                  "; closed-polyline repair: "
+                  (if repair-error repair-error "unknown failure")
+                  ". All three strategies failed to build any region from "
+                  "this loop, which usually means the traced loop is not a "
+                  "simple (non-self-intersecting) closed boundary. "
+                  (cond
+                    (crossings
+                      (strcat "Detected unexpected crossing(s): "
+                              crossing-text "."))
+                    (repeats
+                      (strcat "Detected repeated vertex (pinch point): "
+                              repeat-text ". The face tracer likely merged "
+                              "two sub-loops that only touch at this point "
+                              "into one invalid cycle."))
+                    (near-misses
+                      (strcat
+                        "No exact crossing or repeated vertex, but these "
+                        "non-adjacent pairs pass unusually close to each "
+                        "other (closest approaches): " near-miss-text "."))
+                    (t
+                      (strcat
+                        "No unexpected pairwise crossing, repeated vertex, or "
+                        "close approach was found; inspect these loop entity "
+                        "handles in the drawing: " loop-handles ".")))))
+            )
+          )
+        )
+      )
+    )
+    (progn
+      (setq regions (sr-vla-object-list result))
+      (if (/= (length regions) 1)
+        (progn
+          (foreach region-object regions (sr-safe-vla-delete region-object))
+          (sr-abort
+            (strcat "A traced loop produced " (itoa (length regions))
+                    " REGION objects instead of one.")))
+      )
+      (setq region-object (car regions))
+      (vla-put-Layer region-object *sr-layer-temp*)
+      (setq region-entity (vlax-vla-object->ename region-object))
+      (sr-set-role region-entity *sr-role-temp* nil)
+    )
+  )
+  region-entity
+)
+
+(defun sr-region-area (entity / object result)
+  (setq object (vlax-ename->vla-object entity)
+        result (vl-catch-all-apply 'vla-get-Area (list object)))
+  (if (vl-catch-all-error-p result) 0.0 result)
+)
+
+(defun sr-copy-region-object (entity / object copy copy-entity)
+  (setq object (vlax-ename->vla-object entity)
+        copy (vl-catch-all-apply 'vla-Copy (list object)))
+  (if (vl-catch-all-error-p copy)
+    (sr-abort (strcat "Cannot copy REGION " (sr-handle entity) ".")))
+  (vla-put-Layer copy *sr-layer-temp*)
+  (setq copy-entity (vlax-vla-object->ename copy))
+  (sr-set-role copy-entity *sr-role-temp* nil)
+  copy-entity
+)
+
+(defun sr-region-intersection-area (entity1 entity2 / copy1 copy2 object1 object2 result area)
+  (setq *sr-phase* "compare REGION containment")
+  (setq copy1 (sr-copy-region-object entity1)
+        copy2 (sr-copy-region-object entity2)
+        object1 (vlax-ename->vla-object copy1)
+        object2 (vlax-ename->vla-object copy2)
+        result
+          (vl-catch-all-apply 'vla-Boolean
+            (list object1 *sr-ac-intersection* object2)))
+  (if (vl-catch-all-error-p result)
+    (setq area 0.0)
+    (setq area
+      (vl-catch-all-apply 'vla-get-Area (list object1)))
+  )
+  (if (vl-catch-all-error-p area) (setq area 0.0))
+  (sr-safe-entdel copy1)
+  (sr-safe-entdel copy2)
+  area
+)
+
+(defun sr-region-contains-p (outer inner area-tolerance / inner-area intersection-area)
+  (setq inner-area (sr-region-area inner)
+        intersection-area (sr-region-intersection-area outer inner))
+  (sr-area-equal-p inner-area intersection-area area-tolerance)
+)
+
+(defun sr-create-base-regions (model-space loops area-tolerance tolerance / bases loop region area
+                                duplicate existing existing-area intersection-area)
+  (setq bases nil)
+  (foreach loop loops
+    (setq region
+            (sr-add-region-from-loop model-space (car loop) (caddr loop) tolerance)
+          area (sr-region-area region)
+          duplicate nil)
+    (if (<= area area-tolerance)
+      (sr-safe-entdel region)
+      (progn
+        (foreach existing bases
+          (if (and (not duplicate)
+                   (sr-area-equal-p area (cadr existing) area-tolerance))
+            (progn
+              (setq intersection-area
+                (sr-region-intersection-area region (car existing)))
+              (if (and (sr-area-equal-p area intersection-area area-tolerance)
+                       (sr-area-equal-p (cadr existing) intersection-area area-tolerance))
+                (setq duplicate t)
+              )
+            )
+          )
+        )
+        (if duplicate
+          (sr-safe-entdel region)
+          (setq bases (append bases (list (list region area))))
+        )
+      )
+    )
+  )
+  bases
+)
+
+(defun sr-find-region-parents (bases area-tolerance / parents i j inner outer inner-area
+                               outer-area best best-area)
+  (setq parents nil
+        i 0)
+  (while (< i (length bases))
+    (setq inner (nth i bases)
+          inner-area (cadr inner)
+          best -1
+          best-area nil
+          j 0)
+    (while (< j (length bases))
+      (if (/= i j)
+        (progn
+          (setq outer (nth j bases)
+                outer-area (cadr outer))
+          (if (and (> outer-area (+ inner-area area-tolerance))
+                   (or (null best-area) (< outer-area best-area))
+                   (sr-region-contains-p (car outer) (car inner) area-tolerance))
+            (setq best j
+                  best-area outer-area)
+          )
+        )
+      )
+      (setq j (1+ j))
+    )
+    (setq parents (append parents (list (cons i best)))
+          i (1+ i))
+  )
+  parents
+)
+
+(defun sr-create-final-regions (bases parents area-tolerance / finals i face face-object
+                                 child-index child tool tool-object result area)
+  (setq finals nil
+        i 0)
+  (while (< i (length bases))
+    (setq face (sr-copy-region-object (car (nth i bases)))
+          face-object (vlax-ename->vla-object face)
+          child-index 0)
+    (while (< child-index (length bases))
+      (if (= (cdr (assoc child-index parents)) i)
+        (progn
+          (setq *sr-phase* "subtract inner REGION from parent REGION")
+          (setq child (car (nth child-index bases))
+                tool (sr-copy-region-object child)
+                tool-object (vlax-ename->vla-object tool)
+                result
+                  (vl-catch-all-apply 'vla-Boolean
+                    (list face-object *sr-ac-subtraction* tool-object)))
+          (if (vl-catch-all-error-p result)
+            (progn
+              (sr-safe-entdel tool)
+              (sr-safe-entdel face)
+              (sr-abort
+                (strcat "REGION subtraction failed while creating a hole. Parent handle "
+                        (sr-handle (car (nth i bases))) "."))))
+          ;; Some ACIS operations may replace entity data on the first object.
+          ;; Re-apply ownership immediately so error cleanup remains reliable.
+          (sr-set-role face *sr-role-temp* nil)
+          (sr-safe-entdel tool)
+        )
+      )
+      (setq child-index (1+ child-index))
+    )
+    (setq area (sr-region-area face))
+    (if (> area area-tolerance)
+      (setq finals (append finals (list face)))
+      (sr-safe-entdel face)
+    )
+    (setq i (1+ i))
+  )
+  finals
+)
+
+(defun sr-build-regions (model-space loops area-tolerance tolerance / bases parents finals base)
+  (setq bases (sr-create-base-regions model-space loops area-tolerance tolerance))
+  (if bases
+    (progn
+      (setq parents (sr-find-region-parents bases area-tolerance)
+            finals (sr-create-final-regions bases parents area-tolerance))
+      (foreach base bases
+        (sr-safe-entdel (car base))
+      )
+      finals
+    )
+    nil
+  )
+)
+
+;;; --------------------------------------------------------------------------
+;;; Commit and command entry point
+;;; --------------------------------------------------------------------------
+
+(defun sr-commit (document new-sources split-entities region-entities
+                   old-split old-regions / entity object original-layer)
+  (setq *sr-phase* "commit final layers and XData")
+  ;; Old output remains visible until all new output has succeeded.
+  (foreach entity old-split (sr-safe-entdel entity))
+  (foreach entity old-regions (sr-safe-entdel entity))
+
+  (foreach entity new-sources
+    (setq object (vlax-ename->vla-object entity)
+          original-layer (vla-get-Layer object))
+    (sr-set-role entity *sr-role-source* original-layer)
+    (vla-put-Layer object *sr-layer-backup*)
+  )
+
+  (foreach entity split-entities
+    (setq object (vlax-ename->vla-object entity))
+    (vla-put-Layer object *sr-layer-split*)
+    (sr-set-role entity *sr-role-split* nil)
+  )
+  (foreach entity region-entities
+    (setq object (vlax-ename->vla-object entity))
+    (vla-put-Layer object *sr-layer-region*)
+    ;; A copied/Boolean REGION can retain an invisible object flag on some
+    ;; AutoCAD 2008 builds even when its destination layer is on and thawed.
+    (vl-catch-all-apply 'vla-put-Visible (list object :vlax-true))
+    (vl-catch-all-apply 'vla-Update (list object))
+    (sr-set-role entity *sr-role-region* nil)
+  )
+  ;; SR_REGION becomes current, and every other layer (split/backup/temp work
+  ;; layers as well as any original drawing layers) is switched off, so a
+  ;; later export only ever sees the final REGION geometry.
+  (setvar "CLAYER" *sr-layer-region*)
+  (sr-set-layer-on document *sr-layer-region* t)
+  (sr-isolate-layer document *sr-layer-region*)
+)
+
+(defun c:SREG (/ acad document model-space saved-vars previous-error undo-open started
+                        prior-source-all prior-source stale-source-count
+                        prior-split prior-regions new-sources choice selection
+                        sources validation tolerance area-tolerance primitives intersection-map
+                        split-entities overlap-normalization duplicate-count loops regions
+                        dangling-count process-result success)
+  (vl-load-com)
+  (setq acad (vlax-get-acad-object)
+        document (vla-get-ActiveDocument acad)
+        model-space (vla-get-ModelSpace document)
+        saved-vars
+          (list (cons "CMDECHO" (getvar "CMDECHO"))
+                (cons "OSMODE" (getvar "OSMODE"))
+                (cons "DELOBJ" (getvar "DELOBJ"))
+                (cons "CLAYER" (getvar "CLAYER")))
+        previous-error *error*
+        undo-open nil
+        started nil
+        success nil
+        *sr-phase* "initialize"
+        *sr-failure* nil)
+
+  (defun *error* (message)
+    (if started
+      (sr-delete-role *sr-role-temp*))
+    (if undo-open
+      (vl-catch-all-apply 'vla-EndUndoMark (list document)))
+    (sr-restore-vars saved-vars)
+    (setq *error* previous-error)
+    (if (and message
+             (/= message "Function cancelled")
+             (/= message "quit / exit abort"))
+      (prompt
+        (strcat "\nSREG error ["
+                (if *sr-phase* *sr-phase* "unknown phase")
+                "]: " message))
+    )
+    (princ)
+  )
+
+  (setvar "CMDECHO" 0)
+  (setvar "OSMODE" 0)
+  (setvar "DELOBJ" 0)
+  (regapp *sr-app-name*)
+
+  (setq prior-source-all (sr-entities-by-role *sr-role-source*)
+        prior-source (sr-filter-supported-sources prior-source-all)
+        stale-source-count (- (length prior-source-all) (length prior-source))
+        prior-split (sr-entities-by-role *sr-role-split*)
+        prior-regions (sr-entities-by-role *sr-role-region*))
+  (if (> stale-source-count 0)
+    (prompt
+      (strcat "\nNotice: ignored " (itoa stale-source-count)
+              " stale SOURCE-tagged unsupported object(s)."))
+  )
+
+  (if prior-source
+    (progn
+      (prompt
+        (strcat "\nRebuild source contains " (itoa (length prior-source))
+                " supported backup curve(s)."))
+      (initget "Rebuild Add Cancel")
+      (setq choice
+        (getkword "\nPrevious SREG model found [Rebuild/Add/Cancel] <Rebuild>: "))
+      (if (null choice) (setq choice "Rebuild"))
+      (cond
+        ((= choice "Cancel")
+         (prompt "\nSREG cancelled; no geometry changed.")
+         (exit)
+        )
+        ((= choice "Add")
+         (prompt
+           "\nSelect additional LINE, ARC, CIRCLE, ELLIPSE, SPLINE, LWPOLYLINE, or 2D POLYLINE source geometry to add: ")
+         (setq selection (ssget))
+         (if (null selection)
+           (progn
+             (prompt "\nNothing selected; no geometry changed.")
+             (exit)
+           )
+         )
+         (setq new-sources (sr-unique-enames (sr-ss-to-list selection))
+               sources (sr-unique-enames (append prior-source new-sources)))
+        )
+        (t
+         (setq sources prior-source
+               new-sources nil)
+        )
+      )
+    )
+    (progn
+      (prompt
+        "\nSelect LINE, ARC, CIRCLE, ELLIPSE, SPLINE, LWPOLYLINE, or 2D POLYLINE source geometry: ")
+      (setq selection (ssget))
+      (if (null selection)
+        (progn
+          (prompt "\nNothing selected; no geometry changed.")
+          (exit)
+        )
+      )
+      (setq sources (sr-ss-to-list selection)
+            new-sources sources)
+    )
+  )
+
+  (vla-StartUndoMark document)
+  (setq undo-open t
+        started t)
+  (setq process-result
+    (vl-catch-all-apply
+      (function
+        (lambda ()
+          (setq *sr-phase* "prepare output layers")
+          (sr-prepare-layers document)
+          ;; Remove only script-owned debris from an earlier interrupted run.
+          (setq *sr-phase* "remove stale temporary entities")
+          (sr-delete-role *sr-role-temp*)
+          (setq *sr-phase* "validate selected source geometry")
+          (setq validation (sr-validate-sources document sources)
+                tolerance (cadr validation)
+                area-tolerance (caddr validation))
+          (setq *sr-phase* "copy and explode source geometry")
+          (setq primitives (sr-copy-and-explode sources))
+          (setq *sr-phase* "collect intersections and overlap boundaries")
+          (setq intersection-map (sr-collect-intersections primitives tolerance))
+          (setq *sr-phase* "split curves at intersections")
+          (setq split-entities
+            (sr-split-primitives
+              primitives intersection-map model-space document tolerance))
+          (setq *sr-phase* "deduplicate coincident split curves")
+          (setq overlap-normalization
+                  (sr-normalize-split-overlaps split-entities tolerance)
+                split-entities (car overlap-normalization)
+                duplicate-count (cadr overlap-normalization))
+          (setq *sr-phase* "trace bounded planar faces")
+          (setq loops (sr-build-loops split-entities tolerance area-tolerance)
+                dangling-count (sr-count-unbounded-curves split-entities loops))
+          (if (null loops)
+            (sr-abort
+              "The selected curves do not form any bounded planar face."))
+          (setq *sr-phase* "create independent REGION objects")
+          (setq regions (sr-build-regions model-space loops area-tolerance tolerance))
+          (if (null regions)
+            (sr-abort
+              "No valid REGION could be created from the bounded faces."))
+          (sr-commit document new-sources split-entities regions
+                     prior-split prior-regions)
+          t
+        )
+      )
+      nil
+    )
+  )
+  (if (vl-catch-all-error-p process-result)
+    (progn
+      (if (null *sr-failure*)
+        (setq *sr-failure* (vl-catch-all-error-message process-result)))
+      (setq success nil)
+    )
+    (setq success t)
+  )
+
+  (if (not success)
+    (progn
+      (sr-delete-role *sr-role-temp*)
+      (prompt
+        (strcat "\nSREG stopped: "
+                (if *sr-failure* *sr-failure* "unknown error")
+                " Phase: " (if *sr-phase* *sr-phase* "unknown") "."
+                " No source geometry was changed."))
+    )
+    (prompt
+      (strcat "\nSREG complete: "
+              (itoa (length split-entities)) " split curve(s), "
+              (itoa (length regions)) " independent REGION(s)."))
+  )
+  (if (and success (> dangling-count 0))
+    (prompt
+      (strcat "\nNotice: " (itoa dangling-count)
+              " curve(s) do not belong to any bounded face; they remain on SR_SPLIT."))
+  )
+  (if (and success (> duplicate-count 0))
+    (prompt
+      (strcat "\nNotice: removed " (itoa duplicate-count)
+              " duplicate coincident curve piece(s) from the work set."))
+  )
+
+  (if undo-open
+    (progn
+      (vl-catch-all-apply 'vla-EndUndoMark (list document))
+      (setq undo-open nil)
+    )
+  )
+
+  (sr-restore-vars saved-vars)
+  (setq *error* previous-error)
+  (vla-Regen document *sr-ac-all-viewports*)
+  (if success
+    ;; The source layers are frozen after commit. Fit the active model-space
+    ;; viewport to the remaining visible REGION geometry.
+    (vl-catch-all-apply 'vla-ZoomExtents (list acad))
+  )
+  (princ)
+)
+
+(princ "\nSREG loaded. Type SREG to run.")
+(princ)
+
