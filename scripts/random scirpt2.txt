@@ -1,0 +1,11 @@
+FINISH
+KEYW,PR_SGVOF,1   ! 關閉 Verify 視窗，自動視為 Yes
+/CLEAR,START
+
+/FACET,NORML
+/PNUM,AREA,1
+
+~SATIN,'sat21','sat','C:\Users\Desktop\ansys\016_sat',ALL,0
+
+/FACET,NORML
+/REP,FAST
