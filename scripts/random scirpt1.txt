@@ -1,30 +1,33 @@
-Z_B = 0.0                        ! ★新增：起始 Z 位置
-H_C = 0.03                       ! ★新增：厚度
 
-/INQUIRE,EXIST_CIRCLE,EXIST,shape_export_circle,txt
-*IF,EXIST_CIRCLE,EQ,1,THEN
-    /INQUIRE,N_CIRCLE,LINES,shape_export_circle,txt
-    *DIM,CIRC,ARRAY,N_CIRCLE,4
-    *VREAD,CIRC(1,1),shape_export_circle,txt,,JIK,4,N_CIRCLE
-(F9.0,3E21.13E3)
-
-    *DO,I_C,1,N_CIRCLE
-        CX_C = CIRC(I_C,2)
-        CY_C = CIRC(I_C,3)
-        R_C  = CIRC(I_C,4)
-
-        TOL_C = R_C*1E-6
-
-        LOCAL,15,1,CX_C,CY_C,0
-        ESEL,S,CENT,X,-TOL_C,R_C+TOL_C            ! ★改：元素形心半徑 ≤ R_C
-        CSYS,0
-        ESEL,R,CENT,Z,Z_B-TOL_C,Z_B+H_C+TOL_C     ! ★新增：形心落在 Z_B ~ Z_B+H_C
-
-        *IF,I_C,GT,1,THEN
-            CMSEL,A,CIRCLE_ELEM                    ! ★改：CIRCLE_AREA → CIRCLE_ELEM
-        *ENDIF
-        CM,CIRCLE_ELEM,ELEM                        ! ★改：AREA → ELEM
-    *ENDDO
-*ELSE
-    /COM,[座標重建CM] 找不到 shape_export_circle.txt，略過 CIRCLE 類別
-*ENDIF
+(defun c:SRTEST (/ e d o c ce ex)
+  (vl-load-com)
+  (setq e (handent "3740")
+        d (entget e))
+  (princ (strcat "\n類型: " (cdr (assoc 0 d))
+                 "  圖層: " (cdr (assoc 8 d))))
+  (if (assoc 70 d)
+    (princ (strcat "  旗標70: " (itoa (cdr (assoc 70 d))))))
+  (if (assoc 90 d)
+    (princ (strcat "  頂點數: " (itoa (cdr (assoc 90 d))))))
+  (princ "\n[1] 轉 VLA 物件...")
+  (setq o (vlax-ename->vla-object e))
+  (princ "OK\n[2] vla-Copy...")
+  (setq c (vla-Copy o))
+  (princ "OK\n[3] 改圖層...")
+  (vla-put-Layer c "0")
+  (princ "OK\n[4] 取 ename...")
+  (setq ce (vlax-vla-object->ename c))
+  (princ "OK\n[5] 寫 XData...")
+  (regapp "SRTEST")
+  (entmod (append (entget ce)
+                  (list (list -3 (list "SRTEST" (cons 1000 "x"))))))
+  (princ "OK\n[6] Explode...")
+  (if (wcmatch (cdr (assoc 0 (entget ce))) "*POLYLINE")
+    (progn
+      (setq ex (vlax-invoke c 'Explode))
+      (princ (strcat "OK，炸成 " (itoa (length ex)) " 個"))
+      (foreach x ex (vla-Delete x)))
+    (princ "略過（不是多段線）"))
+  (vla-Delete c)
+  (princ "\n全部通過")
+  (princ))
