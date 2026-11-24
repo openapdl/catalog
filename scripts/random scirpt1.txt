@@ -60,5 +60,36 @@ EPLOT                             ! 應該是 600 顆分開的 bump
 *MSG,INFO,n1,n2,m1,m2
 EX=%I  BUMP=%I  first MAT=%I  last MAT=%I
 
+！========================
 
+
+CSYS,0
+x0 = 10      $  y0 = 10
+w  = 1.1     $  l  = 2.1
+pitch_x  = 0.5  $  pitch_y  = 0.5
+pitch_xx = 20   $  pitch_yy = 30
+nx = 5   $  ny = 5
+nbx = 8  $  nby = 3
+mat_new = 21
+
+/PREP7
+*DO,by,1,nby
+    *DO,bx,1,nbx
+        *DO,j,1,ny
+            *DO,i,1,nx
+                xa = x0+(bx-1)*pitch_xx+(i-1)*(w+pitch_x)
+                ya = y0+(by-1)*pitch_yy+(j-1)*(l+pitch_y)
+
+                ESEL,S,CENT,X,xa,xa+w          ! 這一顆的 X 範圍
+                ESEL,R,CENT,Y,ya,ya+l          ! 再篩 Y
+                ESEL,R,CENT,Z,-0.013,0         ! 再篩厚度
+                EMODIF,ALL,MAT,mat_new         ! 當場改材料
+            *ENDDO
+        *ENDDO
+    *ENDDO
+*ENDDO
+
+ESEL,S,MAT,,mat_new                            ! 全部改完，用材料號一次選回來
+CM,E_BUMP,ELEM
+ALLSEL,ALL
 
