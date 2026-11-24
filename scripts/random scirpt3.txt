@@ -145,7 +145,7 @@ first_x_cell = 1
 
             *if,bump_x_loc_cnt(bump_x_idx),eq,0,then
                 *msg,WARN,bump_x_idx
-這格(bump_x_idx=%I)沒有選到任何面，請檢查 Boolean 結果
+No area found for this cell (bump_x_idx=%I), check Boolean result
             *endif
             *if,bump_x_loc_cnt(bump_x_idx),gt,0,then
                 *if,first_x_cell,eq,1,then
@@ -163,6 +163,5 @@ first_x_cell = 1
 *ENDDO
 
 ALLSEL,ALL
-
 
 
