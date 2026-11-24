@@ -5,6 +5,7 @@ pitch_x  = 0.5  $  pitch_y  = 0.5
 pitch_xx = 20   $  pitch_yy = 30
 nx = 5   $  ny = 5
 nbx = 8  $  nby = 3
+mat_new = 21                      ! ★新材料號
 
 ESEL,NONE
 *DO,bx,1,nbx
@@ -26,5 +27,9 @@ ESEL,NONE
 CMSEL,R,_EX
 ESEL,R,CENT,Z,-0.013,0
 CM,E_BUMP,ELEM
+
+/PREP7                            ! ★EMODIF 只在 PREP7 有效
+EMODIF,ALL,MAT,mat_new            ! ★已選元素改材料
+
 CMDELE,_EX
 ALLSEL,ALL
