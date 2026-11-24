@@ -33,3 +33,32 @@ EMODIF,ALL,MAT,mat_new            ! ★已選元素改材料
 
 CMDELE,_EX
 ALLSEL,ALL
+
+
+
+
+
+！========================
+
+! ---- 1. 直條選了什麼 ----
+CMSEL,S,_EX
+*GET,n1,ELEM,0,COUNT
+EPLOT                             ! 應該是 40 條分開的直條
+
+! ---- 2. 交集之後 ----
+CMSEL,S,E_BUMP
+*GET,n2,ELEM,0,COUNT
+EPLOT                             ! 應該是 600 顆分開的 bump
+
+! ---- 3. 材料有沒有真的改到 ----
+*GET,e1,ELEM,0,NUM,MIN
+*GET,e2,ELEM,0,NUM,MAX
+*GET,m1,ELEM,e1,ATTR,MAT
+*GET,m2,ELEM,e2,ATTR,MAT
+
+/GO
+*MSG,INFO,n1,n2,m1,m2
+EX=%I  BUMP=%I  first MAT=%I  last MAT=%I
+
+
+
