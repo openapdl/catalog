@@ -100,6 +100,23 @@ ESLV,S                                        ! 選出附屬於這些 bump volum
 EMODIF,ALL,MAT,25                             ! 把選取的元素材料改成 MAT=25
 ALLSEL,ALL
 
+! ========= 依座標選出 bump 所在的另一個面，跟 bump_full_array 做 Boolean Overlap
+ALLSEL,ALL
+ASEL,S,LOC,X,bg_x1-loc_tol,bg_x2+loc_tol
+ASEL,R,LOC,Y,bg_y1-loc_tol,bg_y2+loc_tol
+CMSEL,U,bump_full_array,AREA                  ! 排除 bump 面本身，只留下承載 bump 的那個背景大面
+CM,bg_area,AREA                               ! 存成 component，方便後面 CMSEL 取用
+ALLSEL,ALL
+
+boptn,keep,0     ! Overlap 後保留輸入面（AOVLAP 預設即保留重疊前的原面，這裡維持預設）
+boptn,nwarn,0    ! 布林運算「沒效果」時跳警告（預設值）
+btol,1e-3        ! 布林運算點重合容差，放寬到 1e-3（預設 1e-5）以吸收浮點誤差，提高 AOVLAP 成功率
+
+CMSEL,S,bg_area,AREA
+CMSEL,A,bump_full_array,AREA
+AOVLAP,ALL                                    ! 兩面重疊部分切成共用面，供後續網格共用節點用
+ALLSEL,ALL
+
 
 
 
