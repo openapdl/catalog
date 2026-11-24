@@ -120,44 +120,47 @@ ALLSEL,ALL
 
 
 
-! ========= Boolean 後重新建立 bump_x_array（原本的面已被 Overlap/Subtract 切割或刪除，面號不再有效，改用座標重選）
-bump_x_count_total = bump_count_per_die*die_count_x
-*del,bump_x_loc_cnt
-*dim,bump_x_loc_cnt,array,bump_x_count_total
-first_x_cell = 1
 
-*DO,bx,1,die_count_x
-    *DO,j,1,bump_count_y
-        *DO,i,1,bump_count_x
-            xc = start_cx + (i-1)*(bump_w + pitch_x) + (bx-1)*die_pitch_x
-            yc = start_cy + (j-1)*(bump_h + pitch_y)
-            x1 = xc - bump_w/2
-            x2 = xc + bump_w/2
-            y1 = yc - bump_h/2
-            y2 = yc + bump_h/2
+! ========= Boolean 後重新建立 bump_full_array（原本的面已被 Overlap/Subtract 切割或刪除，面號不再有效，改用座標重選）
+bump_full_count_total = bump_count_per_die*die_count_x*die_count_y
+*del,bump_full_loc_cnt
+*dim,bump_full_loc_cnt,array,bump_full_count_total
+first_full_cell = 1
 
-            bump_x_idx = (bx-1)*bump_count_per_die + (j-1)*bump_count_x + i
+*DO,by,1,die_count_y
+    *DO,bx,1,die_count_x
+        *DO,j,1,bump_count_y
+            *DO,i,1,bump_count_x
+                xc = start_cx + (i-1)*(bump_w + pitch_x) + (bx-1)*die_pitch_x
+                yc = start_cy + (j-1)*(bump_h + pitch_y) + (by-1)*die_pitch_y
+                x1 = xc - bump_w/2
+                x2 = xc + bump_w/2
+                y1 = yc - bump_h/2
+                y2 = yc + bump_h/2
 
-            ALLSEL,ALL
-            ASEL,S,LOC,X,x1-loc_tol,x2+loc_tol
-            ASEL,R,LOC,Y,y1-loc_tol,y2+loc_tol
-            *get,bump_x_loc_cnt(bump_x_idx),area,0,count   ! 這格實際選到幾個面：Boolean 後可能被切成多塊，仍全部收進來；0 代表這格選不到面，需留意
+                bump_full_idx = ((by-1)*die_count_x + (bx-1))*bump_count_per_die + (j-1)*bump_count_x + i
 
-            *if,bump_x_loc_cnt(bump_x_idx),eq,0,then
-                *msg,WARN,bump_x_idx
-No area found for this cell (bump_x_idx=%I), check Boolean result
-            *endif
-            *if,bump_x_loc_cnt(bump_x_idx),gt,0,then
-                *if,first_x_cell,eq,1,then
-                    CM,bump_x_array,AREA              ! 第一格：把目前選到的（可能不只一個）面直接存成 component
-                    first_x_cell = 0
-                *else
-                    CM,bump_x_tmp_cell,AREA           ! 這一格選到的所有面，先存成暫存 component
-                    CMSEL,A,bump_x_array,AREA         ! 加回目前累積結果
-                    CMSEL,A,bump_x_tmp_cell,AREA       ! 再加上這一格新選到的
-                    CM,bump_x_array,AREA              ! 重新存回累積 component（等於聯集）
+                ALLSEL,ALL
+                ASEL,S,LOC,X,x1-loc_tol,x2+loc_tol
+                ASEL,R,LOC,Y,y1-loc_tol,y2+loc_tol
+                *get,bump_full_loc_cnt(bump_full_idx),area,0,count   ! 這格實際選到幾個面：Boolean 後可能被切成多塊，仍全部收進來；0 代表這格選不到面，需留意
+
+                *if,bump_full_loc_cnt(bump_full_idx),eq,0,then
+                    *msg,WARN,bump_full_idx
+No area found for this cell (bump_full_idx=%I), check Boolean result
                 *endif
-            *endif
+                *if,bump_full_loc_cnt(bump_full_idx),gt,0,then
+                    *if,first_full_cell,eq,1,then
+                        CM,bump_full_array,AREA           ! 第一格：把目前選到的（可能不只一個）面直接存成 component
+                        first_full_cell = 0
+                    *else
+                        CM,bump_full_tmp_cell,AREA        ! 這一格選到的所有面，先存成暫存 component
+                        CMSEL,A,bump_full_array,AREA      ! 加回目前累積結果
+                        CMSEL,A,bump_full_tmp_cell,AREA   ! 再加上這一格新選到的
+                        CM,bump_full_array,AREA           ! 重新存回累積 component（等於聯集）
+                    *endif
+                *endif
+            *ENDDO
         *ENDDO
     *ENDDO
 *ENDDO
