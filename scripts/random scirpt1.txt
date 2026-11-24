@@ -1,33 +1,30 @@
+CSYS,0
+x0 = 10      $  y0 = 10
+w  = 1.1     $  l  = 2.1
+pitch_x  = 0.5  $  pitch_y  = 0.5
+pitch_xx = 20   $  pitch_yy = 30
+nx = 5   $  ny = 5
+nbx = 8  $  nby = 3
 
-(defun c:SRTEST (/ e d o c ce ex)
-  (vl-load-com)
-  (setq e (handent "3740")
-        d (entget e))
-  (princ (strcat "\n類型: " (cdr (assoc 0 d))
-                 "  圖層: " (cdr (assoc 8 d))))
-  (if (assoc 70 d)
-    (princ (strcat "  旗標70: " (itoa (cdr (assoc 70 d))))))
-  (if (assoc 90 d)
-    (princ (strcat "  頂點數: " (itoa (cdr (assoc 90 d))))))
-  (princ "\n[1] 轉 VLA 物件...")
-  (setq o (vlax-ename->vla-object e))
-  (princ "OK\n[2] vla-Copy...")
-  (setq c (vla-Copy o))
-  (princ "OK\n[3] 改圖層...")
-  (vla-put-Layer c "0")
-  (princ "OK\n[4] 取 ename...")
-  (setq ce (vlax-vla-object->ename c))
-  (princ "OK\n[5] 寫 XData...")
-  (regapp "SRTEST")
-  (entmod (append (entget ce)
-                  (list (list -3 (list "SRTEST" (cons 1000 "x"))))))
-  (princ "OK\n[6] Explode...")
-  (if (wcmatch (cdr (assoc 0 (entget ce))) "*POLYLINE")
-    (progn
-      (setq ex (vlax-invoke c 'Explode))
-      (princ (strcat "OK，炸成 " (itoa (length ex)) " 個"))
-      (foreach x ex (vla-Delete x)))
-    (princ "略過（不是多段線）"))
-  (vla-Delete c)
-  (princ "\n全部通過")
-  (princ))
+ESEL,NONE
+*DO,bx,1,nbx
+    *DO,i,1,nx
+        xa = x0+(bx-1)*pitch_xx+(i-1)*(w+pitch_x)
+        ESEL,A,CENT,X,xa,xa+w
+    *ENDDO
+*ENDDO
+CM,_EX,ELEM
+
+ESEL,NONE
+*DO,by,1,nby
+    *DO,j,1,ny
+        ya = y0+(by-1)*pitch_yy+(j-1)*(l+pitch_y)
+        ESEL,A,CENT,Y,ya,ya+l
+    *ENDDO
+*ENDDO
+
+CMSEL,R,_EX
+ESEL,R,CENT,Z,-0.013,0
+CM,E_BUMP,ELEM
+CMDELE,_EX
+ALLSEL,ALL
