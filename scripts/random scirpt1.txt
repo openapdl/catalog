@@ -1,30 +1,95 @@
-Z_B = 0.0                        ! ★新增：起始 Z 位置
-H_C = 0.03                       ! ★新增：厚度
+CSYS,0
+x0 = 10      $  y0 = 10
+w  = 1.1     $  l  = 2.1
+pitch_x  = 0.5  $  pitch_y  = 0.5
+pitch_xx = 20   $  pitch_yy = 30
+nx = 5   $  ny = 5
+nbx = 8  $  nby = 3
+mat_new = 21                      ! ★新材料號
 
-/INQUIRE,EXIST_CIRCLE,EXIST,shape_export_circle,txt
-*IF,EXIST_CIRCLE,EQ,1,THEN
-    /INQUIRE,N_CIRCLE,LINES,shape_export_circle,txt
-    *DIM,CIRC,ARRAY,N_CIRCLE,4
-    *VREAD,CIRC(1,1),shape_export_circle,txt,,JIK,4,N_CIRCLE
-(F9.0,3E21.13E3)
-
-    *DO,I_C,1,N_CIRCLE
-        CX_C = CIRC(I_C,2)
-        CY_C = CIRC(I_C,3)
-        R_C  = CIRC(I_C,4)
-
-        TOL_C = R_C*1E-6
-
-        LOCAL,15,1,CX_C,CY_C,0
-        ESEL,S,CENT,X,-TOL_C,R_C+TOL_C            ! ★改：元素形心半徑 ≤ R_C
-        CSYS,0
-        ESEL,R,CENT,Z,Z_B-TOL_C,Z_B+H_C+TOL_C     ! ★新增：形心落在 Z_B ~ Z_B+H_C
-
-        *IF,I_C,GT,1,THEN
-            CMSEL,A,CIRCLE_ELEM                    ! ★改：CIRCLE_AREA → CIRCLE_ELEM
-        *ENDIF
-        CM,CIRCLE_ELEM,ELEM                        ! ★改：AREA → ELEM
+ESEL,NONE
+*DO,bx,1,nbx
+    *DO,i,1,nx
+        xa = x0+(bx-1)*pitch_xx+(i-1)*(w+pitch_x)
+        ESEL,A,CENT,X,xa,xa+w
     *ENDDO
-*ELSE
-    /COM,[座標重建CM] 找不到 shape_export_circle.txt，略過 CIRCLE 類別
-*ENDIF
+*ENDDO
+CM,_EX,ELEM
+
+ESEL,NONE
+*DO,by,1,nby
+    *DO,j,1,ny
+        ya = y0+(by-1)*pitch_yy+(j-1)*(l+pitch_y)
+        ESEL,A,CENT,Y,ya,ya+l
+    *ENDDO
+*ENDDO
+
+CMSEL,R,_EX
+ESEL,R,CENT,Z,-0.013,0
+CM,E_BUMP,ELEM
+
+/PREP7                            ! ★EMODIF 只在 PREP7 有效
+EMODIF,ALL,MAT,mat_new            ! ★已選元素改材料
+
+CMDELE,_EX
+ALLSEL,ALL
+
+
+
+
+
+！========================
+
+! ---- 1. 直條選了什麼 ----
+CMSEL,S,_EX
+*GET,n1,ELEM,0,COUNT
+EPLOT                             ! 應該是 40 條分開的直條
+
+! ---- 2. 交集之後 ----
+CMSEL,S,E_BUMP
+*GET,n2,ELEM,0,COUNT
+EPLOT                             ! 應該是 600 顆分開的 bump
+
+! ---- 3. 材料有沒有真的改到 ----
+*GET,e1,ELEM,0,NUM,MIN
+*GET,e2,ELEM,0,NUM,MAX
+*GET,m1,ELEM,e1,ATTR,MAT
+*GET,m2,ELEM,e2,ATTR,MAT
+
+/GO
+*MSG,INFO,n1,n2,m1,m2
+EX=%I  BUMP=%I  first MAT=%I  last MAT=%I
+
+！========================
+
+
+CSYS,0
+x0 = 10      $  y0 = 10
+w  = 1.1     $  l  = 2.1
+pitch_x  = 0.5  $  pitch_y  = 0.5
+pitch_xx = 20   $  pitch_yy = 30
+nx = 5   $  ny = 5
+nbx = 8  $  nby = 3
+mat_new = 21
+
+/PREP7
+*DO,by,1,nby
+    *DO,bx,1,nbx
+        *DO,j,1,ny
+            *DO,i,1,nx
+                xa = x0+(bx-1)*pitch_xx+(i-1)*(w+pitch_x)
+                ya = y0+(by-1)*pitch_yy+(j-1)*(l+pitch_y)
+
+                ESEL,S,CENT,X,xa,xa+w          ! 這一顆的 X 範圍
+                ESEL,R,CENT,Y,ya,ya+l          ! 再篩 Y
+                ESEL,R,CENT,Z,-0.013,0         ! 再篩厚度
+                EMODIF,ALL,MAT,mat_new         ! 當場改材料
+            *ENDDO
+        *ENDDO
+    *ENDDO
+*ENDDO
+
+ESEL,S,MAT,,mat_new                            ! 全部改完，用材料號一次選回來
+CM,E_BUMP,ELEM
+ALLSEL,ALL
+
