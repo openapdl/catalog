@@ -1,0 +1,28 @@
+! box_import_cm.mac
+! Usage: box_import_cm,filename,cm_name,entity_type
+! 讀取純數值box座標檔（每行x0,x1,y0,y1,z0,z1），逐行選取NODE/ELEM並累加建立cm_name
+! entity_type = 'NODE' 或 'ELEM'
+/INQUIRE,n_box,LINES,%ARG1%,txt
+*del,box_data
+*dim,box_data,array,n_box,6
+*vread,box_data(1,1),%ARG1%,txt,,jik,6,n_box
+(6F16.6)
+
+*do,r,1,n_box
+    *if,ARG3,eq,'NODE',then
+        NSEL,S,LOC,X,box_data(r,1),box_data(r,2)
+        NSEL,R,LOC,Y,box_data(r,3),box_data(r,4)
+        NSEL,R,LOC,Z,box_data(r,5),box_data(r,6)
+    *else
+        ESEL,S,CENT,X,box_data(r,1),box_data(r,2)
+        ESEL,R,CENT,Y,box_data(r,3),box_data(r,4)
+        ESEL,R,CENT,Z,box_data(r,5),box_data(r,6)
+    *endif
+    *if,r,eq,1,then
+        CM,%ARG2%,%ARG3%
+    *else
+        CMSEL,A,%ARG2%,%ARG3%
+        CM,%ARG2%,%ARG3%
+    *endif
+*enddo
+ALLSEL,ALL

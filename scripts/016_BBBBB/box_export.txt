@@ -1,0 +1,7 @@
+! box_export.mac
+! Usage: box_export,array_name,filename
+! 把一個N列6欄(x0,x1,y0,y1,z0,z1)的陣列整個倒出成純數值文字檔，供box_import_cm.mac讀取
+*cfopen,%ARG2%,txt
+*vwrite,%ARG1%(1,1),%ARG1%(1,2),%ARG1%(1,3),%ARG1%(1,4),%ARG1%(1,5),%ARG1%(1,6)
+(6F16.6)
+*cfclos
